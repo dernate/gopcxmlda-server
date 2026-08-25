@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap:Body><GetProperties xmlns="http://opcfoundation.org/webservices/XMLDA/1.0/" LocaleID="en" ClientRequestHandle="TestClient" ItemPath="" ReturnAllProperties="true" ReturnPropertyValues="true"><ItemIDs ItemPath="" ItemName="Folder1/Folder4/Folder5/Item1"/></GetProperties></soap:Body></soap:Envelope>

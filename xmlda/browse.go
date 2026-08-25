@@ -1,0 +1,179 @@
+package xmlda
+
+import (
+	"encoding/xml"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// BrowseFilter filters Browse results by element kind (§3.8.1, p.70).
+type BrowseFilter string
+
+// Standard BrowseFilter values.
+const (
+	BrowseFilterAll    BrowseFilter = "all"
+	BrowseFilterBranch BrowseFilter = "branch"
+	BrowseFilterItem   BrowseFilter = "item"
+)
+
+// BrowseRequest is the request for the Browse operation (§3.8.1,
+// pp.69-71). A blank ItemName/ItemPath means "browse the address space
+// root". Single-level only — the client re-browses into a child's
+// ItemPath/ItemName to descend (REQ-BROWSE-001).
+type BrowseRequest struct {
+	LocaleID             string
+	ClientRequestHandle  string
+	ItemName             string
+	ItemPath             *string
+	ContinuationPoint    string
+	MaxElementsReturned  uint32
+	BrowseFilter         BrowseFilter
+	ElementNameFilter    string
+	VendorFilter         string
+	ReturnAllProperties  bool
+	ReturnPropertyValues bool
+	// ReturnErrorText requests human-readable Errors text. Default: true
+	// (see ReturnErrorTextOrDefault) — a pointer so "attribute absent" is
+	// distinguishable from "explicitly false", the same reason
+	// RequestOptions.ReturnErrorText is a pointer.
+	ReturnErrorText *bool
+	// PropertyNames filters which properties to inline-return; ignored if
+	// ReturnAllProperties is true.
+	PropertyNames []QName
+}
+
+// ReturnErrorTextOrDefault returns ReturnErrorText, or its default (true)
+// if unset.
+func (r BrowseRequest) ReturnErrorTextOrDefault() bool {
+	return returnErrorTextOrDefault(r.ReturnErrorText)
+}
+
+// MarshalXML implements xml.Marshaler.
+func (r BrowseRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Name = xml.Name{Local: "Browse"}
+	if r.LocaleID != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "LocaleID"}, Value: r.LocaleID})
+	}
+	if r.ClientRequestHandle != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ClientRequestHandle"}, Value: r.ClientRequestHandle})
+	}
+	if r.ItemName != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: r.ItemName})
+	}
+	if r.ItemPath != nil {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemPath"}, Value: *r.ItemPath})
+	}
+	if r.ContinuationPoint != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ContinuationPoint"}, Value: r.ContinuationPoint})
+	}
+	if r.MaxElementsReturned != 0 {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "MaxElementsReturned"}, Value: strconv.FormatUint(uint64(r.MaxElementsReturned), 10)})
+	}
+	if r.BrowseFilter != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "BrowseFilter"}, Value: string(r.BrowseFilter)})
+	}
+	if r.ElementNameFilter != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ElementNameFilter"}, Value: r.ElementNameFilter})
+	}
+	if r.VendorFilter != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "VendorFilter"}, Value: r.VendorFilter})
+	}
+	start.Attr = append(start.Attr,
+		xml.Attr{Name: xml.Name{Local: "ReturnAllProperties"}, Value: strconv.FormatBool(r.ReturnAllProperties)},
+		xml.Attr{Name: xml.Name{Local: "ReturnPropertyValues"}, Value: strconv.FormatBool(r.ReturnPropertyValues)},
+	)
+	if r.ReturnErrorText != nil {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ReturnErrorText"}, Value: strconv.FormatBool(*r.ReturnErrorText)})
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	if err := encodePropertyNames(e, r.PropertyNames); err != nil {
+		return err
+	}
+	return e.EncodeToken(start.End())
+}
+
+// UnmarshalXML implements xml.Unmarshaler.
+func (r *BrowseRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	r.LocaleID, _ = attrValue(start.Attr, xml.Name{Local: "LocaleID"})
+	r.ClientRequestHandle, _ = attrValue(start.Attr, xml.Name{Local: "ClientRequestHandle"})
+	r.ItemName, _ = attrValue(start.Attr, xml.Name{Local: "ItemName"})
+	if v, ok := attrValue(start.Attr, xml.Name{Local: "ItemPath"}); ok {
+		r.ItemPath = &v
+	}
+	r.ContinuationPoint, _ = attrValue(start.Attr, xml.Name{Local: "ContinuationPoint"})
+	if v, ok := attrValue(start.Attr, xml.Name{Local: "MaxElementsReturned"}); ok {
+		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		if err != nil {
+			return fmt.Errorf("xmlda: invalid MaxElementsReturned %q: %w", v, err)
+		}
+		r.MaxElementsReturned = uint32(u)
+	}
+	if v, ok := attrValue(start.Attr, xml.Name{Local: "BrowseFilter"}); ok {
+		r.BrowseFilter = BrowseFilter(v)
+	}
+	r.ElementNameFilter, _ = attrValue(start.Attr, xml.Name{Local: "ElementNameFilter"})
+	r.VendorFilter, _ = attrValue(start.Attr, xml.Name{Local: "VendorFilter"})
+	var err error
+	if r.ReturnAllProperties, r.ReturnPropertyValues, r.ReturnErrorText, err = decodeReturnFlags(start.Attr); err != nil {
+		return err
+	}
+
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return fmt.Errorf("xmlda: decoding Browse request: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.EndElement:
+			return nil
+		case xml.StartElement:
+			if t.Name.Local != "PropertyNames" {
+				if err := d.Skip(); err != nil {
+					return err
+				}
+				continue
+			}
+			qn, err := decodePropertyNameElement(d, t)
+			if err != nil {
+				return err
+			}
+			r.PropertyNames = append(r.PropertyNames, qn)
+		}
+	}
+}
+
+// BrowseElement is one entry in a BrowseResponse (§3.8.2, pp.72-74).
+type BrowseElement struct {
+	Name string `xml:"Name,attr"`
+	// ItemPath and ItemName together identify this element, or ItemName
+	// alone if ItemPath is empty. Both absent (ItemPath nil, ItemName
+	// "") means this is a non-actionable "hint" node — see IsItem's doc.
+	ItemPath *string `xml:"ItemPath,attr"`
+	ItemName string  `xml:"ItemName,attr,omitempty"`
+	// IsItem is required (REQ-BROWSE-005). true with no ItemPath/ItemName
+	// means this element is a hint, not a directly readable/writable/
+	// subscribable item.
+	IsItem bool `xml:"IsItem,attr"`
+	// HasChildren is required; may conservatively report true if the
+	// server cannot cheaply determine whether children exist.
+	HasChildren bool           `xml:"HasChildren,attr"`
+	Properties  []ItemProperty `xml:"Properties"`
+}
+
+// BrowseResponse is the response for the Browse operation (§3.8.2,
+// pp.72-75).
+type BrowseResponse struct {
+	XMLName xml.Name `xml:"BrowseResponse"`
+	// MoreElements is always present; true if more elements exist beyond
+	// MaxElementsReturned (REQ-BROWSE-003).
+	MoreElements bool `xml:"MoreElements,attr"`
+	// ContinuationPoint is set when the result set was truncated and the
+	// server supports pagination.
+	ContinuationPoint string          `xml:"ContinuationPoint,attr,omitempty"`
+	Result            ReplyBase       `xml:"BrowseResult"`
+	Elements          []BrowseElement `xml:"Elements"`
+	Errors            Errors          `xml:"Errors"`
+}

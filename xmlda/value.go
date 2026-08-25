@@ -1,0 +1,1668 @@
+package xmlda
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ScalarType identifies an OPC XML-DA scalar wire type by its xsi:type
+// local name (for array types, the type of one element). See
+// docs/specification/type-mapping.md for the full XSD-to-Go mapping.
+type ScalarType string
+
+// Standard OPC XML-DA / XSD scalar types, per §2.7.1 of the specification.
+const (
+	TypeString        ScalarType = "string"        // VT_BSTR
+	TypeBoolean       ScalarType = "boolean"       // VT_BOOL
+	TypeFloat         ScalarType = "float"         // VT_R4
+	TypeDouble        ScalarType = "double"        // VT_R8
+	TypeDecimal       ScalarType = "decimal"       // VT_CY
+	TypeLong          ScalarType = "long"          // VT_I8
+	TypeInt           ScalarType = "int"           // VT_I4
+	TypeShort         ScalarType = "short"         // VT_I2
+	TypeByte          ScalarType = "byte"          // VT_I1
+	TypeUnsignedLong  ScalarType = "unsignedLong"  // VT_UI8
+	TypeUnsignedInt   ScalarType = "unsignedInt"   // VT_UI4
+	TypeUnsignedShort ScalarType = "unsignedShort" // VT_UI2
+	TypeUnsignedByte  ScalarType = "unsignedByte"  // VT_UI1
+	TypeBase64Binary  ScalarType = "base64Binary"  // byte array
+	TypeDateTime      ScalarType = "dateTime"      // VT_DATE
+	TypeTime          ScalarType = "time"          // VT_DATE, see OQ-12
+	TypeDate          ScalarType = "date"          // VT_DATE, see OQ-12
+	TypeDuration      ScalarType = "duration"      // VT_BSTR
+	TypeQName         ScalarType = "QName"         // no Variant equivalent
+	TypeAnyType       ScalarType = "anyType"       // array element type only
+)
+
+// Kind identifies which shape a Value holds.
+type Kind uint8
+
+const (
+	// KindScalar is a single scalar value of one ScalarType.
+	KindScalar Kind = iota
+	// KindArray is an ArrayOf<X> value; see Value.Array.
+	KindArray
+	// KindUnknown is a value whose xsi:type was not recognized (a vendor
+	// or future type). Its exact wire bytes are preserved for round-trip;
+	// see ADR-003.
+	KindUnknown
+)
+
+// String returns a human-readable name for k, used in error messages.
+func (k Kind) String() string {
+	switch k {
+	case KindScalar:
+		return "scalar"
+	case KindArray:
+		return "array"
+	case KindUnknown:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
+// decimalPattern validates the lexical form of xsd:decimal per the XSD
+// Part 2 grammar: an optional sign, and digits on at least one side of an
+// optional decimal point — a digit is required on only one side, not
+// both, so "210." and ".5" are both legal (the specification's own
+// worked examples).
+var decimalPattern = regexp.MustCompile(`^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)$`)
+
+// Decimal preserves the exact lexical xsd:decimal wire text. VT_CY (the
+// OPC Variant type decimal maps to) is fixed-point with no exact float64
+// representation, so Decimal is a validated string, not a float64 — see
+// ADR-002.
+type Decimal string
+
+// NewDecimal validates s as an xsd:decimal literal and returns it as a
+// Decimal. It returns an error if s is not a valid decimal lexical form.
+func NewDecimal(s string) (Decimal, error) {
+	if !decimalPattern.MatchString(s) {
+		return "", fmt.Errorf("xmlda: %q is not a valid xsd:decimal literal", s)
+	}
+	return Decimal(s), nil
+}
+
+// NewDecimalFromFloat64 formats f as a Decimal. Callers needing exact
+// wire-format fidelity should prefer NewDecimal with the original literal
+// text instead, since the float64-to-decimal-text conversion may not
+// reproduce the exact digits of a value that originated as decimal text.
+func NewDecimalFromFloat64(f float64) Decimal {
+	return Decimal(strconv.FormatFloat(f, 'f', -1, 64))
+}
+
+// Float64 parses d as a float64, accepting the precision loss inherent in
+// that conversion.
+func (d Decimal) Float64() (float64, error) {
+	f, err := strconv.ParseFloat(string(d), 64)
+	if err != nil {
+		return 0, fmt.Errorf("xmlda: Decimal %q: %w", string(d), err)
+	}
+	return f, nil
+}
+
+// String returns the exact decimal literal text.
+func (d Decimal) String() string { return string(d) }
+
+// RawValue preserves an unrecognized <Value> element exactly as received:
+// its declared xsi:type and its verbatim inner XML bytes. See ADR-003.
+type RawValue struct {
+	// TypeName is the xsi:type this value declared, resolved to a QName.
+	TypeName QName
+	// InnerXML is the exact captured child content (text and/or nested
+	// elements), re-emitted unmodified on MarshalXML.
+	InnerXML []byte
+}
+
+// TypeError reports that a Value or Array accessor was called for a type
+// it does not actually hold — never a panic.
+type TypeError struct {
+	// Receiver is which type's accessor failed: "Value" or "Array". Left
+	// empty, it defaults to "Value" (the common case).
+	Receiver string
+	// Op names the accessor that failed, e.g. "Int32" or "Strings".
+	Op string
+	// Kind is the Value's actual Kind (always KindArray for an
+	// Array-sourced error).
+	Kind Kind
+	// Actual is the Value's (or Array's element) actual ScalarType (zero
+	// if Kind is KindUnknown).
+	Actual ScalarType
+	// TypeName is the actual xsi:type, always populated.
+	TypeName QName
+	// Nil reports whether the Value was present but declared xsi:nil.
+	// Never set for an Array-sourced error.
+	Nil bool
+}
+
+// Error implements the error interface.
+func (e *TypeError) Error() string {
+	receiver := e.Receiver
+	if receiver == "" {
+		receiver = "Value"
+	}
+	if e.Nil {
+		return fmt.Sprintf("xmlda: %s.%s: value is xsi:nil (declared type %s)", receiver, e.Op, e.TypeName)
+	}
+	if receiver == "Array" {
+		return fmt.Sprintf("xmlda: Array.%s: array has element type %s, not the requested type", e.Op, e.Actual)
+	}
+	switch e.Kind {
+	case KindUnknown:
+		return fmt.Sprintf("xmlda: Value.%s: value has unrecognized type %s", e.Op, e.TypeName)
+	case KindArray:
+		return fmt.Sprintf("xmlda: Value.%s: value is an array of %s, not the requested scalar type", e.Op, e.Actual)
+	default:
+		return fmt.Sprintf("xmlda: Value.%s: value has scalar type %s, not the requested type", e.Op, e.Actual)
+	}
+}
+
+// Value is the generic container for every OPC XML-DA <Value> element
+// (ItemValue.Value, ItemProperty.Value, ...). The zero Value is
+// KindUnknown with no type and is never produced by the constructors in
+// this file; use NewNil to represent an explicit xsi:nil value of a known
+// declared type.
+type Value struct {
+	kind     Kind
+	typ      ScalarType
+	typeName QName
+	isNil    bool
+	scalar   any
+	array    Array
+	raw      RawValue
+}
+
+// Kind reports which shape v holds.
+func (v Value) Kind() Kind { return v.kind }
+
+// Type returns v's ScalarType (the element type, if v is an array). It is
+// the zero ScalarType if v.Kind() is KindUnknown.
+func (v Value) Type() ScalarType { return v.typ }
+
+// TypeName returns v's exact xsi:type, resolved to a QName. It is always
+// populated, for every Kind.
+func (v Value) TypeName() QName { return v.typeName }
+
+// IsNil reports whether v is present on the wire but declared xsi:nil
+// (REQ-READ-005: e.g. a write-only item read back).
+func (v Value) IsNil() bool { return v.isNil }
+
+// IsUnknown reports whether v.Kind() is KindUnknown.
+func (v Value) IsUnknown() bool { return v.kind == KindUnknown }
+
+// Equal reports whether v and other represent the same value: same Kind,
+// same declared type, same nil-ness, and equal content (using
+// time.Time.Equal for time-typed scalars/arrays rather than ==, since a
+// caller-constructed time.Time may carry a monotonic reading that would
+// otherwise make two logically-equal times compare unequal). This is the
+// only supported way to compare two Values — their fields are
+// unexported specifically so callers cannot depend on their internal
+// representation, only on typed accessors and this method.
+func (v Value) Equal(other Value) bool {
+	if v.kind != other.kind || v.typ != other.typ || v.isNil != other.isNil {
+		return false
+	}
+	switch v.kind {
+	case KindArray:
+		return v.array.equal(other.array)
+	case KindUnknown:
+		return v.typeName == other.typeName && bytes.Equal(v.raw.InnerXML, other.raw.InnerXML)
+	default: // KindScalar
+		return scalarEqual(v.typ, v.scalar, other.scalar)
+	}
+}
+
+func scalarEqual(t ScalarType, a, b any) bool {
+	switch t {
+	case TypeBase64Binary:
+		ab, aok := a.([]byte)
+		bb, bok := b.([]byte)
+		return aok == bok && bytes.Equal(ab, bb)
+	case TypeDateTime, TypeTime, TypeDate:
+		at, aok := a.(time.Time)
+		bt, bok := b.(time.Time)
+		return aok == bok && at.Equal(bt)
+	default:
+		return a == b
+	}
+}
+
+// equal compares two Arrays. Element-wise comparison uses scalarEqual for
+// the time/bytes special cases; anyType arrays recurse through Value.Equal.
+func (a Array) equal(other Array) bool {
+	if a.elemType != other.elemType || a.Len() != other.Len() {
+		return false
+	}
+	if a.elemType == TypeAnyType {
+		av, _ := a.Any()
+		bv, _ := other.Any()
+		for i := range av {
+			if !av[i].Equal(bv[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if a.elemType == TypeDateTime {
+		at, _ := a.DateTimes()
+		bt, _ := other.DateTimes()
+		for i := range at {
+			if !at[i].Equal(bt[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(a.data, other.data)
+}
+
+// NewNil returns a Value representing an explicit xsi:nil="true" element
+// of the given wire type — used when a server must convey "no value"
+// while still declaring the item's data type. Kind() reflects what
+// typeName actually denotes (array, scalar, or unrecognized), matching
+// the xsi:nil decode path (decodeNilKind) — a nil ArrayOf<X>-typed value
+// must still report KindArray, not be silently flattened to KindScalar.
+func NewNil(typeName QName) Value {
+	kind, typ := decodeNilKind(typeName)
+	return Value{kind: kind, typ: typ, typeName: typeName, isNil: true}
+}
+
+// decodeNilKind resolves typeName to the Kind/ScalarType an xsi:nil value
+// declaring it should report, shared by NewNil and the xsi:nil decode
+// branch in unmarshalXML.
+func decodeNilKind(typeName QName) (Kind, ScalarType) {
+	if et, ok := arrayElemTypesByQName[typeName]; ok {
+		return KindArray, et
+	}
+	if st, ok := scalarTypesByQName[typeName]; ok {
+		return KindScalar, st
+	}
+	return KindUnknown, ""
+}
+
+// NewString returns a scalar Value of XSD type string.
+func NewString(s string) Value {
+	return Value{kind: KindScalar, typ: TypeString, typeName: QName{XSDNamespace, "string"}, scalar: s}
+}
+
+// NewBool returns a scalar Value of XSD type boolean.
+func NewBool(b bool) Value {
+	return Value{kind: KindScalar, typ: TypeBoolean, typeName: QName{XSDNamespace, "boolean"}, scalar: b}
+}
+
+// NewFloat32 returns a scalar Value of XSD type float.
+func NewFloat32(f float32) Value {
+	return Value{kind: KindScalar, typ: TypeFloat, typeName: QName{XSDNamespace, "float"}, scalar: f}
+}
+
+// NewFloat64 returns a scalar Value of XSD type double.
+func NewFloat64(f float64) Value {
+	return Value{kind: KindScalar, typ: TypeDouble, typeName: QName{XSDNamespace, "double"}, scalar: f}
+}
+
+// NewDecimalValue returns a scalar Value of XSD type decimal.
+func NewDecimalValue(d Decimal) Value {
+	return Value{kind: KindScalar, typ: TypeDecimal, typeName: QName{XSDNamespace, "decimal"}, scalar: d}
+}
+
+// NewInt64 returns a scalar Value of XSD type long.
+func NewInt64(i int64) Value {
+	return Value{kind: KindScalar, typ: TypeLong, typeName: QName{XSDNamespace, "long"}, scalar: i}
+}
+
+// NewInt32 returns a scalar Value of XSD type int.
+func NewInt32(i int32) Value {
+	return Value{kind: KindScalar, typ: TypeInt, typeName: QName{XSDNamespace, "int"}, scalar: i}
+}
+
+// NewInt16 returns a scalar Value of XSD type short.
+func NewInt16(i int16) Value {
+	return Value{kind: KindScalar, typ: TypeShort, typeName: QName{XSDNamespace, "short"}, scalar: i}
+}
+
+// NewInt8 returns a scalar Value of XSD type byte (signed).
+func NewInt8(i int8) Value {
+	return Value{kind: KindScalar, typ: TypeByte, typeName: QName{XSDNamespace, "byte"}, scalar: i}
+}
+
+// NewUint64 returns a scalar Value of XSD type unsignedLong.
+func NewUint64(u uint64) Value {
+	return Value{kind: KindScalar, typ: TypeUnsignedLong, typeName: QName{XSDNamespace, "unsignedLong"}, scalar: u}
+}
+
+// NewUint32 returns a scalar Value of XSD type unsignedInt.
+func NewUint32(u uint32) Value {
+	return Value{kind: KindScalar, typ: TypeUnsignedInt, typeName: QName{XSDNamespace, "unsignedInt"}, scalar: u}
+}
+
+// NewUint16 returns a scalar Value of XSD type unsignedShort.
+func NewUint16(u uint16) Value {
+	return Value{kind: KindScalar, typ: TypeUnsignedShort, typeName: QName{XSDNamespace, "unsignedShort"}, scalar: u}
+}
+
+// NewUint8 returns a scalar Value of XSD type unsignedByte.
+func NewUint8(u uint8) Value {
+	return Value{kind: KindScalar, typ: TypeUnsignedByte, typeName: QName{XSDNamespace, "unsignedByte"}, scalar: u}
+}
+
+// NewBytes returns a scalar Value of XSD type base64Binary. b is copied.
+// A nil b and a non-nil empty b are preserved as distinct (see
+// docs/specification/type-mapping.md): append(nil-dst, empty-src...)
+// always yields nil in Go, so copying b's nil-ness must be done
+// explicitly rather than via a single unconditional append.
+func NewBytes(b []byte) Value {
+	var cp []byte
+	if b != nil {
+		cp = append([]byte{}, b...)
+	}
+	return Value{kind: KindScalar, typ: TypeBase64Binary, typeName: QName{XSDNamespace, "base64Binary"}, scalar: cp}
+}
+
+// NewDateTime returns a scalar Value of XSD type dateTime.
+func NewDateTime(t time.Time) Value {
+	return Value{kind: KindScalar, typ: TypeDateTime, typeName: QName{XSDNamespace, "dateTime"}, scalar: t}
+}
+
+// NewTime returns a scalar Value of XSD type time. See
+// docs/specification/open-questions.md OQ-12 for how this differs from the
+// dateTime+ValueTypeQualifier encoding some peers use.
+func NewTime(t time.Time) Value {
+	return Value{kind: KindScalar, typ: TypeTime, typeName: QName{XSDNamespace, "time"}, scalar: t}
+}
+
+// NewDate returns a scalar Value of XSD type date. See OQ-12.
+func NewDate(t time.Time) Value {
+	return Value{kind: KindScalar, typ: TypeDate, typeName: QName{XSDNamespace, "date"}, scalar: t}
+}
+
+// NewDuration returns a scalar Value of XSD type duration, wrapping the
+// given ISO-8601 duration literal (e.g. "P1D"). The literal is not
+// validated beyond being stored as-is, since the spec transmits it as
+// opaque VT_BSTR.
+func NewDuration(iso8601 string) Value {
+	return Value{kind: KindScalar, typ: TypeDuration, typeName: QName{XSDNamespace, "duration"}, scalar: iso8601}
+}
+
+// NewQNameValue returns a scalar Value of XSD type QName, wrapping q as
+// the value's own payload (distinct from v.TypeName, which remains
+// {XSDNamespace, "QName"}).
+func NewQNameValue(q QName) Value {
+	return Value{kind: KindScalar, typ: TypeQName, typeName: QName{XSDNamespace, "QName"}, scalar: q}
+}
+
+// checkScalar returns a *TypeError if v is not a present scalar of type
+// want, or nil if the access is valid.
+func (v Value) checkScalar(op string, want ScalarType) error {
+	if v.isNil {
+		return &TypeError{Op: op, Kind: v.kind, Actual: v.typ, TypeName: v.typeName, Nil: true}
+	}
+	if v.kind != KindScalar || v.typ != want {
+		return &TypeError{Op: op, Kind: v.kind, Actual: v.typ, TypeName: v.typeName}
+	}
+	return nil
+}
+
+// String returns v's value as a string, or a *TypeError if v is not a
+// scalar string.
+func (v Value) String() (string, error) {
+	if err := v.checkScalar("String", TypeString); err != nil {
+		return "", err
+	}
+	return v.scalar.(string), nil
+}
+
+// Bool returns v's value as a bool, or a *TypeError if v is not a scalar
+// boolean.
+func (v Value) Bool() (bool, error) {
+	if err := v.checkScalar("Bool", TypeBoolean); err != nil {
+		return false, err
+	}
+	return v.scalar.(bool), nil
+}
+
+// Float32 returns v's value as a float32, or a *TypeError if v is not a
+// scalar float.
+func (v Value) Float32() (float32, error) {
+	if err := v.checkScalar("Float32", TypeFloat); err != nil {
+		return 0, err
+	}
+	return v.scalar.(float32), nil
+}
+
+// Float64 returns v's value as a float64, or a *TypeError if v is not a
+// scalar double.
+func (v Value) Float64() (float64, error) {
+	if err := v.checkScalar("Float64", TypeDouble); err != nil {
+		return 0, err
+	}
+	return v.scalar.(float64), nil
+}
+
+// Decimal returns v's value as a Decimal, or a *TypeError if v is not a
+// scalar decimal.
+func (v Value) Decimal() (Decimal, error) {
+	if err := v.checkScalar("Decimal", TypeDecimal); err != nil {
+		return "", err
+	}
+	return v.scalar.(Decimal), nil
+}
+
+// Int64 returns v's value as an int64, or a *TypeError if v is not a
+// scalar long.
+func (v Value) Int64() (int64, error) {
+	if err := v.checkScalar("Int64", TypeLong); err != nil {
+		return 0, err
+	}
+	return v.scalar.(int64), nil
+}
+
+// Int32 returns v's value as an int32, or a *TypeError if v is not a
+// scalar int.
+func (v Value) Int32() (int32, error) {
+	if err := v.checkScalar("Int32", TypeInt); err != nil {
+		return 0, err
+	}
+	return v.scalar.(int32), nil
+}
+
+// Int16 returns v's value as an int16, or a *TypeError if v is not a
+// scalar short.
+func (v Value) Int16() (int16, error) {
+	if err := v.checkScalar("Int16", TypeShort); err != nil {
+		return 0, err
+	}
+	return v.scalar.(int16), nil
+}
+
+// Int8 returns v's value as an int8, or a *TypeError if v is not a scalar
+// (signed) byte.
+func (v Value) Int8() (int8, error) {
+	if err := v.checkScalar("Int8", TypeByte); err != nil {
+		return 0, err
+	}
+	return v.scalar.(int8), nil
+}
+
+// Uint64 returns v's value as a uint64, or a *TypeError if v is not a
+// scalar unsignedLong.
+func (v Value) Uint64() (uint64, error) {
+	if err := v.checkScalar("Uint64", TypeUnsignedLong); err != nil {
+		return 0, err
+	}
+	return v.scalar.(uint64), nil
+}
+
+// Uint32 returns v's value as a uint32, or a *TypeError if v is not a
+// scalar unsignedInt.
+func (v Value) Uint32() (uint32, error) {
+	if err := v.checkScalar("Uint32", TypeUnsignedInt); err != nil {
+		return 0, err
+	}
+	return v.scalar.(uint32), nil
+}
+
+// Uint16 returns v's value as a uint16, or a *TypeError if v is not a
+// scalar unsignedShort.
+func (v Value) Uint16() (uint16, error) {
+	if err := v.checkScalar("Uint16", TypeUnsignedShort); err != nil {
+		return 0, err
+	}
+	return v.scalar.(uint16), nil
+}
+
+// Uint8 returns v's value as a uint8, or a *TypeError if v is not a
+// scalar unsignedByte.
+func (v Value) Uint8() (uint8, error) {
+	if err := v.checkScalar("Uint8", TypeUnsignedByte); err != nil {
+		return 0, err
+	}
+	return v.scalar.(uint8), nil
+}
+
+// NumericAsFloat64 returns v's value converted to float64 if v is a
+// present scalar of any numeric ScalarType (the signed/unsigned integer
+// widths, float, double, or decimal), or ok=false otherwise (v is an
+// array, an unknown-type value, xsi:nil, or a non-numeric scalar type
+// such as string/boolean/dateTime). Unlike the individual typed
+// accessors, this deliberately loses which exact numeric type v held —
+// callers that need that distinction, or need exact-integer precision
+// beyond float64's 2^53-exact range (int64/uint64), must use Type() plus
+// the specific typed accessor instead (see server/coerce.go's
+// integer-to-integer coercion path, which avoids this method for exactly
+// that reason). Intended for callers that only need an approximate
+// numeric comparison, e.g. subscription deadband evaluation.
+func (v Value) NumericAsFloat64() (float64, bool) {
+	if v.isNil || v.kind != KindScalar {
+		return 0, false
+	}
+	switch v.typ {
+	case TypeByte:
+		return float64(v.scalar.(int8)), true
+	case TypeUnsignedByte:
+		return float64(v.scalar.(uint8)), true
+	case TypeShort:
+		return float64(v.scalar.(int16)), true
+	case TypeUnsignedShort:
+		return float64(v.scalar.(uint16)), true
+	case TypeInt:
+		return float64(v.scalar.(int32)), true
+	case TypeUnsignedInt:
+		return float64(v.scalar.(uint32)), true
+	case TypeLong:
+		return float64(v.scalar.(int64)), true
+	case TypeUnsignedLong:
+		return float64(v.scalar.(uint64)), true
+	case TypeFloat:
+		return float64(v.scalar.(float32)), true
+	case TypeDouble:
+		return v.scalar.(float64), true
+	case TypeDecimal:
+		f, err := v.scalar.(Decimal).Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+// Bytes returns v's value as a []byte, or a *TypeError if v is not a
+// scalar base64Binary. The returned slice is a copy.
+func (v Value) Bytes() ([]byte, error) {
+	if err := v.checkScalar("Bytes", TypeBase64Binary); err != nil {
+		return nil, err
+	}
+	b := v.scalar.([]byte)
+	if b == nil {
+		return nil, nil
+	}
+	return append([]byte{}, b...), nil
+}
+
+// Time returns v's value as a time.Time, or a *TypeError if v is not a
+// scalar dateTime, time, or date.
+func (v Value) Time() (time.Time, error) {
+	if v.isNil {
+		return time.Time{}, &TypeError{Op: "Time", Kind: v.kind, Actual: v.typ, TypeName: v.typeName, Nil: true}
+	}
+	if v.kind != KindScalar || (v.typ != TypeDateTime && v.typ != TypeTime && v.typ != TypeDate) {
+		return time.Time{}, &TypeError{Op: "Time", Kind: v.kind, Actual: v.typ, TypeName: v.typeName}
+	}
+	return v.scalar.(time.Time), nil
+}
+
+// Duration returns v's value as an ISO-8601 duration literal, or a
+// *TypeError if v is not a scalar duration.
+func (v Value) Duration() (string, error) {
+	if err := v.checkScalar("Duration", TypeDuration); err != nil {
+		return "", err
+	}
+	return v.scalar.(string), nil
+}
+
+// QNameValue returns v's value as a QName, or a *TypeError if v is not a
+// scalar QName.
+func (v Value) QNameValue() (QName, error) {
+	if err := v.checkScalar("QNameValue", TypeQName); err != nil {
+		return QName{}, err
+	}
+	return v.scalar.(QName), nil
+}
+
+// Array returns v as an Array, or a *TypeError if v is not an array.
+func (v Value) Array() (Array, error) {
+	if v.isNil {
+		return Array{}, &TypeError{Op: "Array", Kind: v.kind, Actual: v.typ, TypeName: v.typeName, Nil: true}
+	}
+	if v.kind != KindArray {
+		return Array{}, &TypeError{Op: "Array", Kind: v.kind, Actual: v.typ, TypeName: v.typeName}
+	}
+	return v.array, nil
+}
+
+// Raw returns v's captured raw content, or a *TypeError if v.Kind() is
+// not KindUnknown.
+func (v Value) Raw() (RawValue, error) {
+	if v.kind != KindUnknown {
+		return RawValue{}, &TypeError{Op: "Raw", Kind: v.kind, Actual: v.typ, TypeName: v.typeName}
+	}
+	return v.raw, nil
+}
+
+// Array is one ArrayOf<X> value: a homogeneous sequence of elements of one
+// ScalarType (or, for ArrayOfAnyType, a heterogeneous sequence of
+// independently-typed Values). Reachable only through the typed
+// constructors/accessors below, so misuse produces a *TypeError instead of
+// a panic.
+type Array struct {
+	elemType ScalarType
+	typeName QName
+	data     any
+}
+
+// ElemType returns the array's element ScalarType.
+func (a Array) ElemType() ScalarType { return a.elemType }
+
+// TypeName returns the array's declared ArrayOf<X> xsi:type, resolved to
+// a QName.
+func (a Array) TypeName() QName { return a.typeName }
+
+// Len returns the number of elements in the array.
+func (a Array) Len() int {
+	switch d := a.data.(type) {
+	case []int8:
+		return len(d)
+	case []int16:
+		return len(d)
+	case []uint16:
+		return len(d)
+	case []int32:
+		return len(d)
+	case []uint32:
+		return len(d)
+	case []int64:
+		return len(d)
+	case []uint64:
+		return len(d)
+	case []float32:
+		return len(d)
+	case []Decimal:
+		return len(d)
+	case []float64:
+		return len(d)
+	case []bool:
+		return len(d)
+	case []string:
+		return len(d)
+	case []time.Time:
+		return len(d)
+	case []Value:
+		return len(d)
+	default:
+		return 0
+	}
+}
+
+func (a Array) checkElem(op string, want ScalarType) error {
+	if a.elemType != want {
+		return &TypeError{Receiver: "Array", Op: op, Kind: KindArray, Actual: a.elemType, TypeName: a.typeName}
+	}
+	return nil
+}
+
+// NewInt8Array returns an ArrayOfByte value (signed byte elements).
+func NewInt8Array(v []int8) Array {
+	return Array{elemType: TypeByte, typeName: QName{Namespace, "ArrayOfByte"}, data: append([]int8(nil), v...)}
+}
+
+// NewInt16Array returns an ArrayOfShort value.
+func NewInt16Array(v []int16) Array {
+	return Array{elemType: TypeShort, typeName: QName{Namespace, "ArrayOfShort"}, data: append([]int16(nil), v...)}
+}
+
+// NewUint16Array returns an ArrayOfUnsignedShort value.
+func NewUint16Array(v []uint16) Array {
+	return Array{elemType: TypeUnsignedShort, typeName: QName{Namespace, "ArrayOfUnsignedShort"}, data: append([]uint16(nil), v...)}
+}
+
+// NewInt32Array returns an ArrayOfInt value.
+func NewInt32Array(v []int32) Array {
+	return Array{elemType: TypeInt, typeName: QName{Namespace, "ArrayOfInt"}, data: append([]int32(nil), v...)}
+}
+
+// NewUint32Array returns an ArrayOfUnsignedInt value.
+func NewUint32Array(v []uint32) Array {
+	return Array{elemType: TypeUnsignedInt, typeName: QName{Namespace, "ArrayOfUnsignedInt"}, data: append([]uint32(nil), v...)}
+}
+
+// NewInt64Array returns an ArrayOfLong value.
+func NewInt64Array(v []int64) Array {
+	return Array{elemType: TypeLong, typeName: QName{Namespace, "ArrayOfLong"}, data: append([]int64(nil), v...)}
+}
+
+// NewUint64Array returns an ArrayOfUnsignedLong value.
+func NewUint64Array(v []uint64) Array {
+	return Array{elemType: TypeUnsignedLong, typeName: QName{Namespace, "ArrayOfUnsignedLong"}, data: append([]uint64(nil), v...)}
+}
+
+// NewFloat32Array returns an ArrayOfFloat value.
+func NewFloat32Array(v []float32) Array {
+	return Array{elemType: TypeFloat, typeName: QName{Namespace, "ArrayOfFloat"}, data: append([]float32(nil), v...)}
+}
+
+// NewDecimalArray returns an ArrayOfDecimal value.
+func NewDecimalArray(v []Decimal) Array {
+	return Array{elemType: TypeDecimal, typeName: QName{Namespace, "ArrayOfDecimal"}, data: append([]Decimal(nil), v...)}
+}
+
+// NewFloat64Array returns an ArrayOfDouble value.
+func NewFloat64Array(v []float64) Array {
+	return Array{elemType: TypeDouble, typeName: QName{Namespace, "ArrayOfDouble"}, data: append([]float64(nil), v...)}
+}
+
+// NewBoolArray returns an ArrayOfBoolean value.
+func NewBoolArray(v []bool) Array {
+	return Array{elemType: TypeBoolean, typeName: QName{Namespace, "ArrayOfBoolean"}, data: append([]bool(nil), v...)}
+}
+
+// NewStringArray returns an ArrayOfString value.
+func NewStringArray(v []string) Array {
+	return Array{elemType: TypeString, typeName: QName{Namespace, "ArrayOfString"}, data: append([]string(nil), v...)}
+}
+
+// NewDateTimeArray returns an ArrayOfDateTime value.
+func NewDateTimeArray(v []time.Time) Array {
+	return Array{elemType: TypeDateTime, typeName: QName{Namespace, "ArrayOfDateTime"}, data: append([]time.Time(nil), v...)}
+}
+
+// NewAnyArray returns an ArrayOfAnyType value: a heterogeneous sequence
+// where each element is independently typed (and may itself be an array).
+// Note: there is deliberately no NewUint8Array/ArrayOfUnsignedByte —
+// the specification defines no such array type; unsigned-byte sequences
+// are always transmitted as scalar base64Binary (see NewBytes).
+func NewAnyArray(v []Value) Array {
+	return Array{elemType: TypeAnyType, typeName: QName{Namespace, "ArrayOfAnyType"}, data: append([]Value(nil), v...)}
+}
+
+// Int8s returns the array's elements as []int8, or a *TypeError if the
+// array's element type is not byte.
+func (a Array) Int8s() ([]int8, error) {
+	if err := a.checkElem("Int8s", TypeByte); err != nil {
+		return nil, err
+	}
+	return a.data.([]int8), nil
+}
+
+// Int16s returns the array's elements as []int16, or a *TypeError if the
+// array's element type is not short.
+func (a Array) Int16s() ([]int16, error) {
+	if err := a.checkElem("Int16s", TypeShort); err != nil {
+		return nil, err
+	}
+	return a.data.([]int16), nil
+}
+
+// Uint16s returns the array's elements as []uint16, or a *TypeError if the
+// array's element type is not unsignedShort.
+func (a Array) Uint16s() ([]uint16, error) {
+	if err := a.checkElem("Uint16s", TypeUnsignedShort); err != nil {
+		return nil, err
+	}
+	return a.data.([]uint16), nil
+}
+
+// Int32s returns the array's elements as []int32, or a *TypeError if the
+// array's element type is not int.
+func (a Array) Int32s() ([]int32, error) {
+	if err := a.checkElem("Int32s", TypeInt); err != nil {
+		return nil, err
+	}
+	return a.data.([]int32), nil
+}
+
+// Uint32s returns the array's elements as []uint32, or a *TypeError if the
+// array's element type is not unsignedInt.
+func (a Array) Uint32s() ([]uint32, error) {
+	if err := a.checkElem("Uint32s", TypeUnsignedInt); err != nil {
+		return nil, err
+	}
+	return a.data.([]uint32), nil
+}
+
+// Int64s returns the array's elements as []int64, or a *TypeError if the
+// array's element type is not long.
+func (a Array) Int64s() ([]int64, error) {
+	if err := a.checkElem("Int64s", TypeLong); err != nil {
+		return nil, err
+	}
+	return a.data.([]int64), nil
+}
+
+// Uint64s returns the array's elements as []uint64, or a *TypeError if the
+// array's element type is not unsignedLong.
+func (a Array) Uint64s() ([]uint64, error) {
+	if err := a.checkElem("Uint64s", TypeUnsignedLong); err != nil {
+		return nil, err
+	}
+	return a.data.([]uint64), nil
+}
+
+// Float32s returns the array's elements as []float32, or a *TypeError if
+// the array's element type is not float.
+func (a Array) Float32s() ([]float32, error) {
+	if err := a.checkElem("Float32s", TypeFloat); err != nil {
+		return nil, err
+	}
+	return a.data.([]float32), nil
+}
+
+// Decimals returns the array's elements as []Decimal, or a *TypeError if
+// the array's element type is not decimal.
+func (a Array) Decimals() ([]Decimal, error) {
+	if err := a.checkElem("Decimals", TypeDecimal); err != nil {
+		return nil, err
+	}
+	return a.data.([]Decimal), nil
+}
+
+// Float64s returns the array's elements as []float64, or a *TypeError if
+// the array's element type is not double.
+func (a Array) Float64s() ([]float64, error) {
+	if err := a.checkElem("Float64s", TypeDouble); err != nil {
+		return nil, err
+	}
+	return a.data.([]float64), nil
+}
+
+// Bools returns the array's elements as []bool, or a *TypeError if the
+// array's element type is not boolean.
+func (a Array) Bools() ([]bool, error) {
+	if err := a.checkElem("Bools", TypeBoolean); err != nil {
+		return nil, err
+	}
+	return a.data.([]bool), nil
+}
+
+// Strings returns the array's elements as []string, or a *TypeError if
+// the array's element type is not string.
+func (a Array) Strings() ([]string, error) {
+	if err := a.checkElem("Strings", TypeString); err != nil {
+		return nil, err
+	}
+	return a.data.([]string), nil
+}
+
+// DateTimes returns the array's elements as []time.Time, or a *TypeError
+// if the array's element type is not dateTime.
+func (a Array) DateTimes() ([]time.Time, error) {
+	if err := a.checkElem("DateTimes", TypeDateTime); err != nil {
+		return nil, err
+	}
+	return a.data.([]time.Time), nil
+}
+
+// Any returns the array's elements as []Value, or a *TypeError if the
+// array's element type is not anyType.
+func (a Array) Any() ([]Value, error) {
+	if err := a.checkElem("Any", TypeAnyType); err != nil {
+		return nil, err
+	}
+	return a.data.([]Value), nil
+}
+
+// elementAt returns element i of a's underlying storage as an any, for use
+// by the generic array marshaler.
+func elementAt(a Array, i int) (any, error) {
+	switch d := a.data.(type) {
+	case []int8:
+		return d[i], nil
+	case []int16:
+		return d[i], nil
+	case []uint16:
+		return d[i], nil
+	case []int32:
+		return d[i], nil
+	case []uint32:
+		return d[i], nil
+	case []int64:
+		return d[i], nil
+	case []uint64:
+		return d[i], nil
+	case []float32:
+		return d[i], nil
+	case []Decimal:
+		return d[i], nil
+	case []float64:
+		return d[i], nil
+	case []bool:
+		return d[i], nil
+	case []string:
+		return d[i], nil
+	case []time.Time:
+		return d[i], nil
+	default:
+		return nil, fmt.Errorf("xmlda: array: unsupported element storage type %T", a.data)
+	}
+}
+
+// --- scalar parsing/formatting ---
+
+var dateTimeLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02",
+}
+
+func parseXSDDateTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	var lastErr error
+	for _, layout := range dateTimeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return time.Time{}, fmt.Errorf("xmlda: %q is not a valid xsd:dateTime value: %w", s, lastErr)
+}
+
+// timeLayouts are the accepted lexical forms of a standalone xsd:time
+// literal (OQ-12): an optional fractional-second component, and an
+// optional timezone (either "Z" or a numeric offset) — tried most-specific
+// first since time.Parse requires the whole string to match one layout
+// exactly (no partial/leftover match).
+var timeLayouts = []string{
+	"15:04:05.999999999Z07:00",
+	"15:04:05Z07:00",
+	"15:04:05.999999999",
+	"15:04:05",
+}
+
+// parseXSDTime parses a standalone xsd:time literal. Go's time.Parse fills
+// in the fields absent from the layout (year 0, month 1, day 1, and UTC
+// when no zone is present) — exactly the "drop the component this type
+// doesn't carry" behavior xsd:time needs, with no separate zeroing step.
+func parseXSDTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	var lastErr error
+	for _, layout := range timeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return time.Time{}, fmt.Errorf("xmlda: %q is not a valid xsd:time value: %w", s, lastErr)
+}
+
+// dateLayouts are the accepted lexical forms of a standalone xsd:date
+// literal (OQ-12): the calendar date, with an optional (and, per real
+// traffic, non-conformant but tolerated) timezone suffix.
+var dateLayouts = []string{
+	"2006-01-02Z07:00",
+	"2006-01-02",
+}
+
+// parseXSDDate parses a standalone xsd:date literal, dropping any
+// time-of-day component the same way parseXSDTime drops the date.
+func parseXSDDate(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	var lastErr error
+	for _, layout := range dateLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return time.Time{}, fmt.Errorf("xmlda: %q is not a valid xsd:date value: %w", s, lastErr)
+}
+
+func formatXSDFloat(f float64, bitSize int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "INF"
+	case math.IsInf(f, -1):
+		return "-INF"
+	default:
+		return strconv.FormatFloat(f, 'g', -1, bitSize)
+	}
+}
+
+func parseBytesLiteral(s string) ([]byte, error) {
+	s = strings.Join(strings.Fields(s), "") // tolerate embedded whitespace/linebreaks
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("xmlda: invalid xsd:base64Binary literal: %w", err)
+	}
+	return b, nil
+}
+
+// parseScalar parses text as an xsd literal of the given ScalarType. It
+// does not handle TypeQName, which needs decoder-scoped prefix
+// resolution and is handled directly in decodeScalar.
+func parseScalar(st ScalarType, text string) (any, error) {
+	switch st {
+	case TypeString:
+		return text, nil
+	case TypeBoolean:
+		b, err := strconv.ParseBool(strings.TrimSpace(text))
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:boolean literal %q: %w", text, err)
+		}
+		return b, nil
+	case TypeFloat:
+		f, err := strconv.ParseFloat(strings.TrimSpace(text), 32)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:float literal %q: %w", text, err)
+		}
+		return float32(f), nil
+	case TypeDouble:
+		f, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:double literal %q: %w", text, err)
+		}
+		return f, nil
+	case TypeDecimal:
+		return NewDecimal(strings.TrimSpace(text))
+	case TypeLong:
+		i, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:long literal %q: %w", text, err)
+		}
+		return i, nil
+	case TypeInt:
+		i, err := strconv.ParseInt(strings.TrimSpace(text), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:int literal %q: %w", text, err)
+		}
+		return int32(i), nil
+	case TypeShort:
+		i, err := strconv.ParseInt(strings.TrimSpace(text), 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:short literal %q: %w", text, err)
+		}
+		return int16(i), nil
+	case TypeByte:
+		i, err := strconv.ParseInt(strings.TrimSpace(text), 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:byte literal %q: %w", text, err)
+		}
+		return int8(i), nil
+	case TypeUnsignedLong:
+		u, err := strconv.ParseUint(strings.TrimSpace(text), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:unsignedLong literal %q: %w", text, err)
+		}
+		return u, nil
+	case TypeUnsignedInt:
+		u, err := strconv.ParseUint(strings.TrimSpace(text), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:unsignedInt literal %q: %w", text, err)
+		}
+		return uint32(u), nil
+	case TypeUnsignedShort:
+		u, err := strconv.ParseUint(strings.TrimSpace(text), 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:unsignedShort literal %q: %w", text, err)
+		}
+		return uint16(u), nil
+	case TypeUnsignedByte:
+		u, err := strconv.ParseUint(strings.TrimSpace(text), 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("xmlda: invalid xsd:unsignedByte literal %q: %w", text, err)
+		}
+		return uint8(u), nil
+	case TypeBase64Binary:
+		return parseBytesLiteral(text)
+	case TypeDateTime:
+		return parseXSDDateTime(text)
+	case TypeTime:
+		return parseXSDTime(text)
+	case TypeDate:
+		return parseXSDDate(text)
+	case TypeDuration:
+		return strings.TrimSpace(text), nil
+	default:
+		return nil, fmt.Errorf("xmlda: unsupported scalar type %q", st)
+	}
+}
+
+// formatScalar renders val (as produced by parseScalar or one of the NewX
+// constructors) as its xsd literal text. It does not handle TypeQName.
+func formatScalar(st ScalarType, val any) (string, error) {
+	switch st {
+	case TypeString:
+		return val.(string), nil
+	case TypeBoolean:
+		if val.(bool) {
+			return "true", nil
+		}
+		return "false", nil
+	case TypeFloat:
+		return formatXSDFloat(float64(val.(float32)), 32), nil
+	case TypeDouble:
+		return formatXSDFloat(val.(float64), 64), nil
+	case TypeDecimal:
+		return val.(Decimal).String(), nil
+	case TypeLong:
+		return strconv.FormatInt(val.(int64), 10), nil
+	case TypeInt:
+		return strconv.FormatInt(int64(val.(int32)), 10), nil
+	case TypeShort:
+		return strconv.FormatInt(int64(val.(int16)), 10), nil
+	case TypeByte:
+		return strconv.FormatInt(int64(val.(int8)), 10), nil
+	case TypeUnsignedLong:
+		return strconv.FormatUint(val.(uint64), 10), nil
+	case TypeUnsignedInt:
+		return strconv.FormatUint(uint64(val.(uint32)), 10), nil
+	case TypeUnsignedShort:
+		return strconv.FormatUint(uint64(val.(uint16)), 10), nil
+	case TypeUnsignedByte:
+		return strconv.FormatUint(uint64(val.(uint8)), 10), nil
+	case TypeBase64Binary:
+		return base64.StdEncoding.EncodeToString(val.([]byte)), nil
+	case TypeDateTime:
+		return val.(time.Time).Format(time.RFC3339Nano), nil
+	case TypeTime:
+		// Only the time-of-day component is ever on the wire for xsd:time —
+		// Format simply ignores the date fields of the stored time.Time
+		// (which NewTime keeps as originally passed, e.g. a caller's
+		// "now"), symmetric with parseXSDTime dropping them on decode.
+		return val.(time.Time).Format("15:04:05.999999999"), nil
+	case TypeDate:
+		return val.(time.Time).Format("2006-01-02"), nil
+	case TypeDuration:
+		return val.(string), nil
+	default:
+		return "", fmt.Errorf("xmlda: unsupported scalar type %q", st)
+	}
+}
+
+// --- xsi:type attribute rendering ---
+
+// typeAttrs returns the {xsi:type, xmlns:*} attributes needed to declare
+// tn as an element's xsi:type. It always locally declares whatever
+// namespace prefix it uses (a clean, conventional name — "xsd", "opc", or
+// "ext" for anything else — never Go's auto-generated synthetic prefix),
+// so the output is self-contained and correct whether or not it is
+// embedded in a larger document that already declares a (possibly
+// different) prefix for the same namespace.
+//
+// xsi:type is deliberately returned first, ahead of the xmlns:*
+// declarations it depends on. XML attribute order carries no semantic
+// meaning — a namespace declaration's scope covers its whole element
+// regardless of where in the attribute list it appears — but at least
+// one real-world OPC XML-DA client (github.com/dernate/gopcxmlda, as of
+// v1.1.4) decodes a <Value> element's type by reading attribute index 0
+// and splitting its value on ":", rather than resolving by attribute
+// name. Putting xsi:type first costs nothing and happens to make that
+// client's Read/Write/Subscribe/GetProperties value decoding work; see
+// docs/interoperability.md.
+func typeAttrs(tn QName) []xml.Attr {
+	if tn.Space == "" {
+		return []xml.Attr{
+			{Name: xml.Name{Local: "xsi:type"}, Value: tn.Local},
+			{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
+		}
+	}
+	prefix := prefixForNamespace(tn.Space)
+	return []xml.Attr{
+		{Name: xml.Name{Local: "xsi:type"}, Value: prefix + ":" + tn.Local},
+		{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
+		{Name: xml.Name{Local: "xmlns:" + prefix}, Value: tn.Space},
+	}
+}
+
+func prefixForNamespace(space string) string {
+	switch space {
+	case XSDNamespace:
+		return "xsd"
+	case Namespace:
+		return "opc"
+	default:
+		return "ext"
+	}
+}
+
+// --- MarshalXML / UnmarshalXML ---
+
+// MarshalXML implements xml.Marshaler. It renders v exactly as the
+// specification's real-world wire format: scalars as element text, arrays
+// as repeated scalar-typed child elements, and unknown types verbatim.
+func (v Value) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if v.typeName.IsZero() {
+		return fmt.Errorf("xmlda: cannot marshal a Value with no declared type")
+	}
+	start.Attr = append(append([]xml.Attr{}, start.Attr...), typeAttrs(v.typeName)...)
+	if v.isNil {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xsi:nil"}, Value: "true"})
+		if err := e.EncodeToken(start); err != nil {
+			return err
+		}
+		return e.EncodeToken(start.End())
+	}
+	switch v.kind {
+	case KindUnknown:
+		return v.marshalUnknown(e, start)
+	case KindArray:
+		return v.marshalArray(e, start)
+	default:
+		return v.marshalScalar(e, start)
+	}
+}
+
+func (v Value) marshalUnknown(e *xml.Encoder, start xml.StartElement) error {
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	if err := writeRawInnerXML(e, v.raw.InnerXML); err != nil {
+		return err
+	}
+	return e.EncodeToken(start.End())
+}
+
+func writeRawInnerXML(e *xml.Encoder, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	d := xml.NewDecoder(strings.NewReader(string(raw)))
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("xmlda: re-encoding unknown value's inner XML: %w", err)
+		}
+		if err := e.EncodeToken(xml.CopyToken(tok)); err != nil {
+			return err
+		}
+	}
+}
+
+func (v Value) marshalScalar(e *xml.Encoder, start xml.StartElement) error {
+	if v.typ == TypeQName {
+		return v.marshalQNameScalar(e, start)
+	}
+	text, err := formatScalar(v.typ, v.scalar)
+	if err != nil {
+		return err
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	if text != "" {
+		if err := e.EncodeToken(xml.CharData(text)); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
+}
+
+func (v Value) marshalQNameScalar(e *xml.Encoder, start xml.StartElement) error {
+	qn := v.scalar.(QName)
+	text := qn.Local
+	if qn.Space != "" {
+		prefix := prefixForNamespace(qn.Space)
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: qn.Space})
+		text = prefix + ":" + qn.Local
+	} else {
+		// Explicitly declare "no default namespace" in this scope so an
+		// unprefixed QName value round-trips unambiguously even when
+		// nothing else in the document happens to declare a default
+		// namespace (see resolveQName: an unprefixed value with no
+		// default namespace in scope is otherwise unresolvable).
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: ""})
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	if err := e.EncodeToken(xml.CharData(text)); err != nil {
+		return err
+	}
+	return e.EncodeToken(start.End())
+}
+
+func (v Value) marshalArray(e *xml.Encoder, start xml.StartElement) error {
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	elemLocal := string(v.array.elemType)
+	n := v.array.Len()
+	for i := 0; i < n; i++ {
+		if v.array.elemType == TypeAnyType {
+			elem := v.array.data.([]Value)[i]
+			if err := elem.MarshalXML(e, xml.StartElement{Name: xml.Name{Local: "anyType"}}); err != nil {
+				return err
+			}
+			continue
+		}
+		val, err := elementAt(v.array, i)
+		if err != nil {
+			return err
+		}
+		text, err := formatScalar(v.array.elemType, val)
+		if err != nil {
+			return err
+		}
+		childStart := xml.StartElement{Name: xml.Name{Local: elemLocal}}
+		if err := e.EncodeToken(childStart); err != nil {
+			return err
+		}
+		if text != "" {
+			if err := e.EncodeToken(xml.CharData(text)); err != nil {
+				return err
+			}
+		}
+		if err := e.EncodeToken(childStart.End()); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
+}
+
+// scalarTypesByQName maps a standard XSD scalar xsi:type QName to its
+// ScalarType.
+var scalarTypesByQName = map[QName]ScalarType{
+	{XSDNamespace, "string"}:        TypeString,
+	{XSDNamespace, "boolean"}:       TypeBoolean,
+	{XSDNamespace, "float"}:         TypeFloat,
+	{XSDNamespace, "double"}:        TypeDouble,
+	{XSDNamespace, "decimal"}:       TypeDecimal,
+	{XSDNamespace, "long"}:          TypeLong,
+	{XSDNamespace, "int"}:           TypeInt,
+	{XSDNamespace, "short"}:         TypeShort,
+	{XSDNamespace, "byte"}:          TypeByte,
+	{XSDNamespace, "unsignedLong"}:  TypeUnsignedLong,
+	{XSDNamespace, "unsignedInt"}:   TypeUnsignedInt,
+	{XSDNamespace, "unsignedShort"}: TypeUnsignedShort,
+	{XSDNamespace, "unsignedByte"}:  TypeUnsignedByte,
+	{XSDNamespace, "base64Binary"}:  TypeBase64Binary,
+	{XSDNamespace, "dateTime"}:      TypeDateTime,
+	{XSDNamespace, "time"}:          TypeTime,
+	{XSDNamespace, "date"}:          TypeDate,
+	{XSDNamespace, "duration"}:      TypeDuration,
+	{XSDNamespace, "QName"}:         TypeQName,
+}
+
+// arrayElemTypesByQName maps a standard OPC XML-DA ArrayOf<X> xsi:type
+// QName to the ScalarType of its elements. Deliberately absent:
+// ArrayOfUnsignedByte — see NewAnyArray's doc comment.
+var arrayElemTypesByQName = map[QName]ScalarType{
+	{Namespace, "ArrayOfByte"}:          TypeByte,
+	{Namespace, "ArrayOfShort"}:         TypeShort,
+	{Namespace, "ArrayOfUnsignedShort"}: TypeUnsignedShort,
+	{Namespace, "ArrayOfInt"}:           TypeInt,
+	{Namespace, "ArrayOfUnsignedInt"}:   TypeUnsignedInt,
+	{Namespace, "ArrayOfLong"}:          TypeLong,
+	{Namespace, "ArrayOfUnsignedLong"}:  TypeUnsignedLong,
+	{Namespace, "ArrayOfFloat"}:         TypeFloat,
+	{Namespace, "ArrayOfDecimal"}:       TypeDecimal,
+	{Namespace, "ArrayOfDouble"}:        TypeDouble,
+	{Namespace, "ArrayOfBoolean"}:       TypeBoolean,
+	{Namespace, "ArrayOfString"}:        TypeString,
+	{Namespace, "ArrayOfDateTime"}:      TypeDateTime,
+	{Namespace, "ArrayOfAnyType"}:       TypeAnyType,
+}
+
+// maxAnyTypeArrayDepth bounds how many levels of nested ArrayOfAnyType a
+// decode will follow before failing cleanly. Without it, decodeAnyTypeArray
+// recurses back into Value's own decode logic once per nesting level with
+// no bound, so a small but deeply-nested adversarial document could drive
+// stack usage proportional to attacker-chosen depth. An implementation
+// policy default (not spec-mandated), chosen generously above anything a
+// legitimate OPC XML-DA message would plausibly nest.
+const maxAnyTypeArrayDepth = 64
+
+// UnmarshalXML implements xml.Unmarshaler. It never fails on an
+// unrecognized xsi:type — see ADR-003 — and never panics on malformed
+// input; all failures are returned as errors.
+func (v *Value) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	return v.unmarshalXML(d, start, 0)
+}
+
+// unmarshalXML is UnmarshalXML's real implementation, plus the depth
+// counter threaded through ArrayOfAnyType recursion (see
+// maxAnyTypeArrayDepth) that xml.Unmarshaler's fixed method signature has
+// no room for.
+func (v *Value) unmarshalXML(d *xml.Decoder, start xml.StartElement, depth int) error {
+	if depth > maxAnyTypeArrayDepth {
+		return fmt.Errorf("xmlda: ArrayOfAnyType nesting exceeds the maximum depth of %d", maxAnyTypeArrayDepth)
+	}
+	rawType, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "type"})
+	if !ok {
+		return fmt.Errorf("xmlda: <%s> is missing a required xsi:type attribute", start.Name.Local)
+	}
+	tn, err := resolveQName(d, rawType)
+	if err != nil {
+		return err
+	}
+
+	isNil := false
+	if nilAttr, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "nil"}); ok {
+		isNil = strings.EqualFold(strings.TrimSpace(nilAttr), "true") || strings.TrimSpace(nilAttr) == "1"
+	}
+	if isNil {
+		kind, typ := decodeNilKind(tn)
+		v.kind, v.typ, v.typeName, v.isNil = kind, typ, tn, true
+		return d.Skip()
+	}
+
+	if st, ok := scalarTypesByQName[tn]; ok {
+		return v.decodeScalar(d, start, st, tn)
+	}
+	if et, ok := arrayElemTypesByQName[tn]; ok {
+		return v.decodeArray(d, start, et, tn, depth)
+	}
+	return v.decodeUnknown(d, start, tn)
+}
+
+func (v *Value) decodeScalar(d *xml.Decoder, start xml.StartElement, st ScalarType, tn QName) error {
+	var holder struct {
+		Text string `xml:",chardata"`
+	}
+	if err := d.DecodeElement(&holder, &start); err != nil {
+		return fmt.Errorf("xmlda: decoding scalar %s: %w", tn, err)
+	}
+	if st == TypeQName {
+		qn, err := resolveQName(d, strings.TrimSpace(holder.Text))
+		if err != nil {
+			return err
+		}
+		v.kind, v.typ, v.typeName, v.scalar = KindScalar, st, tn, qn
+		return nil
+	}
+	scalar, err := parseScalar(st, holder.Text)
+	if err != nil {
+		return err
+	}
+	v.kind, v.typ, v.typeName, v.scalar = KindScalar, st, tn, scalar
+	return nil
+}
+
+func (v *Value) decodeArray(d *xml.Decoder, start xml.StartElement, elemType ScalarType, tn QName, depth int) error {
+	if elemType == TypeAnyType {
+		elems, err := decodeAnyTypeArray(d, depth)
+		if err != nil {
+			return fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
+		}
+		v.kind, v.typ, v.typeName, v.array = KindArray, elemType, tn, Array{elemType: elemType, typeName: tn, data: elems}
+		return nil
+	}
+
+	wantLocal := string(elemType)
+	var data any
+	var err error
+	switch elemType {
+	case TypeByte:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (int8, error) {
+			r, e := parseScalar(TypeByte, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(int8), nil
+		})
+	case TypeShort:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (int16, error) {
+			r, e := parseScalar(TypeShort, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(int16), nil
+		})
+	case TypeUnsignedShort:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (uint16, error) {
+			r, e := parseScalar(TypeUnsignedShort, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(uint16), nil
+		})
+	case TypeInt:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (int32, error) {
+			r, e := parseScalar(TypeInt, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(int32), nil
+		})
+	case TypeUnsignedInt:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (uint32, error) {
+			r, e := parseScalar(TypeUnsignedInt, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(uint32), nil
+		})
+	case TypeLong:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (int64, error) {
+			r, e := parseScalar(TypeLong, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(int64), nil
+		})
+	case TypeUnsignedLong:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (uint64, error) {
+			r, e := parseScalar(TypeUnsignedLong, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(uint64), nil
+		})
+	case TypeFloat:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (float32, error) {
+			r, e := parseScalar(TypeFloat, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(float32), nil
+		})
+	case TypeDecimal:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (Decimal, error) {
+			r, e := parseScalar(TypeDecimal, s)
+			if e != nil {
+				return "", e
+			}
+			return r.(Decimal), nil
+		})
+	case TypeDouble:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (float64, error) {
+			r, e := parseScalar(TypeDouble, s)
+			if e != nil {
+				return 0, e
+			}
+			return r.(float64), nil
+		})
+	case TypeBoolean:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (bool, error) {
+			r, e := parseScalar(TypeBoolean, s)
+			if e != nil {
+				return false, e
+			}
+			return r.(bool), nil
+		})
+	case TypeString:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (string, error) {
+			return s, nil
+		})
+	case TypeDateTime:
+		data, err = decodeScalarArray(d, tn, wantLocal, func(s string) (time.Time, error) {
+			r, e := parseScalar(TypeDateTime, s)
+			if e != nil {
+				return time.Time{}, e
+			}
+			return r.(time.Time), nil
+		})
+	default:
+		return fmt.Errorf("xmlda: array %s: unsupported element type %q", tn, elemType)
+	}
+	if err != nil {
+		return fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
+	}
+	v.kind, v.typ, v.typeName, v.array = KindArray, elemType, tn, Array{elemType: elemType, typeName: tn, data: data}
+	return nil
+}
+
+// decodeScalarArray reads repeated <wantLocal>text</wantLocal> child
+// elements until the array's end element, parsing each via parse.
+func decodeScalarArray[T any](d *xml.Decoder, tn QName, wantLocal string, parse func(string) (T, error)) ([]T, error) {
+	var out []T
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return nil, fmt.Errorf("array %s: %w", tn, err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local != wantLocal {
+				return nil, fmt.Errorf("array %s: unexpected child element %q, want %q", tn, t.Name.Local, wantLocal)
+			}
+			var holder struct {
+				Text string `xml:",chardata"`
+			}
+			if err := d.DecodeElement(&holder, &t); err != nil {
+				return nil, err
+			}
+			val, err := parse(holder.Text)
+			if err != nil {
+				return nil, fmt.Errorf("array %s: element %d: %w", tn, len(out), err)
+			}
+			out = append(out, val)
+		case xml.EndElement:
+			return out, nil
+		}
+	}
+}
+
+// decodeAnyTypeArray reads child elements of an ArrayOfAnyType value,
+// tolerating any child element local name (the .NET-style convention is
+// "anyType", but only each child's own xsi:type actually matters). depth
+// is this array's own nesting depth (see maxAnyTypeArrayDepth); each
+// element is decoded one level deeper.
+func decodeAnyTypeArray(d *xml.Decoder, depth int) ([]Value, error) {
+	var elems []Value
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			var elem Value
+			if err := elem.unmarshalXML(d, t, depth+1); err != nil {
+				return nil, err
+			}
+			elems = append(elems, elem)
+		case xml.EndElement:
+			return elems, nil
+		}
+	}
+}
+
+func (v *Value) decodeUnknown(d *xml.Decoder, start xml.StartElement, tn QName) error {
+	var holder struct {
+		Inner []byte `xml:",innerxml"`
+	}
+	if err := d.DecodeElement(&holder, &start); err != nil {
+		return fmt.Errorf("xmlda: decoding unrecognized-type value %s: %w", tn, err)
+	}
+	v.kind, v.typeName, v.raw = KindUnknown, tn, RawValue{TypeName: tn, InnerXML: holder.Inner}
+	return nil
+}
