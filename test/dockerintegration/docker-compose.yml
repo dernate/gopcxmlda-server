@@ -1,0 +1,17 @@
+# Manual/local convenience only — the automated integration test
+# (docker_test.go) builds and runs the container itself via
+# testcontainers-go and does not use this file. Run from the repository
+# root:
+#
+#   docker compose -f test/dockerintegration/docker-compose.yml up --build
+#
+# then, from another shell:
+#
+#   curl -s http://localhost:8080/ -H 'Content-Type: text/xml' --data-binary @request.xml
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: test/dockerintegration/Dockerfile
+    ports:
+      - "8080:8080"

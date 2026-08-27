@@ -62,6 +62,30 @@ func newTestServer(t *testing.T) (*gopcxmlda.Server, *memorybackend.Backend) {
 	return client, be
 }
 
+// clientOptions is the RequestOptions every client call in this module
+// sends. Asking for ItemName, ItemPath and Timestamp exercises each
+// response in its fully populated form instead of the sparse default one,
+// so a field the server fails to echo surfaces as a test failure rather
+// than going unnoticed.
+//
+// The attribute names are PascalCase because that is what the wire format
+// defines and what the server matches. XML attribute names are
+// case-sensitive, so a lowercased "returnItemName" is not a synonym for
+// "ReturnItemName" — it is an unknown attribute, silently ignored, and
+// the option falls back to its false default. TestRealClient_RequestOptionsAreCaseSensitive pins that down.
+//
+// It returns a fresh map on every call rather than exposing one shared
+// value: the reference client writes ClientRequestHandle into the map it
+// is handed, so a single map shared across concurrent calls is a data
+// race.
+func clientOptions() map[string]any {
+	return map[string]any{
+		"ReturnItemTime": true,
+		"ReturnItemPath": true,
+		"ReturnItemName": true,
+	}
+}
+
 func newHandles(t *testing.T, n int) (string, []string) {
 	t.Helper()
 	crh, cih, err := gopcxmlda.GenerateClientHandles(n)
@@ -131,7 +155,7 @@ func TestRealClient_ReadInitialValue(t *testing.T) {
 	crh, cih := newHandles(t, 1)
 
 	items := []gopcxmlda.TItem{{ItemName: "Demo/Switch"}}
-	got, err := client.Read(context.Background(), items, &crh, &cih, "", map[string]any{})
+	got, err := client.Read(context.Background(), items, &crh, &cih, "", clientOptions())
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -141,6 +165,14 @@ func TestRealClient_ReadInitialValue(t *testing.T) {
 	item := got.Response.ItemList.Items[0]
 	if item.Error != "" {
 		t.Fatalf("unexpected ResultID %q", item.Error)
+	}
+	// clientOptions asked for these; a reply that omits them is a
+	// server-side gating bug, not a client quirk.
+	if item.ItemName != "Demo/Switch" {
+		t.Errorf("got ItemName %q, want it echoed as requested via ReturnItemName", item.ItemName)
+	}
+	if item.Timestamp.IsZero() {
+		t.Errorf("got no Timestamp despite ReturnItemTime")
 	}
 	b, ok := item.Value.Value.(bool)
 	if !ok {
@@ -172,7 +204,7 @@ func TestRealClient_WriteScalar_TypeNamespaceMismatch(t *testing.T) {
 	crh, cih := newHandles(t, 1)
 
 	items := []gopcxmlda.TItem{{ItemName: "Demo/Switch", Value: gopcxmlda.TValue{Value: true}}}
-	_, err := client.Write(context.Background(), items, &crh, &cih, "", map[string]any{})
+	_, err := client.Write(context.Background(), items, &crh, &cih, "", clientOptions())
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -218,7 +250,7 @@ func TestRealClient_WriteArray_DecodesCorrectly(t *testing.T) {
 	// memorybackend.Write does not type-check against the item's "native"
 	// type, it stores whatever Value it's given.
 	items := []gopcxmlda.TItem{{ItemName: "Demo/Message", Value: gopcxmlda.TValue{Value: []int32{1, 2, 3}}}}
-	_, err := client.Write(context.Background(), items, &crh, &cih, "", map[string]any{})
+	_, err := client.Write(context.Background(), items, &crh, &cih, "", clientOptions())
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -247,7 +279,7 @@ func TestRealClient_WriteUnknownItem_ReportsResultID(t *testing.T) {
 	crh, cih := newHandles(t, 1)
 
 	items := []gopcxmlda.TItem{{ItemName: "Demo/NoSuchItem", Value: gopcxmlda.TValue{Value: true}}}
-	got, err := client.Write(context.Background(), items, &crh, &cih, "", map[string]any{})
+	got, err := client.Write(context.Background(), items, &crh, &cih, "", clientOptions())
 	// The client treats a non-empty top-level <Errors> list as an error
 	// return (errReturn), so err != nil here is expected — assert on the
 	// decoded ResultID instead of treating err as fatal.
@@ -304,7 +336,7 @@ func TestRealClient_SubscribeAndPolledRefresh(t *testing.T) {
 	crh, cih := newHandles(t, 1)
 
 	items := []gopcxmlda.TItem{{ItemName: "Demo/Counter"}}
-	sub, err := client.Subscribe(context.Background(), items, &crh, &cih, "", true, 0, map[string]any{})
+	sub, err := client.Subscribe(context.Background(), items, &crh, &cih, "", true, 0, clientOptions())
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
@@ -323,7 +355,7 @@ func TestRealClient_SubscribeAndPolledRefresh(t *testing.T) {
 	crh2, _ := newHandles(t, 0)
 	refreshed, err := client.SubscriptionPolledRefresh(
 		context.Background(), sub.Response.ServerSubHandle, 0, "", &crh2,
-		map[string]any{}, gopcxmlda.TServerTime{UseClientTime: true},
+		clientOptions(), gopcxmlda.TServerTime{UseClientTime: true},
 	)
 	if err != nil {
 		t.Fatalf("SubscriptionPolledRefresh: %v", err)
@@ -334,6 +366,70 @@ func TestRealClient_SubscribeAndPolledRefresh(t *testing.T) {
 	if len(refreshed.Response.ItemList.Items) == 0 {
 		t.Fatalf("expected at least one changed item (Demo/Counter ticks every second) after a 1.2s wait")
 	}
+	for _, item := range refreshed.Response.ItemList.Items {
+		if item.ItemName != "Demo/Counter" || item.Timestamp.IsZero() {
+			t.Errorf("got refreshed item %+v, want ItemName and Timestamp echoed per clientOptions", item)
+		}
+	}
+}
+
+// TestRealClient_RequestOptionsAreCaseSensitive pins down why
+// clientOptions spells its keys in PascalCase. The reference client
+// passes an options map straight through as XML attributes without
+// validating or normalizing the keys, and XML attribute names are
+// case-sensitive, so a lowercased key is not a differently-spelled
+// request for the same option — it is an attribute the server has never
+// heard of. Nothing rejects it: the request succeeds, and the option
+// quietly keeps its false default, which looks exactly like a server that
+// forgot to echo the field.
+//
+// ItemPath cannot be asserted here the way ItemName can: the server
+// echoes it as an empty attribute for these items, which the client
+// decodes into the same empty string an absent attribute produces. Name
+// and Timestamp are the observable discriminators.
+func TestRealClient_RequestOptionsAreCaseSensitive(t *testing.T) {
+	client, _ := newTestServer(t)
+
+	read := func(t *testing.T, options map[string]any) gopcxmlda.TItem {
+		t.Helper()
+		crh, cih := newHandles(t, 1)
+		got, err := client.Read(context.Background(),
+			[]gopcxmlda.TItem{{ItemName: "Demo/Switch"}}, &crh, &cih, "", options)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(got.Response.ItemList.Items) != 1 {
+			t.Fatalf("got %d items, want 1", len(got.Response.ItemList.Items))
+		}
+		return got.Response.ItemList.Items[0]
+	}
+
+	t.Run("PascalCaseIsHonored", func(t *testing.T) {
+		item := read(t, clientOptions())
+		if item.ItemName != "Demo/Switch" {
+			t.Errorf("got ItemName %q, want %q", item.ItemName, "Demo/Switch")
+		}
+		if item.Timestamp.IsZero() {
+			t.Errorf("got no Timestamp, want one")
+		}
+	})
+
+	t.Run("LowercasedKeysAreIgnored", func(t *testing.T) {
+		item := read(t, map[string]any{
+			"ReturnItemTime": true,
+			"returnItemPath": true,
+			"returnItemName": true,
+		})
+		if item.ItemName != "" {
+			t.Errorf("got ItemName %q from a lowercased returnItemName; the server must not match attributes case-insensitively", item.ItemName)
+		}
+		// The one correctly-spelled key in that map still works, which is
+		// what makes the mistake so easy to miss: the reply is not empty,
+		// just missing the two fields whose keys were misspelled.
+		if item.Timestamp.IsZero() {
+			t.Errorf("got no Timestamp despite a correctly spelled ReturnItemTime")
+		}
+	})
 }
 
 // TestRealClient_SubscriptionCancel documents a second real
@@ -349,7 +445,7 @@ func TestRealClient_SubscriptionCancel(t *testing.T) {
 	crh, cih := newHandles(t, 1)
 
 	items := []gopcxmlda.TItem{{ItemName: "Demo/Counter"}}
-	sub, err := client.Subscribe(context.Background(), items, &crh, &cih, "", false, 0, map[string]any{})
+	sub, err := client.Subscribe(context.Background(), items, &crh, &cih, "", false, 0, clientOptions())
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
@@ -370,7 +466,7 @@ func TestRealClient_SubscriptionCancel(t *testing.T) {
 	crh3, _ := newHandles(t, 0)
 	refreshed, err := client.SubscriptionPolledRefresh(
 		context.Background(), handle, 0, "", &crh3,
-		map[string]any{}, gopcxmlda.TServerTime{UseClientTime: true},
+		clientOptions(), gopcxmlda.TServerTime{UseClientTime: true},
 	)
 	// Only one handle was ever requested, and it is now invalid — per
 	// this server's own documented behavior (matching

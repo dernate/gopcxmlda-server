@@ -29,3 +29,36 @@ jobs:
 
       - name: Test (race detector)
         run: go test -race ./...
+
+  client-integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test/clientintegration/go.mod
+
+      - name: Test against real gopcxmlda client (in-process)
+        working-directory: test/clientintegration
+        run: go test ./...
+
+  docker-integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test/dockerintegration/go.mod
+
+      # Covers both the per-operation test and the sustained-load soak
+      # test; the latter runs for DOCKERINTEGRATION_SOAK (default 30s)
+      # and is what `go test -short` would skip.
+      - name: Test against real gopcxmlda client (Dockerized server)
+        working-directory: test/dockerintegration
+        run: go test ./...
