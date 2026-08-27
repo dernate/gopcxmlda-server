@@ -92,16 +92,25 @@ func (h *Handler) BeginShutdown() {
 // record — degrading every other in-flight request on that connection
 // for a failure isolated to one call.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Captured before anything else, so ReplyBase.RcvTime is genuinely the
+	// receipt time rather than "whenever this handler last looked at the
+	// clock" (see opContext).
+	rcvTime := h.clk.Now()
+
 	opName := "unknown"
 	defer func() {
 		if rec := recover(); rec != nil {
 			h.log.Error("panic recovered while handling request",
 				"operation", opName, "panic", rec, "stack", string(debug.Stack()))
 			h.metrics.IncRequestError(opName, "panic")
-			writeFaultWithStatus(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)), http.StatusInternalServerError)
+			writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
 		}
 	}()
 
+	// Transport-level rejections below emit no SOAP envelope at all, so
+	// they use the HTTP status code that actually describes them. Every
+	// response that *does* carry a SOAP Fault goes through writeFault,
+	// which is fixed at 500 per the SOAP 1.1 HTTP binding.
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed: OPC XML-DA is POST-only", http.StatusMethodNotAllowed)
 		return
@@ -112,27 +121,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.metrics.IncParseError()
 		var maxErr *http.MaxBytesError
-		status := http.StatusBadRequest
-		text := "unable to read request body"
 		if errors.As(err, &maxErr) {
-			status = http.StatusRequestEntityTooLarge
-			text = "request body exceeds the configured maximum size"
+			http.Error(w, "request body exceeds the configured maximum size", http.StatusRequestEntityTooLarge)
+			return
 		}
-		writeFaultWithStatus(w, soapClientFault(text), status)
+		http.Error(w, "unable to read request body", http.StatusBadRequest)
 		return
 	}
 
-	op, ok, err := xmlda.IdentifyOperation(body)
+	// One Document for the whole request: its namespace-prefix table is
+	// built once here and reused by the typed decode in each handler,
+	// instead of being rebuilt from scratch per decode.
+	doc, err := xmlda.NewDocument(body)
 	if err != nil {
 		// Bucket 1: not well-formed XML/SOAP at all.
 		h.metrics.IncParseError()
-		writeFaultWithStatus(w, soapClientFault("malformed request: "+err.Error()), http.StatusBadRequest)
+		writeFault(w, soapClientFault("malformed request: "+err.Error()))
+		return
+	}
+	op, ok, err := doc.IdentifyOperation()
+	if err != nil {
+		h.metrics.IncParseError()
+		writeFault(w, soapClientFault("malformed request: "+err.Error()))
 		return
 	}
 	if !ok {
 		// Bucket 2: well-formed, but not one of the 8 known operations.
 		h.metrics.IncRequestError("unknown", "unsupported_operation")
-		writeFaultWithStatus(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
 		return
 	}
 
@@ -141,46 +157,67 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	timeout := h.cfg.RequestTimeout
 	if opName == "SubscriptionPolledRefresh" {
-		timeout = h.cfg.MaxPolledRefreshWait
+		// The operation's own Hold+Wait budget is capped at
+		// MaxPolledRefreshWait (see handlePolledRefresh). This context
+		// deadline is deliberately that budget *plus* headroom: were the
+		// two equal, a client legitimately requesting the full budget
+		// would race the context, and losing that race turns a complete,
+		// data-bearing response into an E_TIMEDOUT fault that discards it.
+		// The Hold+Wait cap is the authority; this is only a backstop
+		// against a handler that somehow never returns.
+		timeout = h.cfg.MaxPolledRefreshWait + polledRefreshGrace
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
+	// Locale "" here: this call exists only to obtain State for
+	// RequiresFault, before the request body has been decoded and the
+	// client's requested LocaleID is even known (REQ-SERVER-002).
+	// GetStatus re-fetches with the requested locale when one was asked
+	// for — see handleGetStatus.
 	status, err := h.backend.Status.GetStatus(ctx, "")
 	if err != nil {
 		h.metrics.IncRequestError(opName, "backend_error")
-		writeFaultWithStatus(w, backendErrorFault(err), http.StatusInternalServerError)
+		writeFault(w, backendErrorFault(err))
 		return
 	}
 	if needsFault, code := xmlda.RequiresFault(opName, status.State); needsFault {
 		h.metrics.IncRequestError(opName, "server_state")
-		writeFaultWithStatus(w, fault(code, xmlda.StandardErrorText(code)), http.StatusInternalServerError)
+		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
 		return
 	}
 
+	oc := opContext{rcvTime: rcvTime, status: status}
+
 	switch opName {
 	case "GetStatus":
-		h.handleGetStatus(ctx, w, body, status)
+		h.handleGetStatus(ctx, w, doc, oc)
 	case "Read":
-		h.handleRead(ctx, w, body, status.State)
+		h.handleRead(ctx, w, doc, oc)
 	case "Write":
-		h.handleWrite(ctx, w, body, status.State)
+		h.handleWrite(ctx, w, doc, oc)
 	case "Browse":
-		h.handleBrowse(ctx, w, body, status.State)
+		h.handleBrowse(ctx, w, doc, oc)
 	case "GetProperties":
-		h.handleGetProperties(ctx, w, body, status.State)
+		h.handleGetProperties(ctx, w, doc, oc)
 	case "Subscribe":
-		h.handleSubscribe(ctx, w, body, status.State)
+		h.handleSubscribe(ctx, w, doc, oc)
 	case "SubscriptionPolledRefresh":
-		h.handlePolledRefresh(ctx, w, body, status.State)
+		h.handlePolledRefresh(ctx, w, doc, oc)
 	case "SubscriptionCancel":
-		h.handleSubscriptionCancel(ctx, w, body)
+		h.handleSubscriptionCancel(ctx, w, doc)
 	default:
 		// Unreachable: op came from xmlda's own registry, which only
 		// contains these 8 names.
-		writeFaultWithStatus(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
 	}
 }
+
+// polledRefreshGrace is the headroom added to a SubscriptionPolledRefresh
+// request's context deadline beyond Config.MaxPolledRefreshWait, so
+// assembling and encoding the response cannot be cut short by the very
+// deadline the Hold+Wait budget was sized against.
+const polledRefreshGrace = 5 * time.Second
 
 // writeResponse encodes resp as a successful SOAP response body. It is a
 // package-level generic function, not a method, because Go does not
@@ -199,7 +236,7 @@ func writeResponse[T any](w http.ResponseWriter, resp T) {
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
 	if err := xml.NewEncoder(&buf).Encode(env); err != nil {
-		writeFaultWithStatus(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)), http.StatusInternalServerError)
+		writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
 		return
 	}
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
@@ -207,18 +244,34 @@ func writeResponse[T any](w http.ResponseWriter, resp T) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-// writeFaultWithStatus encodes f as a SOAP Fault response body with the
-// given HTTP status. Client-input-driven faults (malformed/unrecognized
-// requests, configured-limit violations) use 400; server-condition
-// faults (ServerState, backend errors, busy, timeout) use 500 — an
-// implementation choice (the specification does not mandate HTTP status
-// codes), applied consistently.
-func writeFaultWithStatus(w http.ResponseWriter, f *soap.Fault, status int) {
+// writeFault encodes f as a SOAP Fault response body.
+//
+// The status is always 500, as the SOAP 1.1 HTTP binding requires (§6.2:
+// a response carrying a SOAP Fault "MUST" use 500) — and this library
+// always emits the SOAP 1.1 shape (ADR-004). Distinguishing
+// client-input faults with a 400 reads as more informative, but it makes
+// the response non-conformant, and a strict SOAP 1.1 client is entitled
+// to treat a 4xx as a transport failure and never parse the Fault body
+// at all — losing the very error code the fault existed to convey.
+// Failures that emit no SOAP envelope (wrong HTTP method, oversized body)
+// are not SOAP faults and keep their own status codes; see ServeHTTP.
+//
+// Encoding goes into a buffer first for the same reason writeResponse
+// does it: WriteHeader cannot be taken back, so an encode failure partway
+// through must not reach the client as a truncated fault body.
+func writeFault(w http.ResponseWriter, f *soap.Fault) {
 	env := soap.Envelope[struct{}]{Body: soap.Body[struct{}]{Fault: f}}
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	if err := xml.NewEncoder(&buf).Encode(env); err != nil {
+		// A Fault that cannot be encoded leaves nothing meaningful to
+		// send; report the status alone rather than a malformed body.
+		http.Error(w, "internal error encoding SOAP fault", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(xml.Header))
-	_ = xml.NewEncoder(w).Encode(env)
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // checkItemCount rejects a request whose item count exceeds

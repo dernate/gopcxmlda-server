@@ -281,6 +281,45 @@ const (
 	FaultNotSupported FaultCode = "not_supported"
 )
 
+// ErrorCode maps fc to the xmlda.ErrorCode it denotes. An unrecognized
+// FaultCode maps to E_FAIL.
+func (fc FaultCode) ErrorCode() xmlda.ErrorCode {
+	switch fc {
+	case FaultBusy:
+		return xmlda.ErrBusy
+	case FaultAccessDenied:
+		return xmlda.ErrAccessDenied
+	case FaultServerState:
+		return xmlda.ErrServerState
+	case FaultOutOfMemory:
+		return xmlda.ErrOutOfMemory
+	case FaultTimedOut:
+		return xmlda.ErrTimedOut
+	case FaultNotSupported:
+		return xmlda.ErrNotSupported
+	default:
+		return xmlda.ErrFail
+	}
+}
+
+// ErrorCodeFor maps an arbitrary error from a backend call to the
+// xmlda.ErrorCode it should be reported as (ADR-005): an opt-in
+// *BackendError is honored precisely, context.DeadlineExceeded becomes
+// E_TIMEDOUT, and anything else becomes E_FAIL. It is the single mapping
+// used both for whole-operation SOAP faults (server layer) and for the
+// per-item ResultID of an asynchronously-failing subscribed item
+// (subscription layer), so the two can never drift apart.
+func ErrorCodeFor(err error) xmlda.ErrorCode {
+	var be *BackendError
+	if errors.As(err, &be) {
+		return be.Fault.ErrorCode()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return xmlda.ErrTimedOut
+	}
+	return xmlda.ErrFail
+}
+
 // BackendError lets a backend precisely signal a whole-operation failure
 // (e.g. busy/access-denied) instead of relying on the server's
 // deterministic default mapping (context.DeadlineExceeded → E_TIMEDOUT,

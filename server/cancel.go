@@ -13,11 +13,11 @@ import (
 // REQ-SUBSCRIPTION-011, the response has no ReplyBase at all, so this
 // handler — unlike every other operation — does not need the current
 // ServerState.
-func (h *Handler) handleSubscriptionCancel(ctx context.Context, w http.ResponseWriter, body []byte) {
+func (h *Handler) handleSubscriptionCancel(ctx context.Context, w http.ResponseWriter, doc *xmlda.Document) {
 	var env soap.Envelope[xmlda.SubscriptionCancelRequest]
-	if err := xmlda.Decode(body, &env); err != nil {
+	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("SubscriptionCancel", "parse")
-		writeFaultWithStatus(w, requestDecodeFault("SubscriptionCancel", err), http.StatusBadRequest)
+		writeFault(w, requestDecodeFault("SubscriptionCancel", err))
 		return
 	}
 	req := env.Body.Content

@@ -12,28 +12,28 @@ import (
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
-func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, body []byte, state xmlda.ServerState) {
+func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, doc *xmlda.Document, oc opContext) {
 	var env soap.Envelope[xmlda.SubscribeRequest]
-	if err := xmlda.Decode(body, &env); err != nil {
+	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Subscribe", "parse")
-		writeFaultWithStatus(w, requestDecodeFault("Subscribe", err), http.StatusBadRequest)
+		writeFault(w, requestDecodeFault("Subscribe", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Subscribe", "deadline_exceeded")
-		writeFaultWithStatus(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)), http.StatusInternalServerError)
+		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
 	if len(req.ItemList.Items) == 0 {
 		h.metrics.IncRequestError("Subscribe", "empty_item_list")
-		writeFaultWithStatus(w, fault(xmlda.ErrFail, "at least one item is required"), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
 		return
 	}
 	if !h.checkSubscriptionItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Subscribe", "limit_exceeded")
-		writeFaultWithStatus(w, limitExceededFault("too many items in one Subscribe request"), http.StatusBadRequest)
+		writeFault(w, limitExceededFault("too many items in one Subscribe request"))
 		return
 	}
 
@@ -76,15 +76,21 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, bo
 	if err != nil {
 		if errors.Is(err, subscription.ErrTooManySubscriptions) {
 			h.metrics.IncRequestError("Subscribe", "limit_exceeded")
-			writeFaultWithStatus(w, limitExceededFault(err.Error()), http.StatusBadRequest)
+			writeFault(w, limitExceededFault(err.Error()))
+			return
+		}
+		if errors.Is(err, subscription.ErrShuttingDown) {
+			// A shutting-down server is a server-state condition, not the
+			// generic E_FAIL a bare context.Canceled used to produce.
+			h.metrics.IncRequestError("Subscribe", "server_state")
+			writeFault(w, fault(xmlda.ErrServerState, xmlda.StandardErrorText(xmlda.ErrServerState)))
 			return
 		}
 		h.metrics.IncRequestError("Subscribe", "backend_error")
-		writeFaultWithStatus(w, backendErrorFault(err), http.StatusInternalServerError)
+		writeFault(w, backendErrorFault(err))
 		return
 	}
 
-	now := h.clk.Now()
 	listItems := make([]xmlda.SubscribeItemValue, len(res.Items))
 	codes := make([]xmlda.ErrorCode, len(res.Items))
 	for i, itemRes := range res.Items {
@@ -98,15 +104,9 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, bo
 
 	resp := xmlda.SubscribeResponse{
 		ServerSubHandle: string(res.Handle),
-		Result: xmlda.ReplyBase{
-			RcvTime:             now,
-			ReplyTime:           now,
-			ClientRequestHandle: req.Options.ClientRequestHandle,
-			RevisedLocaleID:     req.Options.LocaleID,
-			ServerState:         state,
-		},
-		RItemList: xmlda.SubscribeReplyItemList{Items: listItems},
-		Errors:    xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
+		Result:          h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
+		RItemList:       xmlda.SubscribeReplyItemList{Items: listItems},
+		Errors:          xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
 	}
 	writeResponse(w, resp)
 }

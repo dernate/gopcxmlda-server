@@ -121,8 +121,8 @@ func TestHandleRead_EmptyItemList_Faults(t *testing.T) {
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
 	resp := postSOAP(t, h, readRequestBody(nil))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 	f := decodeFault(t, resp)
 	if f == nil {
@@ -140,8 +140,8 @@ func TestHandleRead_ItemCountLimit(t *testing.T) {
 	h := newTestHandler(t, be, Config{MaxItemsPerRequest: 3}, clock.Real{})
 
 	resp := postSOAP(t, h, readRequestBody(names))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 	f := decodeFault(t, resp)
 	if f == nil || f.Code.Local != "E_OUTOFMEMORY" {

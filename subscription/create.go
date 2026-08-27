@@ -16,6 +16,13 @@ import (
 // not a specification requirement).
 var ErrTooManySubscriptions = errors.New("subscription: maximum number of concurrent subscriptions reached")
 
+// ErrShuttingDown is returned by Create once BeginShutdown has run: the
+// Manager will accept no new subscriptions. The server layer maps this to
+// an E_SERVERSTATE fault (the specification's code for "the server cannot
+// perform this operation in its current state"), not the E_FAIL that a
+// bare context.Canceled would otherwise produce.
+var ErrShuttingDown = errors.New("subscription: server is shutting down")
+
 // CreateItemRequest is one item requested in a Create call.
 type CreateItemRequest struct {
 	Ref                   backend.ItemRef
@@ -153,7 +160,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 	if m.rootCtx.Err() != nil {
 		m.mu.Unlock()
 		cancel()
-		return CreateResult{}, m.rootCtx.Err()
+		return CreateResult{}, ErrShuttingDown
 	}
 	if m.cfg.MaxConcurrentSubscriptions > 0 && len(m.subs) >= m.cfg.MaxConcurrentSubscriptions {
 		m.mu.Unlock()

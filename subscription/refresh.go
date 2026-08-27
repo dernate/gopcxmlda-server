@@ -37,8 +37,16 @@ type RefreshRequest struct {
 type RefreshItemResult struct {
 	Ref              backend.ItemRef
 	ClientItemHandle string
-	Sample           backend.ItemSample
-	ResultID         xmlda.ErrorCode
+	// Sample is meaningful only if HaveSample is true.
+	Sample backend.ItemSample
+	// HaveSample is false when this entry reports an abnormal condition
+	// rather than a value — i.e. whenever ResultID is non-zero. The server
+	// layer must not build a wire Value from Sample in that case.
+	HaveSample bool
+	// ResultID is the item's condition at the time this entry was
+	// recorded; the zero ErrorCode means the item was healthy and Sample
+	// holds its value.
+	ResultID xmlda.ErrorCode
 }
 
 // RefreshSubscriptionResult is one polled subscription's changed (or, if
@@ -250,20 +258,34 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 			it.mu.Lock()
 			switch {
 			case returnAllItems:
-				if it.haveLast {
+				// An item currently in an abnormal condition reports that
+				// condition, not its stale last value dressed up as
+				// current: ReturnAllItems asks for every item's state, and
+				// "unreadable" is that state.
+				switch {
+				case !it.lastResultID.IsZero():
+					itemResults = append(itemResults, RefreshItemResult{
+						Ref:              it.ref,
+						ClientItemHandle: it.clientItemHandle,
+						ResultID:         it.lastResultID,
+					})
+				case it.haveLast:
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
 						Sample:           it.last,
+						HaveSample:       true,
 					})
 				}
 				it.buffer = nil
 			case len(it.buffer) > 0:
-				for _, sample := range it.buffer {
+				for _, u := range it.buffer {
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
-						Sample:           sample,
+						Sample:           u.sample,
+						HaveSample:       u.haveSample,
+						ResultID:         u.resultID,
 					})
 				}
 				it.buffer = nil

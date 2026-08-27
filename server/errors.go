@@ -1,9 +1,6 @@
 package server
 
 import (
-	"context"
-	"errors"
-
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/soap"
 	"github.com/dernate/gopcxmlda-server/xmlda"
@@ -21,45 +18,20 @@ func fault(code xmlda.ErrorCode, text string) *soap.Fault {
 	return &soap.Fault{Code: toSoapQName(code), Text: text}
 }
 
-// backendFaultCodeToErrorCode maps a backend.FaultCode to its
-// corresponding xmlda.ErrorCode (ADR-005).
-func backendFaultCodeToErrorCode(fc backend.FaultCode) xmlda.ErrorCode {
-	switch fc {
-	case backend.FaultBusy:
-		return xmlda.ErrBusy
-	case backend.FaultAccessDenied:
-		return xmlda.ErrAccessDenied
-	case backend.FaultServerState:
-		return xmlda.ErrServerState
-	case backend.FaultOutOfMemory:
-		return xmlda.ErrOutOfMemory
-	case backend.FaultTimedOut:
-		return xmlda.ErrTimedOut
-	case backend.FaultNotSupported:
-		return xmlda.ErrNotSupported
-	default:
-		return xmlda.ErrFail
-	}
-}
-
 // backendErrorFault maps a whole-operation error from a backend call (or
 // from subscription.Manager, which surfaces the same kind of plain Go
-// errors for whole-operation failures) to a soap.Fault, per ADR-005: an
-// opt-in *backend.BackendError is honored precisely; anything else falls
-// back to a deterministic default (context.DeadlineExceeded → E_TIMEDOUT,
-// else E_FAIL). Internal error text is never included verbatim — only the
-// fixed, generic description matching the resolved code — so backend
-// implementation details never reach a client (docs/specification/error-mapping.md).
+// errors for whole-operation failures) to a soap.Fault, per ADR-005.
+//
+// The error-to-code mapping itself lives in backend.ErrorCodeFor, because
+// the subscription engine needs the identical mapping for the per-item
+// ResultID of an asynchronously-failing subscribed item; keeping one copy
+// is what stops the two from drifting. Internal error text is never
+// included verbatim — only the fixed, generic description matching the
+// resolved code — so backend implementation details never reach a client
+// (docs/specification/error-mapping.md).
 func backendErrorFault(err error) *soap.Fault {
-	var be *backend.BackendError
-	if errors.As(err, &be) {
-		code := backendFaultCodeToErrorCode(be.Fault)
-		return fault(code, xmlda.StandardErrorText(code))
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut))
-	}
-	return fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail))
+	code := backend.ErrorCodeFor(err)
+	return fault(code, xmlda.StandardErrorText(code))
 }
 
 // soapClientFault is a plain SOAP-standard fault (namespace soap.NS11,

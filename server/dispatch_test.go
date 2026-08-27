@@ -37,8 +37,8 @@ func TestServeHTTP_MalformedXML(t *testing.T) {
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
 	resp := postSOAP(t, h, `<this is not well-formed`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusInternalServerError)
 	}
 	f := decodeFault(t, resp)
 	if f == nil {
@@ -53,8 +53,8 @@ func TestServeHTTP_UnknownOperation(t *testing.T) {
 	body := `<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body>` +
 		`<SomeUnknownOperation xmlns="` + xmlda.Namespace + `"/></SOAP-ENV:Body></SOAP-ENV:Envelope>`
 	resp := postSOAP(t, h, body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusInternalServerError)
 	}
 	f := decodeFault(t, resp)
 	if f == nil || f.Code.Local != "E_NOTSUPPORTED" {
@@ -109,8 +109,8 @@ func TestServeHTTP_RecognizedOperationBadFieldDecode_ClientFault(t *testing.T) {
 	body := soapEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `"><Options ClientRequestHandle="CRH1" RequestDeadline="not-a-date"/>` +
 		`<ItemList><Items ItemName="Item1"/></ItemList></Read>` + soapEnvelopeClose
 	resp := postSOAP(t, h, body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 	f := decodeFault(t, resp)
 	if f == nil {
@@ -172,8 +172,8 @@ func TestServeHTTP_RecognizedOperationBadFieldDecode_OtherOperations(t *testing.
 			h := newTestHandler(t, be, Config{}, clock.Real{})
 
 			resp := postSOAP(t, h, tc.body)
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("got status %d, want 400", resp.StatusCode)
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("got status %d, want 500", resp.StatusCode)
 			}
 			f := decodeFault(t, resp)
 			if f == nil {

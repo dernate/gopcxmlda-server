@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
+	"github.com/dernate/gopcxmlda-server/clock"
+	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
 // startRefreshing begins keeping s's items up to date: push-mode if the
@@ -41,24 +43,22 @@ func (s *subState) minSamplingRate() time.Duration {
 // s.ctx.Err() at the top of the callback, and again before rescheduling,
 // is the cleanup path — a cancelled or shut-down subscription's poll
 // chain simply stops here.
+//
+// The armed timer is handed to s.setTimer so cancellation can stop it:
+// an unstopped clock.Clock.AfterFunc timer keeps its closure — and
+// through it the whole subState and every item's buffered data — reachable
+// until it eventually fires, which for a slow sampling rate can be a long
+// time after the subscription is already gone.
 func (m *Manager) schedulePoll(s *subState, in time.Duration) {
-	m.clock.AfterFunc(in, func() {
+	t := m.clock.AfterFunc(in, func() {
 		// Add/Done bracket exactly this one callback invocation — the
 		// genuine goroutine that exists "only while a poll callback is
 		// actually executing" (docs/architecture/subscription-model.md).
 		// Add happens unconditionally as the very first statement, before
-		// the ctx check below, so there is no window in which this
-		// callback has already started running but a concurrent
-		// Manager.Wait cannot yet see it: Add must complete before the ctx
-		// check can possibly let pollOnceBounded's real backend call
-		// proceed, so Wait can never return early while that call is
-		// still in flight (previously, checking ctx first and only
-		// calling Add afterward left exactly that gap). This is still
-		// safe for an armed-but-never-fired clock.Clock.AfterFunc timer
-		// (e.g. under clocktest.Fake, if a test never advances that far):
-		// if the callback body never executes at all, this line is never
-		// reached, so the WaitGroup counter is never touched — only a
-		// callback that actually fires calls Add, exactly as before.
+		// the ctx check below, so a concurrent Manager.Wait cannot return
+		// while this callback's backend call is still in flight. It is
+		// safe for an armed-but-never-fired timer: a callback that never
+		// executes never reaches this line.
 		m.wg.Add(1)
 		defer m.wg.Done()
 		if s.ctx.Err() != nil {
@@ -69,6 +69,36 @@ func (m *Manager) schedulePoll(s *subState, in time.Duration) {
 			m.schedulePoll(s, s.minSamplingRate())
 		}
 	})
+	if !s.setTimer(t) {
+		// Cancelled while this timer was being armed: nothing else holds a
+		// reference to it, so stop it here.
+		t.Stop()
+	}
+}
+
+// setTimer records t as s's pending poll timer, reporting false if s is
+// already cancelled — in which case the caller must stop t itself.
+func (s *subState) setTimer(t clock.Timer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx.Err() != nil {
+		s.timer = nil
+		return false
+	}
+	s.timer = t
+	return true
+}
+
+// stopPolling stops s's pending poll timer, if any. Called immediately
+// after s.cancel() everywhere a subscription is terminated.
+func (s *subState) stopPolling() {
+	s.mu.Lock()
+	t := s.timer
+	s.timer = nil
+	s.mu.Unlock()
+	if t != nil {
+		t.Stop()
+	}
 }
 
 // pollOnceBounded gates the actual backend call behind Manager.pollSem so
@@ -128,16 +158,27 @@ func (m *Manager) pollOnce(s *subState) {
 		m.log.Warn("subscription poll failed", "handle", string(s.handle), "error", err.Error())
 		return
 	}
+	if len(results) < len(due) {
+		// A conforming backend returns exactly one Result per requested
+		// item (docs/backend-implementation.md). Report the missing tail
+		// as E_FAIL rather than silently leaving those items untouched:
+		// leaving them alone would also leave lastPolledAt unset, making
+		// them due again on every single tick — a silent busy-poll against
+		// a backend that is already misbehaving.
+		m.log.Warn("subscription poll returned fewer results than items requested",
+			"handle", string(s.handle), "requested", len(due), "returned", len(results))
+	}
 
 	changed := false
 	for i, it := range due {
-		if i >= len(results) {
-			break
+		res := backend.Result[backend.ItemSample]{ResultID: xmlda.ErrFail}
+		if i < len(results) {
+			res = results[i]
 		}
 		it.mu.Lock()
 		it.lastPolledAt = now
 		it.mu.Unlock()
-		if applySample(it, results[i].Value, m.cfg.MaxBufferedSamplesPerItem) {
+		if applyUpdate(it, res.Value, res.ResultID, m.cfg.MaxBufferedSamplesPerItem) {
 			changed = true
 		}
 	}
@@ -146,10 +187,18 @@ func (m *Manager) pollOnce(s *subState) {
 	}
 }
 
-// applySample records sample for it if it represents a change worth
-// reporting (a quality change, or a value change outside the item's
-// deadband for numeric types), buffering it if EnableBuffering is set.
-// It reports whether anything changed.
+// applyUpdate records one poll/push outcome for it if it represents a
+// change worth reporting, buffering it if EnableBuffering is set. It
+// reports whether anything changed.
+//
+// resultID is the backend's per-item condition for this outcome. A
+// non-zero one is a change in its own right (the item just became
+// unreadable) and is recorded *without* overwriting the last good sample,
+// so the client is told what went wrong instead of being handed a blank
+// value dressed up as Good quality. A condition that persists across
+// polls is reported once, not on every tick; recovery back to a zero
+// resultID always counts as a change, since the client must learn the
+// item is healthy again.
 //
 // Deadband here is a best-effort approximation: the specification's
 // percentage-of-engineering-range definition needs the item's EU range
@@ -159,18 +208,31 @@ func (m *Manager) pollOnce(s *subState) {
 // value instead of the item's EU range. Documented as an accepted
 // simplification (deadband/buffering are explicitly "soft negotiated
 // behaviors" per docs/architecture/subscription-model.md), not a bug.
-func applySample(it *itemState, sample backend.ItemSample, maxBuffer int) bool {
+func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, maxBuffer int) bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
-	changed := !it.haveLast || sampleChanged(it.last, sample, it.deadband)
-	it.last = sample
-	it.haveLast = true
+	var changed bool
+	var u update
+	switch {
+	case !resultID.IsZero():
+		changed = resultID != it.lastResultID
+		u = update{resultID: resultID}
+	default:
+		// Recovering from a reported condition is always a change, even
+		// if the value happens to be identical to the last good one.
+		changed = !it.lastResultID.IsZero() || !it.haveLast ||
+			sampleChanged(it.last, sample, it.deadband)
+		it.last = sample
+		it.haveLast = true
+		u = update{sample: sample, haveSample: true}
+	}
+	it.lastResultID = resultID
 	if !changed {
 		return false
 	}
 	if it.enableBuffering {
-		it.buffer = append(it.buffer, sample)
+		it.buffer = append(it.buffer, u)
 		if len(it.buffer) > maxBuffer {
 			// Oldest purged first; the Latest Changed Value (the most
 			// recent entry) is always retained (REQ-SUBSCRIPTION-007).
@@ -178,7 +240,7 @@ func applySample(it *itemState, sample backend.ItemSample, maxBuffer int) bool {
 			it.overflowed = true
 		}
 	} else {
-		it.buffer = []backend.ItemSample{sample} // only the latest value
+		it.buffer = []update{u} // only the latest value
 	}
 	return true
 }

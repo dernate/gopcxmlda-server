@@ -115,6 +115,76 @@ func TestHandleGetProperties_ReturnErrorText_DefaultsTrue(t *testing.T) {
 	}
 }
 
+// TestHandleGetProperties_UnknownPropertyName_InvalidPID reproduces the
+// gap where a PropertyNames entry this server cannot resolve to a
+// PropertyID was silently dropped from the response — a client asking for
+// a property that does not exist here could not tell that apart from "it
+// exists and has no value". It must instead be reported per-property as
+// E_INVALIDPID.
+func TestHandleGetProperties_UnknownPropertyName_InvalidPID(t *testing.T) {
+	status := newTestStatus()
+	reader := newTestReader()
+	ref := backend.ItemRef{ItemName: "Item1"}
+	// The item itself is registered (so it resolves successfully) but with
+	// zero real properties, isolating the E_INVALIDPID entry the server
+	// appends for the unresolvable PropertyNames entry — testProperties,
+	// unlike a real backend.PropertyReader, does not filter its returned
+	// properties by the request's IDs/All at all.
+	props := &testProperties{props: map[backend.ItemRef][]backend.Property{ref: {}}}
+	be := backend.Backend{Status: status, Reader: reader, Properties: props}
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<GetProperties xmlns="` + xmlda.Namespace + `" ReturnAllProperties="false">` +
+		`<ItemIDs ItemName="Item1"/>` +
+		`<PropertyNames xmlns="">totallyUnknownProperty</PropertyNames>` +
+		`</GetProperties>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, body))
+
+	if len(got.PropertyLists) != 1 {
+		t.Fatalf("got %d PropertyLists, want 1", len(got.PropertyLists))
+	}
+	list := got.PropertyLists[0]
+	if !list.ResultID.IsZero() {
+		t.Fatalf("expected the item itself to resolve fine, got item-level %+v", list.ResultID)
+	}
+	if len(list.Properties) != 1 {
+		t.Fatalf("got %d properties, want 1 (reporting the unresolvable name, not silently dropping it)", len(list.Properties))
+	}
+	if list.Properties[0].ResultID != xmlda.ErrInvalidPID {
+		t.Fatalf("got %+v, want E_INVALIDPID for an unresolvable PropertyNames entry", list.Properties[0])
+	}
+}
+
+// TestHandleGetProperties_UnknownPropertyName_IgnoredWhenReturnAllProperties
+// is the regression-safety companion (REQ-PROPERTIES-001): PropertyNames
+// is ignored entirely when ReturnAllProperties is set, so an unresolvable
+// name in it must not surface as E_INVALIDPID in that case.
+func TestHandleGetProperties_UnknownPropertyName_IgnoredWhenReturnAllProperties(t *testing.T) {
+	status := newTestStatus()
+	reader := newTestReader()
+	ref := backend.ItemRef{ItemName: "Item1"}
+	props := &testProperties{props: map[backend.ItemRef][]backend.Property{
+		ref: {{ID: xmlda.PropDescription, Value: xmlda.NewString("a description")}},
+	}}
+	be := backend.Backend{Status: status, Reader: reader, Properties: props}
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<GetProperties xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true">` +
+		`<ItemIDs ItemName="Item1"/>` +
+		`<PropertyNames xmlns="">totallyUnknownProperty</PropertyNames>` +
+		`</GetProperties>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, body))
+
+	if len(got.PropertyLists) != 1 || len(got.PropertyLists[0].Properties) != 1 {
+		t.Fatalf("got %+v, want exactly the one real property, no E_INVALIDPID entry", got.PropertyLists)
+	}
+	for _, p := range got.PropertyLists[0].Properties {
+		if p.ResultID == xmlda.ErrInvalidPID {
+			t.Fatalf("got an E_INVALIDPID property entry while ReturnAllProperties=true, want PropertyNames ignored entirely")
+		}
+	}
+}
+
 func TestHandleGetProperties_NotSupportedWithoutPropertyReader(t *testing.T) {
 	be, _, _ := newMinimalBackend() // no Properties configured
 	h := newTestHandler(t, be, Config{}, clock.Real{})

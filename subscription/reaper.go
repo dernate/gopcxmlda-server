@@ -17,7 +17,7 @@ func (m *Manager) startReaper() {
 }
 
 func (m *Manager) scheduleReap() {
-	m.clock.AfterFunc(m.cfg.ReapInterval, func() {
+	t := m.clock.AfterFunc(m.cfg.ReapInterval, func() {
 		// See schedulePoll's comment (poll.go) on why Add happens
 		// unconditionally as the callback's very first statement, before
 		// the ctx check, rather than after it: this closes the window
@@ -35,6 +35,18 @@ func (m *Manager) scheduleReap() {
 			m.scheduleReap()
 		}
 	})
+	// Hand the armed timer to the Manager so BeginShutdown can stop it;
+	// an unstopped one keeps firing-closure state reachable for up to a
+	// full ReapInterval after shutdown. If shutdown already happened while
+	// this timer was being armed, stop it here instead.
+	m.mu.Lock()
+	if m.rootCtx.Err() != nil {
+		m.mu.Unlock()
+		t.Stop()
+		return
+	}
+	m.reapTimer = t
+	m.mu.Unlock()
 }
 
 // reapGrace computes pingRate scaled by multiplier, clamped to a
@@ -112,5 +124,6 @@ func (m *Manager) terminateIfStillAbandoned(handle Handle, asOf time.Time) bool 
 	}
 	delete(m.subs, handle)
 	s.cancel()
+	s.stopPolling()
 	return true
 }

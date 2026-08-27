@@ -10,28 +10,28 @@ import (
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
-func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, body []byte, state xmlda.ServerState) {
+func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xmlda.Document, oc opContext) {
 	var env soap.Envelope[xmlda.ReadRequest]
-	if err := xmlda.Decode(body, &env); err != nil {
+	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Read", "parse")
-		writeFaultWithStatus(w, requestDecodeFault("Read", err), http.StatusBadRequest)
+		writeFault(w, requestDecodeFault("Read", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Read", "deadline_exceeded")
-		writeFaultWithStatus(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)), http.StatusInternalServerError)
+		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
 	if len(req.ItemList.Items) == 0 {
 		h.metrics.IncRequestError("Read", "empty_item_list")
-		writeFaultWithStatus(w, fault(xmlda.ErrFail, "at least one item is required"), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
 		return
 	}
 	if !h.checkItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Read", "limit_exceeded")
-		writeFaultWithStatus(w, limitExceededFault("too many items in one Read request"), http.StatusBadRequest)
+		writeFault(w, limitExceededFault("too many items in one Read request"))
 		return
 	}
 
@@ -56,11 +56,10 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, body []
 	results, err := h.backend.Reader.Read(ctx, readItems)
 	if err != nil {
 		h.metrics.IncRequestError("Read", "backend_error")
-		writeFaultWithStatus(w, backendErrorFault(err), http.StatusInternalServerError)
+		writeFault(w, backendErrorFault(err))
 		return
 	}
 
-	now := h.clk.Now()
 	items := make([]xmlda.ItemValue, len(req.ItemList.Items))
 	var codes []xmlda.ErrorCode
 	for i, it := range req.ItemList.Items {
@@ -91,13 +90,7 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, body []
 	}
 
 	resp := xmlda.ReadResponse{
-		Result: xmlda.ReplyBase{
-			RcvTime:             now,
-			ReplyTime:           now,
-			ClientRequestHandle: req.Options.ClientRequestHandle,
-			RevisedLocaleID:     req.Options.LocaleID,
-			ServerState:         state,
-		},
+		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
 		Errors:    xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
 	}

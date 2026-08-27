@@ -120,8 +120,8 @@ func TestHandleBrowse_ContinuationPointMismatch(t *testing.T) {
 	// Reusing the token with DIFFERENT filters must be rejected.
 	body := soapEnvelopeOpen + `<Browse xmlns="` + xmlda.Namespace + `" ContinuationPoint="` + got.ContinuationPoint + `" ElementNameFilter="changed"/>` + soapEnvelopeClose
 	resp := postSOAP(t, h, body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 	f := decodeFault(t, resp)
 	if f == nil || f.Code.Local != "E_INVALIDCONTINUATIONPOINT" {
@@ -142,5 +142,44 @@ func TestHandleBrowse_ContinuationPointSameFilters(t *testing.T) {
 	resp := postSOAP(t, h, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got status %d, want 200 (same filters, valid continuation)", resp.StatusCode)
+	}
+}
+
+// TestHandleBrowse_ContinuationPointPropertyNamesMismatch reproduces the
+// gap where the continuation token's filter hash ignored PropertyNames:
+// resuming a paged Browse with a DIFFERENT PropertyNames set changes the
+// shape of the very result set the token indexes into, and must be
+// rejected exactly like changing ElementNameFilter is.
+func TestHandleBrowse_ContinuationPointPropertyNamesMismatch(t *testing.T) {
+	status := newTestStatus()
+	reader := newTestReader()
+	browser := &testBrowser{result: backend.BrowseResult{ContinuationPoint: "page2", MoreElements: true}}
+	be := backend.Backend{Status: status, Reader: reader, Browser: browser}
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	firstBody := soapEnvelopeOpen + `<Browse xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true">` +
+		`<PropertyNames xmlns="">description</PropertyNames></Browse>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.BrowseResponse](t, postSOAP(t, h, firstBody))
+	if got.ContinuationPoint == "" {
+		t.Fatalf("expected a non-empty ContinuationPoint")
+	}
+
+	mismatchBody := soapEnvelopeOpen + `<Browse xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true" ContinuationPoint="` + got.ContinuationPoint + `">` +
+		`<PropertyNames xmlns="">engineeringUnits</PropertyNames></Browse>` + soapEnvelopeClose
+	resp := postSOAP(t, h, mismatchBody)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
+	}
+	f := decodeFault(t, resp)
+	if f == nil || f.Code.Local != "E_INVALIDCONTINUATIONPOINT" {
+		t.Fatalf("got %+v, want E_INVALIDCONTINUATIONPOINT", f)
+	}
+
+	// The identical PropertyNames set, replayed, must still be accepted.
+	sameBody := soapEnvelopeOpen + `<Browse xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true" ContinuationPoint="` + got.ContinuationPoint + `">` +
+		`<PropertyNames xmlns="">description</PropertyNames></Browse>` + soapEnvelopeClose
+	resp2 := postSOAP(t, h, sameBody)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200 (identical PropertyNames, valid continuation)", resp2.StatusCode)
 	}
 }

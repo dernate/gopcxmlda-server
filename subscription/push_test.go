@@ -142,14 +142,13 @@ func TestPush_DuplicateItemRef_BothClientHandlesUpdated(t *testing.T) {
 	}
 }
 
-// TestPush_ChangeEventError_LogsAndLeavesItemStale exercises
-// backend.ChangeEvent.Err (previously untested anywhere in this package,
-// which is exactly how a documentation/behavior mismatch about it went
-// unnoticed): a per-item watch error must be logged and otherwise
-// tolerated, not crash the drain goroutine or the whole subscription — a
-// subsequent, valid push for the same item must still be applied
-// afterward, proving the drain loop kept running.
-func TestPush_ChangeEventError_LogsAndLeavesItemStale(t *testing.T) {
+// TestPush_ChangeEventError_ReportedThenRecovers exercises
+// backend.ChangeEvent.Err: a per-item watch error must be reported to the
+// client as that item's ResultID (not merely logged — the client is the
+// only party that can react to one of its items going away), and must not
+// crash the drain goroutine or the whole subscription, so a subsequent
+// valid push for the same item is still applied afterward.
+func TestPush_ChangeEventError_ReportedThenRecovers(t *testing.T) {
 	fake := clocktest.New(testEpoch)
 	pr := newPushReader()
 	ref := backend.ItemRef{ItemName: "Item1"}
@@ -173,15 +172,28 @@ func TestPush_ChangeEventError_LogsAndLeavesItemStale(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PolledRefresh: %v", err)
 		}
-		if len(res2.Subscriptions) > 0 {
-			v, err := res2.Subscriptions[0].Items[0].Sample.Value.Int32()
+		// Buffering is on, so both events are delivered: the reported
+		// failure first, then the recovery.
+		if len(res2.Subscriptions) > 0 && len(res2.Subscriptions[0].Items) == 2 {
+			items := res2.Subscriptions[0].Items
+			if items[0].ResultID.IsZero() {
+				t.Fatalf("first entry: got ResultID %v, want a non-zero code for the failed watch", items[0].ResultID)
+			}
+			if items[0].HaveSample {
+				t.Fatalf("first entry: got HaveSample=true, want no sample alongside a reported failure")
+			}
+			if !items[1].ResultID.IsZero() || !items[1].HaveSample {
+				t.Fatalf("second entry: got (ResultID %v, HaveSample %v), want (zero, true)",
+					items[1].ResultID, items[1].HaveSample)
+			}
+			v, err := items[1].Sample.Value.Int32()
 			if err != nil || v != 99 {
-				t.Fatalf("got (%d, %v), want (99, nil)", v, err)
+				t.Fatalf("second entry value: got (%d, %v), want (99, nil)", v, err)
 			}
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for the valid push after the error event to be reflected")
+			t.Fatalf("timed out waiting for the error event and the valid push after it: %+v", res2.Subscriptions)
 		}
 		time.Sleep(time.Millisecond)
 	}

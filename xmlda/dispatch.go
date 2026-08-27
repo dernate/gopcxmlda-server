@@ -74,8 +74,20 @@ type peekEnvelope struct {
 //     dateTime) is a separate, third failure bucket the caller handles
 //     itself — IdentifyOperation does not attempt that decode.
 func IdentifyOperation(raw []byte) (Operation, bool, error) {
+	doc, err := NewDocument(raw)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	return doc.IdentifyOperation()
+}
+
+// IdentifyOperation reports which of the 8 operations doc's Body's first
+// child represents, with the same three outcomes as the package-level
+// IdentifyOperation (minus its parse-error case, already resolved when the
+// Document was built).
+func (doc *Document) IdentifyOperation() (Operation, bool, error) {
 	var peek peekEnvelope
-	if err := Decode(raw, &peek); err != nil {
+	if err := doc.Decode(&peek); err != nil {
 		return Operation{}, false, err
 	}
 	qn := QName{Space: peek.Body.Op.XMLName.Space, Local: peek.Body.Op.XMLName.Local}

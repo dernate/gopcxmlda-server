@@ -207,6 +207,29 @@ func TestCreate_MaxConcurrentSubscriptions_ConcurrentRace(t *testing.T) {
 	}
 }
 
+// TestCreate_AfterBeginShutdown_ErrShuttingDown reproduces the gap where
+// Create, once BeginShutdown had run, returned the raw m.rootCtx.Err()
+// (context.Canceled) instead of the dedicated ErrShuttingDown — the
+// server layer maps ErrShuttingDown to E_SERVERSTATE specifically, so a
+// bare context.Canceled here would have fallen back to a generic E_FAIL
+// fault for what is actually a well-understood condition.
+func TestCreate_AfterBeginShutdown_ErrShuttingDown(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	ref := backend.ItemRef{ItemName: "Item1"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{})
+
+	m.BeginShutdown()
+
+	_, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH1"}},
+	})
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("got %v, want ErrShuttingDown", err)
+	}
+}
+
 func TestCancel_Idempotent(t *testing.T) {
 	// REQ-SUBSCRIPTION-014 / OQ-9: cancelling twice, or an unknown handle,
 	// is a safe no-op.

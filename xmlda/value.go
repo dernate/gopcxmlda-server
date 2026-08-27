@@ -169,10 +169,18 @@ func (e *TypeError) Error() string {
 }
 
 // Value is the generic container for every OPC XML-DA <Value> element
-// (ItemValue.Value, ItemProperty.Value, ...). The zero Value is
-// KindUnknown with no type and is never produced by the constructors in
-// this file; use NewNil to represent an explicit xsi:nil value of a known
-// declared type.
+// (ItemValue.Value, ItemProperty.Value, ...).
+//
+// The zero Value is not a usable value and is never produced by the
+// constructors in this file or by decoding. Because KindScalar is Kind's
+// own zero, it reports Kind() == KindScalar with an empty Type(), which
+// IsUnknown() does not flag — so a zero Value cannot be detected by
+// inspecting it, only by knowing it was never constructed. Marshaling one
+// fails ("cannot marshal a Value with no declared type") rather than
+// emitting a typeless element; that error is a signal that some code path
+// passed along a Value it never built. Use NewNil to represent an
+// explicit xsi:nil value of a known declared type, which is the correct
+// way to express "no value" on the wire.
 type Value struct {
 	kind     Kind
 	typ      ScalarType

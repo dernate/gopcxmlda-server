@@ -221,6 +221,73 @@ func TestShutdown_Idempotent(t *testing.T) {
 	}
 }
 
+// TestCancel_StopsPendingPollTimer reproduces the gap where terminating a
+// subscription cancelled its context but left its already-armed poll
+// timer running: an unstopped clock.Clock.AfterFunc timer keeps its
+// closure — and through it the whole subState and every item's buffered
+// data — reachable until it eventually fires, which for a slow sampling
+// rate can be long after the subscription is already gone. Cancel must
+// stop the timer immediately, which fake.PendingCount() can verify
+// directly instead of only observing its downstream effects.
+func TestCancel_StopsPendingPollTimer(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	ref := backend.ItemRef{ItemName: "Item1"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour, DefaultSamplingRate: time.Second})
+	defer shutdownManager(t, m)
+
+	before := fake.PendingCount()
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH1"}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := fake.PendingCount(); got != before+1 {
+		t.Fatalf("got %d pending timers after Create, want %d (the poll timer)", got, before+1)
+	}
+
+	if !m.Cancel(res.Handle) {
+		t.Fatalf("expected Cancel to report found=true")
+	}
+	if got := fake.PendingCount(); got != before {
+		t.Fatalf("got %d pending timers after Cancel, want %d — the poll timer was left running, keeping the cancelled subscription reachable until it eventually fires", got, before)
+	}
+}
+
+// TestBeginShutdown_StopsAllPendingTimers is the manager-wide analogue:
+// BeginShutdown must stop every subscription's poll timer plus the
+// reaper's own timer, not just cancel their contexts, for the same
+// leaked-closure reason as TestCancel_StopsPendingPollTimer.
+func TestBeginShutdown_StopsAllPendingTimers(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	refs := []backend.ItemRef{{ItemName: "Item1"}, {ItemName: "Item2"}}
+	for _, ref := range refs {
+		r.Set(ref, xmlda.NewInt32(1))
+	}
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour, DefaultSamplingRate: time.Second})
+	defer shutdownManager(t, m)
+
+	for _, ref := range refs {
+		if _, err := m.Create(context.Background(), CreateRequest{
+			Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH"}},
+		}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if got := fake.PendingCount(); got == 0 {
+		t.Fatalf("expected at least the reap timer plus two poll timers pending before shutdown, got 0")
+	}
+
+	m.BeginShutdown()
+
+	if got := fake.PendingCount(); got != 0 {
+		t.Fatalf("got %d pending timers after BeginShutdown, want 0", got)
+	}
+}
+
 func TestShutdown_StopsPollScheduling(t *testing.T) {
 	fake := clocktest.New(testEpoch)
 	r := newFakeReader()

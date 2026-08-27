@@ -132,7 +132,7 @@ func TestPolledRefresh_EarlyReturnOnChangeDuringWait(t *testing.T) {
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	if changed := applySample(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, m.cfg.MaxBufferedSamplesPerItem); changed {
+	if changed := applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem); changed {
 		s.notifyChanged()
 	}
 
@@ -176,7 +176,7 @@ func TestPolledRefresh_ChangeDuringHold_ReturnsFastAfterHoldElapses(t *testing.T
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	applySample(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, m.cfg.MaxBufferedSamplesPerItem)
+	applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem)
 
 	select {
 	case <-ch:

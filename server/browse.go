@@ -9,23 +9,23 @@ import (
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
-func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, body []byte, state xmlda.ServerState) {
+func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *xmlda.Document, oc opContext) {
 	var env soap.Envelope[xmlda.BrowseRequest]
-	if err := xmlda.Decode(body, &env); err != nil {
+	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Browse", "parse")
-		writeFaultWithStatus(w, requestDecodeFault("Browse", err), http.StatusBadRequest)
+		writeFault(w, requestDecodeFault("Browse", err))
 		return
 	}
 	req := env.Body.Content
 
 	if h.backend.Browser == nil {
-		writeFaultWithStatus(w, fault(xmlda.ErrNotSupported, "Browse is not supported by this server"), http.StatusInternalServerError)
+		writeFault(w, fault(xmlda.ErrNotSupported, "Browse is not supported by this server"))
 		return
 	}
 
 	backendCursor, ok := parseContinuationToken(req.ContinuationPoint, *req)
 	if !ok {
-		writeFaultWithStatus(w, fault(xmlda.ErrInvalidContinuationPoint, xmlda.StandardErrorText(xmlda.ErrInvalidContinuationPoint)), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrInvalidContinuationPoint, xmlda.StandardErrorText(xmlda.ErrInvalidContinuationPoint)))
 		return
 	}
 
@@ -47,11 +47,10 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, body 
 	})
 	if err != nil {
 		h.metrics.IncRequestError("Browse", "backend_error")
-		writeFaultWithStatus(w, backendErrorFault(err), http.StatusInternalServerError)
+		writeFault(w, backendErrorFault(err))
 		return
 	}
 
-	now := h.clk.Now()
 	includeValues := req.ReturnPropertyValues
 	elements := make([]xmlda.BrowseElement, len(bres.Elements))
 	for i, el := range bres.Elements {
@@ -73,14 +72,8 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, body 
 	resp := xmlda.BrowseResponse{
 		MoreElements:      bres.MoreElements,
 		ContinuationPoint: buildContinuationToken(*req, bres.ContinuationPoint),
-		Result: xmlda.ReplyBase{
-			RcvTime:             now,
-			ReplyTime:           now,
-			ClientRequestHandle: req.ClientRequestHandle,
-			RevisedLocaleID:     req.LocaleID,
-			ServerState:         state,
-		},
-		Elements: elements,
+		Result:            h.replyBase(oc, req.ClientRequestHandle, req.LocaleID),
+		Elements:          elements,
 	}
 	writeResponse(w, resp)
 }

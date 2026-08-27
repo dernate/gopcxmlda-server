@@ -168,13 +168,44 @@ func TestHandleWrite_ShortBackendResultSlice_NoPanic(t *testing.T) {
 	}
 }
 
+// TestHandleWrite_ListLevelItemPath_AppliesToItemWithoutOwnPath
+// reproduces the gap where handleWrite read only the per-item ItemPath,
+// silently dropping a list-level one — a hierarchical parameter Write must
+// honor exactly like Read and Subscribe (§3.1.1, REQ-READ-001). Without
+// the fix, the write below resolves against ItemRef{ItemName: "Item1"}
+// (no path), which is unknown, instead of the item actually registered at
+// ItemPath "Folder1".
+func TestHandleWrite_ListLevelItemPath_AppliesToItemWithoutOwnPath(t *testing.T) {
+	be, _, reader := newWritableBackend()
+	ref := backend.ItemRef{ItemName: "Item1", ItemPath: "Folder1"}
+	reader.Set(ref, xmlda.NewInt32(0))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `" ReturnValuesOnReply="false">` +
+		`<Options ClientRequestHandle="CRH1"/><ItemList ItemPath="Folder1">` +
+		`<Items ItemName="Item1"><Value xmlns:xsd="` + xmlda.XSDNamespace + `" xmlns:xsi="` + xmlda.XSINamespace + `" xsi:type="xsd:int">7</Value></Items>` +
+		`</ItemList></Write>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.WriteResponse](t, postSOAP(t, h, body))
+	if len(got.RItemList.Items) != 1 || !got.RItemList.Items[0].ResultID.IsZero() {
+		t.Fatalf("got %+v, want a successful write reaching Item1 at the list-level ItemPath", got.RItemList.Items)
+	}
+	v, ok := reader.values[ref]
+	if !ok {
+		t.Fatalf("expected the backend value at ItemPath=Folder1/Item1 to be updated — the write went to the wrong item")
+	}
+	i32, err := v.Int32()
+	if err != nil || i32 != 7 {
+		t.Fatalf("got (%d, %v), want (7, nil)", i32, err)
+	}
+}
+
 func TestHandleWrite_EmptyItemList_Faults(t *testing.T) {
 	be, _, _ := newWritableBackend()
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
 	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `" ReturnValuesOnReply="false"><Options/><ItemList></ItemList></Write>` + soapEnvelopeClose
 	resp := postSOAP(t, h, body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 }

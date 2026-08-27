@@ -24,6 +24,14 @@ func filterHash(req xmlda.BrowseRequest) string {
 	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%t",
 		req.ItemName, itemPath, req.BrowseFilter, req.ElementNameFilter, req.VendorFilter,
 		req.MaxElementsReturned, req.ReturnAllProperties, req.ReturnPropertyValues)
+	// PropertyNames belongs in the hash too: it selects which properties
+	// each returned element carries, so changing it mid-pagination changes
+	// the shape of the very result set the continuation point indexes
+	// into. Length-prefixing each name keeps the digest unambiguous —
+	// without it, {"ab","c"} and {"a","bc"} would hash identically.
+	for _, pn := range req.PropertyNames {
+		fmt.Fprintf(h, "\x00%d:%s\x00%d:%s", len(pn.Space), pn.Space, len(pn.Local), pn.Local)
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 

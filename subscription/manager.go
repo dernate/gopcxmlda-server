@@ -16,6 +16,7 @@ import (
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/clock"
 	"github.com/dernate/gopcxmlda-server/telemetry"
+	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
 // Handle is an opaque, server-issued subscription identifier
@@ -97,6 +98,10 @@ type Manager struct {
 
 	pollSem chan struct{}
 
+	// reapTimer is the pending abandonment-reaper timer, guarded by mu and
+	// stopped by BeginShutdown (see reaper.go).
+	reapTimer clock.Timer
+
 	shutdownOnce sync.Once
 }
 
@@ -130,6 +135,23 @@ func NewManager(be backend.Backend, clk clock.Clock, log telemetry.Logger, metri
 	return m
 }
 
+// update is one recorded change to a subscribed item: either a new
+// sample (ResultID zero, HaveSample true) or an abnormal per-item
+// condition reported by the backend while the subscription was live
+// (ResultID non-zero, HaveSample false — e.g. the item vanished from the
+// address space, or its watch broke).
+//
+// Carrying the condition alongside the sample is what keeps a failing
+// item from being reported to the client as a Good-quality change: a
+// backend's per-item ResultID is a first-class outcome of every refresh,
+// exactly as it is for Read (docs/backend-implementation.md), not
+// something the subscription engine may discard.
+type update struct {
+	sample     backend.ItemSample
+	resultID   xmlda.ErrorCode
+	haveSample bool
+}
+
 // itemState is one subscribed item's mutable state, private to the
 // subState that owns it.
 type itemState struct {
@@ -140,11 +162,20 @@ type itemState struct {
 	deadband              float64 // 0-100%, analog/array types only
 	enableBuffering       bool
 
-	mu         sync.Mutex
-	haveLast   bool
-	last       backend.ItemSample
-	buffer     []backend.ItemSample // pending, undelivered changes; oldest first
-	overflowed bool
+	mu sync.Mutex
+	// haveLast reports whether last holds a real sample. It stays true
+	// (and last keeps the last good sample) across an abnormal condition,
+	// so recovering from one is evaluated against the last value the
+	// client actually saw rather than against a synthetic blank.
+	haveLast bool
+	last     backend.ItemSample
+	// lastResultID is the item's currently-reported condition, the zero
+	// ErrorCode while it is healthy. Compared against each new poll/push
+	// outcome so a persistent failure is reported once rather than on
+	// every tick.
+	lastResultID xmlda.ErrorCode
+	buffer       []update // pending, undelivered changes; oldest first
+	overflowed   bool
 	// lastPolledAt is the last time THIS item was actually read from the
 	// backend in poll mode — distinct from subState.lastPolledAt (which
 	// tracks client PolledRefresh calls for the reaper). Zero until the
@@ -170,6 +201,10 @@ type subState struct {
 	pingRate     time.Duration
 	lastPolledAt time.Time
 	changedCh    chan struct{}
+	// timer is the pending poll-mode timer, stopped on cancellation so a
+	// terminated subscription is not kept reachable until its next tick
+	// (see schedulePoll/stopPolling in poll.go). nil in push mode.
+	timer clock.Timer
 
 	busyFlag int32 // accessed via sync/atomic; guards E_BUSY (REQ-SUBSCRIPTION-009)
 }
@@ -238,6 +273,18 @@ func (m *Manager) BeginShutdown() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		m.rootCancel()
+		// Cancelling the contexts stops the poll/reap chains from
+		// *rescheduling*, but an already-armed timer still holds its
+		// closure (and everything it captures) until it fires. Stop them
+		// explicitly so a shut-down Manager releases its subscriptions
+		// immediately rather than at the next tick.
+		if m.reapTimer != nil {
+			m.reapTimer.Stop()
+			m.reapTimer = nil
+		}
+		for _, s := range m.subs {
+			s.stopPolling()
+		}
 	})
 }
 
@@ -292,5 +339,6 @@ func (m *Manager) terminate(handle Handle) bool {
 		return false
 	}
 	s.cancel()
+	s.stopPolling()
 	return true
 }

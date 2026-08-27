@@ -9,28 +9,28 @@ import (
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
-func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, body []byte, state xmlda.ServerState) {
+func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *xmlda.Document, oc opContext) {
 	var env soap.Envelope[xmlda.WriteRequest]
-	if err := xmlda.Decode(body, &env); err != nil {
+	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Write", "parse")
-		writeFaultWithStatus(w, requestDecodeFault("Write", err), http.StatusBadRequest)
+		writeFault(w, requestDecodeFault("Write", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Write", "deadline_exceeded")
-		writeFaultWithStatus(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)), http.StatusInternalServerError)
+		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
 	if len(req.ItemList.Items) == 0 {
 		h.metrics.IncRequestError("Write", "empty_item_list")
-		writeFaultWithStatus(w, fault(xmlda.ErrFail, "at least one item is required"), http.StatusBadRequest)
+		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
 		return
 	}
 	if !h.checkItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Write", "limit_exceeded")
-		writeFaultWithStatus(w, limitExceededFault("too many items in one Write request"), http.StatusBadRequest)
+		writeFault(w, limitExceededFault("too many items in one Write request"))
 		return
 	}
 
@@ -39,9 +39,19 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, body [
 
 	refs := make([]backend.ItemRef, len(req.ItemList.Items))
 	for i, it := range req.ItemList.Items {
+		// ItemPath obeys the hierarchical-parameter precedence (§3.1.1,
+		// REQ-READ-001) for Write exactly as it does for Read and
+		// Subscribe: a path given once on <ItemList> applies to every item
+		// in it, and a per-item ItemPath overrides it. Reading only
+		// it.ItemPath silently dropped the list-level value that
+		// WriteItemList.Params had already decoded, sending the write to
+		// the wrong (usually unknown) item. Write carries no
+		// request-level Params element, so the list is the outermost
+		// level here.
+		p := xmlda.MergeItemParams(req.ItemList.Params, xmlda.ItemParams{ItemPath: it.ItemPath})
 		ref := backend.ItemRef{ItemName: it.ItemName}
-		if it.ItemPath != nil {
-			ref.ItemPath = *it.ItemPath
+		if p.ItemPath != nil {
+			ref.ItemPath = *p.ItemPath
 		}
 		refs[i] = ref
 	}
@@ -84,7 +94,7 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, body [
 			backendResults, err := h.backend.Writer.Write(ctx, writeItems)
 			if err != nil {
 				h.metrics.IncRequestError("Write", "backend_error")
-				writeFaultWithStatus(w, backendErrorFault(err), http.StatusInternalServerError)
+				writeFault(w, backendErrorFault(err))
 				return
 			}
 			// A conforming backend returns exactly one Result per
@@ -135,13 +145,7 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, body [
 	}
 
 	resp := xmlda.WriteResponse{
-		Result: xmlda.ReplyBase{
-			RcvTime:             now,
-			ReplyTime:           now,
-			ClientRequestHandle: req.Options.ClientRequestHandle,
-			RevisedLocaleID:     req.Options.LocaleID,
-			ServerState:         state,
-		},
+		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
 		Errors:    xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
 	}

@@ -131,18 +131,50 @@ func resolveQName(d *xml.Decoder, raw string) (QName, error) {
 	return QName{Space: uri, Local: local}, nil
 }
 
+// Document is a raw OPC XML-DA/SOAP document together with its
+// namespace-prefix table, so that table is built once and reused across
+// however many decodes a caller performs on the same bytes.
+//
+// A server handling a request decodes the same document at least twice —
+// once to identify the operation, then again into that operation's
+// concrete request type — and buildPrefixTable is itself a full
+// token-level scan. Going through a Document turns four whole-document
+// parses per request into two.
+type Document struct {
+	raw   []byte
+	table map[string]string
+}
+
+// NewDocument scans raw's namespace declarations, returning an error only
+// if raw is not well-formed XML at all.
+func NewDocument(raw []byte) (*Document, error) {
+	table, err := buildPrefixTable(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &Document{raw: raw, table: table}, nil
+}
+
+// Decode decodes doc into v, with doc's prefix scope available to every
+// nested UnmarshalXML call (via resolveQName) for the decode's duration.
+// It may be called more than once, with different target types.
+func (doc *Document) Decode(v any) error {
+	d := xml.NewDecoder(bytes.NewReader(doc.raw))
+	defer withScope(d, doc.table)()
+	return d.Decode(v)
+}
+
 // Decode is the top-level entry point for decoding a full OPC XML-DA/SOAP
 // document into v. It builds the document's namespace-prefix scope once and
 // makes it available to every nested UnmarshalXML call (via resolveQName)
-// for the duration of the decode.
+// for the duration of the decode. Callers decoding the same bytes more
+// than once should build a Document instead, to reuse that scope.
 func Decode(raw []byte, v any) error {
-	table, err := buildPrefixTable(raw)
+	doc, err := NewDocument(raw)
 	if err != nil {
 		return err
 	}
-	d := xml.NewDecoder(bytes.NewReader(raw))
-	defer withScope(d, table)()
-	return d.Decode(v)
+	return doc.Decode(v)
 }
 
 // attrValue returns the value of the first attribute in attrs whose

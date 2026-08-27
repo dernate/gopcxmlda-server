@@ -1,6 +1,9 @@
 package subscription
 
-import "github.com/dernate/gopcxmlda-server/backend"
+import (
+	"github.com/dernate/gopcxmlda-server/backend"
+	"github.com/dernate/gopcxmlda-server/xmlda"
+)
 
 // startPush begins push-mode refresh for s using cn: exactly one
 // long-lived drain goroutine for the subscription's lifetime — the one
@@ -60,6 +63,12 @@ func (m *Manager) startPush(s *subState, cn backend.ChangeNotifier) {
 		resCh <- watchResult{ch, err}
 	})
 
+	// NewTimer + Stop rather than clock.After: the losing branch's timer
+	// would otherwise stay armed for the rest of PollTimeout with nothing
+	// left to receive it.
+	timeout := m.clock.NewTimer(m.cfg.PollTimeout)
+	defer timeout.Stop()
+
 	select {
 	case res := <-resCh:
 		if res.err != nil {
@@ -70,7 +79,7 @@ func (m *Manager) startPush(s *subState, cn backend.ChangeNotifier) {
 		m.wg.Go(func() {
 			m.drainPush(s, res.ch, byRef)
 		})
-	case <-m.clock.After(m.cfg.PollTimeout):
+	case <-timeout.C():
 		m.log.Warn("subscription: WatchItems did not respond within PollTimeout, falling back to polling", "handle", string(s.handle))
 		m.schedulePoll(s, s.minSamplingRate())
 	}
@@ -108,17 +117,27 @@ func (m *Manager) drainPush(s *subState, ch <-chan backend.ChangeEvent, byRef ma
 // would otherwise crash the whole process rather than just this one event.
 func (m *Manager) handlePushEvent(s *subState, ev backend.ChangeEvent, byRef map[backend.ItemRef][]*itemState) {
 	defer m.recoverBackgroundPanic("drainPush")
-	if ev.Err != nil {
-		m.log.Warn("subscription: item watch broke, item will go stale", "handle", string(s.handle), "error", ev.Err.Error())
-		return
-	}
 	its, ok := byRef[ev.Ref]
 	if !ok {
 		return
 	}
+	// A broken item watch is reported to the client as that item's
+	// ResultID on the next SubscriptionPolledRefresh, not merely logged:
+	// the client is the only party that can react to one of its subscribed
+	// items having gone away, and it cannot do so if the condition never
+	// leaves the server's log. backend.ErrorCodeFor is the same mapping
+	// the server layer applies to a whole-operation backend error, so a
+	// backend signalling e.g. FaultAccessDenied gets E_ACCESS_DENIED here
+	// too rather than a flat E_FAIL.
+	resultID := xmlda.ErrorCode{}
+	if ev.Err != nil {
+		resultID = backend.ErrorCodeFor(ev.Err)
+		m.log.Warn("subscription: item watch broke",
+			"handle", string(s.handle), "resultID", resultID.Local, "error", ev.Err.Error())
+	}
 	changed := false
 	for _, it := range its {
-		if applySample(it, ev.Sample, m.cfg.MaxBufferedSamplesPerItem) {
+		if applyUpdate(it, ev.Sample, resultID, m.cfg.MaxBufferedSamplesPerItem) {
 			changed = true
 		}
 	}

@@ -20,25 +20,33 @@ import (
 
 var testEpoch = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-// testStatus is a controllable backend.StatusProvider.
+// testStatus is a controllable backend.StatusProvider. It also records
+// every locale it was called with and can return locale-specific
+// StatusInfo, so tests can verify a caller actually reaches the backend
+// with the right locale rather than merely echoing the request.
 type testStatus struct {
-	mu    sync.Mutex
-	state xmlda.ServerState
-	start time.Time
+	mu            sync.Mutex
+	state         xmlda.ServerState
+	start         time.Time
+	locales       []string // SupportedLocaleIDs; defaults to {"en-US"}
+	infoByLocale  map[string]string
+	calledLocales []string
 }
 
 func newTestStatus() *testStatus {
-	return &testStatus{state: xmlda.ServerStateRunning, start: testEpoch}
+	return &testStatus{state: xmlda.ServerStateRunning, start: testEpoch, locales: []string{"en-US"}}
 }
 
 func (s *testStatus) GetStatus(ctx context.Context, locale string) (backend.ServerStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.calledLocales = append(s.calledLocales, locale)
 	return backend.ServerStatus{
 		State:              s.state,
 		StartTime:          s.start,
 		ProductVersion:     "1.0.0",
-		SupportedLocaleIDs: []string{"en-US"},
+		StatusInfo:         s.infoByLocale[locale],
+		SupportedLocaleIDs: append([]string(nil), s.locales...),
 	}, nil
 }
 
@@ -46,6 +54,31 @@ func (s *testStatus) SetState(state xmlda.ServerState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state = state
+}
+
+// SetLocales overrides SupportedLocaleIDs (default {"en-US"}).
+func (s *testStatus) SetLocales(locales []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.locales = locales
+}
+
+// SetStatusInfo makes GetStatus(ctx, locale) return info for that exact
+// locale string.
+func (s *testStatus) SetStatusInfo(locale, info string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.infoByLocale == nil {
+		s.infoByLocale = map[string]string{}
+	}
+	s.infoByLocale[locale] = info
+}
+
+// CalledLocales returns every locale GetStatus was called with, in order.
+func (s *testStatus) CalledLocales() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calledLocales...)
 }
 
 // testReader is a controllable backend.Reader (also used as the target
