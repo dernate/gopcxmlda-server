@@ -3,6 +3,8 @@ package xmlda
 import (
 	"bytes"
 	"encoding/xml"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -10,8 +12,20 @@ import (
 // used by tests that need a stable, named root regardless of v's own Go
 // type name (xml.Marshal on an unnamed/anonymous struct can fail; see
 // docs/architecture/testing-strategy.md).
+//
+// rootName is a fallback, not an override: a type that declares its own
+// root via an XMLName struct tag (every ...Response type does, carrying
+// the OPC XML-DA namespace the schema's elementFormDefault="qualified"
+// requires) is marshaled through xml.Marshal so that declaration
+// survives. Passing an explicit StartElement to EncodeElement replaces
+// the declared name *and its namespace*, which would silently encode a
+// response into no namespace and make the round-trip assert the wrong
+// wire shape.
 func xmlMarshalNamed(t *testing.T, rootName string, v any) ([]byte, error) {
 	t.Helper()
+	if declaredXMLName(v).Local != "" {
+		return xml.Marshal(v)
+	}
 	var buf []byte
 	e := xml.NewEncoder(&testByteWriter{&buf})
 	start := xml.StartElement{Name: xml.Name{Local: rootName}}
@@ -22,6 +36,31 @@ func xmlMarshalNamed(t *testing.T, rootName string, v any) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// declaredXMLName returns the root element name v's type declares via an
+// XMLName field tag, or the zero xml.Name if it declares none.
+func declaredXMLName(v any) xml.Name {
+	rt := reflect.TypeOf(v)
+	for rt != nil && rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+	if rt == nil || rt.Kind() != reflect.Struct {
+		return xml.Name{}
+	}
+	f, ok := rt.FieldByName("XMLName")
+	if !ok {
+		return xml.Name{}
+	}
+	tag := f.Tag.Get("xml")
+	if tag == "" {
+		return xml.Name{}
+	}
+	space, local, hasSpace := strings.Cut(tag, " ")
+	if !hasSpace {
+		return xml.Name{Local: space}
+	}
+	return xml.Name{Space: space, Local: local}
 }
 
 type testByteWriter struct{ buf *[]byte }

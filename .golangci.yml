@@ -1,0 +1,49 @@
+# Runs in CI as the "lint" job; see .github/workflows/ci.yml.
+#
+# The enabled set is deliberately narrow. Every linter here either catches
+# a class of defect this project has actually shipped, or enforces an
+# idiom the codebase already follows — a linter that fires on correct code
+# gets ignored, and an ignored linter protects nothing.
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # The reason this file exists. A review found several tests asserting
+    # on sentinel errors with == and on *TypeError with a bare type
+    # assertion; both are correct only for as long as nobody wraps an
+    # error with %w, and both fail in the confusing direction when
+    # somebody does (the test reports wrong behaviour, not a wrong test).
+    - errorlint
+    # Catches hand-rolled equivalents of stdlib constants, e.g. spelling
+    # out "GET" instead of http.MethodGet.
+    - usestdlibvars
+    - misspell
+
+  settings:
+    staticcheck:
+      checks:
+        - all
+        # QF1001 rewrites `!(a && b)` into its De Morgan equivalent. The
+        # negated form is the clearer one where it is used here — "these
+        # elements are NOT in schema sequence order" — so the suggestion
+        # would cost readability to satisfy a stylistic preference.
+        - -QF1001
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+
+# Both default to a cap (50 per linter, 3 per identical message) that
+# silently truncates the report — three io.EOF comparisons were shown
+# while a fourth stayed hidden until they were fixed. A CI gate that
+# hides findings is worse than no gate.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt

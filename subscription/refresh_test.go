@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -378,7 +379,7 @@ func TestPolledRefresh_AllInvalidHandles_ErrNoSubscription(t *testing.T) {
 	defer shutdownManager(t, m)
 
 	_, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{"bogus1", "bogus2"}})
-	if err != ErrNoSubscription {
+	if !errors.Is(err, ErrNoSubscription) {
 		t.Fatalf("got %v, want ErrNoSubscription", err)
 	}
 }
@@ -389,7 +390,7 @@ func TestPolledRefresh_EmptyHandleList_ErrNoSubscription(t *testing.T) {
 	defer shutdownManager(t, m)
 
 	_, err := m.PolledRefresh(context.Background(), RefreshRequest{})
-	if err != ErrNoSubscription {
+	if !errors.Is(err, ErrNoSubscription) {
 		t.Fatalf("got %v, want ErrNoSubscription", err)
 	}
 }
@@ -409,7 +410,7 @@ func TestPolledRefresh_OverlappingCalls_EBusy(t *testing.T) {
 	waitForPending(t, fake, before+1) // first call now holds the busy flag
 
 	_, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{handle}})
-	if err != ErrBusy {
+	if !errors.Is(err, ErrBusy) {
 		t.Fatalf("got %v, want ErrBusy", err)
 	}
 

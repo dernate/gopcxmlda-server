@@ -13,6 +13,8 @@ import (
 	"io"
 	"net/http"
 	"runtime/debug"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
@@ -31,6 +33,128 @@ type Handler struct {
 	log     telemetry.Logger
 	metrics telemetry.Metrics
 	subs    *subscription.Manager
+
+	// statusVal/statusFresh/statusOK memoize the pre-dispatch server
+	// status for Config.StatusCacheTTL — see statusFor.
+	statusMu    sync.Mutex
+	statusVal   backend.ServerStatus
+	statusFresh time.Time
+	statusOK    bool
+}
+
+// statusFor returns the server status ServeHTTP uses to evaluate
+// xmlda.RequiresFault before dispatching opName (REQ-SERVER-002),
+// reusing a recent fetch for up to Config.StatusCacheTTL.
+//
+// GetStatus is deliberately exempt: that operation *is* the status
+// question, so it always gets a live read, which handleGetStatus then
+// uses directly rather than re-fetching. Every other operation only
+// needs State, which does not change on a millisecond scale — and
+// without memoization each of them costs an extra backend GetStatus
+// call, doubling the load on a backend that reaches a device to answer
+// one.
+//
+// The lock is held across the backend call deliberately: that collapses
+// a burst of concurrent requests into a single fetch, which is the point
+// of the cache, rather than letting every miss start its own. A backend
+// error is never cached — the next request retries.
+func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerStatus, error) {
+	if h.cfg.StatusCacheTTL < 0 || opName == "GetStatus" {
+		st, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
+			return h.backend.Status.GetStatus(ctx, "")
+		})
+		if err != nil {
+			return backend.ServerStatus{}, err
+		}
+		// A live read supersedes whatever the cache holds: a state change
+		// observed here must not be masked by an older entry.
+		h.storeStatus(st)
+		return st, nil
+	}
+	// Acquiring the cache lock is itself cancellable. Holding it across
+	// the backend call is what collapses a burst into a single fetch, but
+	// it also means a waiter can be parked here for as long as that call
+	// takes — and a client that has already hung up should not be made to
+	// wait for a backend it will never hear from.
+	if err := lockContext(ctx, &h.statusMu); err != nil {
+		return backend.ServerStatus{}, err
+	}
+	defer h.statusMu.Unlock()
+	now := h.clk.Now()
+	if h.statusOK && now.Sub(h.statusFresh) < h.cfg.StatusCacheTTL {
+		return h.statusVal, nil
+	}
+	st, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
+		return h.backend.Status.GetStatus(ctx, "")
+	})
+	if err != nil {
+		return backend.ServerStatus{}, err
+	}
+	h.statusVal, h.statusFresh, h.statusOK = st, now, true
+	return st, nil
+}
+
+// lockContext acquires mu, or gives up if ctx is done first. sync.Mutex
+// has no cancellable Lock, so the acquisition runs on its own goroutine;
+// if ctx wins the race that goroutine still completes and immediately
+// releases, leaving no leak and no lock held by a caller that has gone.
+func lockContext(ctx context.Context, mu *sync.Mutex) error {
+	acquired := make(chan struct{})
+	go func() {
+		mu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		return nil
+	case <-ctx.Done():
+		go func() {
+			<-acquired
+			mu.Unlock()
+		}()
+		return ctx.Err()
+	}
+}
+
+// storeStatus records st as the current cached status.
+func (h *Handler) storeStatus(st backend.ServerStatus) {
+	h.statusMu.Lock()
+	h.statusVal, h.statusFresh, h.statusOK = st, h.clk.Now(), true
+	h.statusMu.Unlock()
+}
+
+// checkSOAPAction compares the request's SOAPAction header against the
+// value conventional for the operation the body actually contains, and
+// logs a mismatch at debug level.
+//
+// It never rejects. Dispatch is by body element name, which is the
+// authoritative and more robust signal, and real clients are careless
+// here: some omit the header, some send it unquoted, some send an empty
+// string (which SOAP 1.1 explicitly permits as "no intent expressed").
+// Faulting on any of that would break interoperability for no protocol
+// benefit. But a header that names a *different* operation than the body
+// is a genuine client bug worth being able to see, and until now
+// xmlda.Operation.SOAPAction was computed for all eight operations and
+// then never read by anything.
+func (h *Handler) checkSOAPAction(r *http.Request, op xmlda.Operation) {
+	raw := strings.TrimSpace(r.Header.Get("SOAPAction"))
+	raw = strings.Trim(raw, `"`)
+	if raw == "" || raw == op.SOAPAction {
+		return
+	}
+	h.log.Debug("SOAPAction header does not match the operation in the request body",
+		"operation", op.Name.Local, "header", raw, "expected", op.SOAPAction)
+}
+
+// errorText resolves the text for a result code in the response's Errors
+// list, honoring Config.ErrorText when the embedding application supplied
+// one (§2.6's locale-specific error text, and the only way a vendor code
+// gets any text at all).
+func (h *Handler) errorText(code xmlda.ErrorCode, locale string) string {
+	if h.cfg.ErrorText != nil {
+		return h.cfg.ErrorText(code, locale)
+	}
+	return xmlda.StandardErrorText(code)
 }
 
 // New constructs a Handler. It validates deps.Backend (Status and Reader
@@ -154,6 +278,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	opName = op.Name.Local
 	h.metrics.IncRequest(opName)
+	h.checkSOAPAction(r, op)
 
 	timeout := h.cfg.RequestTimeout
 	if opName == "SubscriptionPolledRefresh" {
@@ -175,7 +300,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// client's requested LocaleID is even known (REQ-SERVER-002).
 	// GetStatus re-fetches with the requested locale when one was asked
 	// for — see handleGetStatus.
-	status, err := h.backend.Status.GetStatus(ctx, "")
+	status, err := h.statusFor(ctx, opName)
 	if err != nil {
 		h.metrics.IncRequestError(opName, "backend_error")
 		writeFault(w, backendErrorFault(err))
@@ -230,12 +355,20 @@ const polledRefreshGrace = 5 * time.Second
 // invalid XML body with a misleading 200 status and no error signal at
 // all. Buffering first means a genuine encode failure (e.g. a Value with
 // no declared type, from a non-conforming backend result) can still fall
-// back to a clean fault response instead.
+// back to a clean fault response instead. The encoder is closed as well
+// as encoded to: Encode flushes on its own, but Close is what reports an
+// element left unclosed, and that too must surface as a fault rather
+// than as a truncated body.
 func writeResponse[T any](w http.ResponseWriter, resp T) {
 	env := soap.Envelope[T]{Body: soap.Body[T]{Content: &resp}}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
-	if err := xml.NewEncoder(&buf).Encode(env); err != nil {
+	enc := xml.NewEncoder(&buf)
+	if err := enc.Encode(env); err != nil {
+		writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
+		return
+	}
+	if err := enc.Close(); err != nil {
 		writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
 		return
 	}
@@ -263,7 +396,12 @@ func writeFault(w http.ResponseWriter, f *soap.Fault) {
 	env := soap.Envelope[struct{}]{Body: soap.Body[struct{}]{Fault: f}}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
-	if err := xml.NewEncoder(&buf).Encode(env); err != nil {
+	enc := xml.NewEncoder(&buf)
+	err := enc.Encode(env)
+	if err == nil {
+		err = enc.Close()
+	}
+	if err != nil {
 		// A Fault that cannot be encoded leaves nothing meaningful to
 		// send; report the status alone rather than a malformed body.
 		http.Error(w, "internal error encoding SOAP fault", http.StatusInternalServerError)
@@ -275,13 +413,23 @@ func writeFault(w http.ResponseWriter, f *soap.Fault) {
 }
 
 // checkItemCount rejects a request whose item count exceeds
-// Config.MaxItemsPerRequest (0 = unlimited).
+// Config.MaxItemsPerRequest.
+//
+// The limit is unlimited only when negative. Zero does not mean unlimited
+// here: Config.WithDefaults has already replaced an unset (zero) value
+// with the built-in default by the time any request is served, so a zero
+// reaching this function would be a deliberate one — and treating it as
+// "no limit" would hand the most permissive setting to whoever wrote the
+// least. The same convention governs MaxItemsPerSubscription,
+// MaxConcurrentSubscriptions, MaxBrowseElements and
+// MaxTotalSubscribedItems.
 func (h *Handler) checkItemCount(n int) bool {
 	return h.cfg.MaxItemsPerRequest <= 0 || n <= h.cfg.MaxItemsPerRequest
 }
 
 // checkSubscriptionItemCount rejects a Subscribe request whose item
-// count exceeds Config.MaxItemsPerSubscription (0 = unlimited).
+// count exceeds Config.MaxItemsPerSubscription. Negative means unlimited;
+// see checkItemCount on why zero does not.
 func (h *Handler) checkSubscriptionItemCount(n int) bool {
 	return h.cfg.MaxItemsPerSubscription <= 0 || n <= h.cfg.MaxItemsPerSubscription
 }

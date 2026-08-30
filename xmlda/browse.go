@@ -27,7 +27,7 @@ type BrowseRequest struct {
 	ItemName             string
 	ItemPath             *string
 	ContinuationPoint    string
-	MaxElementsReturned  uint32
+	MaxElementsReturned  int32
 	BrowseFilter         BrowseFilter
 	ElementNameFilter    string
 	VendorFilter         string
@@ -68,7 +68,7 @@ func (r BrowseRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) error 
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ContinuationPoint"}, Value: r.ContinuationPoint})
 	}
 	if r.MaxElementsReturned != 0 {
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "MaxElementsReturned"}, Value: strconv.FormatUint(uint64(r.MaxElementsReturned), 10)})
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "MaxElementsReturned"}, Value: strconv.FormatInt(int64(r.MaxElementsReturned), 10)})
 	}
 	if r.BrowseFilter != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "BrowseFilter"}, Value: string(r.BrowseFilter)})
@@ -105,11 +105,11 @@ func (r *BrowseRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) err
 	}
 	r.ContinuationPoint, _ = attrValue(start.Attr, xml.Name{Local: "ContinuationPoint"})
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "MaxElementsReturned"}); ok {
-		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return fmt.Errorf("xmlda: invalid MaxElementsReturned %q: %w", v, err)
 		}
-		r.MaxElementsReturned = uint32(u)
+		r.MaxElementsReturned = int32(n)
 	}
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "BrowseFilter"}); ok {
 		r.BrowseFilter = BrowseFilter(v)
@@ -166,7 +166,7 @@ type BrowseElement struct {
 // BrowseResponse is the response for the Browse operation (§3.8.2,
 // pp.72-75).
 type BrowseResponse struct {
-	XMLName xml.Name `xml:"BrowseResponse"`
+	XMLName xml.Name `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ BrowseResponse"`
 	// MoreElements is always present; true if more elements exist beyond
 	// MaxElementsReturned (REQ-BROWSE-003).
 	MoreElements bool `xml:"MoreElements,attr"`

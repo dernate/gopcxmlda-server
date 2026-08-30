@@ -6,7 +6,7 @@ import (
 
 func TestMergeItemParams_Precedence(t *testing.T) {
 	reqPath, listPath, itemPath := "req", "list", "item"
-	reqRate, itemRate := uint32(100), uint32(50)
+	reqRate, itemRate := int32(100), int32(50)
 
 	request := ItemParams{ItemPath: &reqPath, RequestedSamplingRate: &reqRate}
 	list := ItemParams{ItemPath: &listPath}
@@ -54,9 +54,9 @@ func TestMergeItemParams_EmptyStringItemPathIsMeaningful(t *testing.T) {
 
 func TestItemParamsAttrs_RoundTrip(t *testing.T) {
 	path := "my/item"
-	maxAge := int64(1000)
+	maxAge := int32(1000)
 	deadband := 5.5
-	rate := uint32(2000)
+	rate := int32(2000)
 	enable := true
 	reqType := QName{Space: XSDNamespace, Local: "int"}
 

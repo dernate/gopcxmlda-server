@@ -16,8 +16,10 @@ type SubscriptionPolledRefreshRequest struct {
 	// nil, WaitTime is ignored (REQ-SUBSCRIPTION-005).
 	HoldTime *time.Time `xml:"HoldTime,attr,omitempty"`
 	// WaitTime is milliseconds to additionally wait for a change after
-	// HoldTime, ignored if HoldTime is nil.
-	WaitTime uint32 `xml:"WaitTime,attr"`
+	// HoldTime, ignored if HoldTime is nil. It is xsd:int on the wire —
+	// signed — so a negative value decodes rather than faulting the
+	// request; the server treats anything <= 0 as "do not wait".
+	WaitTime int32 `xml:"WaitTime,attr"`
 	// ReturnAllItems: true ignores WaitTime and returns a full snapshot
 	// after HoldTime; false returns only changed items
 	// (REQ-SUBSCRIPTION-006).
@@ -41,7 +43,7 @@ type SubscriptionPolledRefreshReplyItemList struct {
 // subscription with no changes (and ReturnAllItems=false) has no entry at
 // all.
 type SubscriptionPolledRefreshResponse struct {
-	XMLName xml.Name `xml:"SubscriptionPolledRefreshResponse"`
+	XMLName xml.Name `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ SubscriptionPolledRefreshResponse"`
 	// DataBufferOverflow signals that buffered data had to be purged due
 	// to resource limits (REQ-SUBSCRIPTION-007).
 	DataBufferOverflow bool      `xml:"DataBufferOverflow,attr"`

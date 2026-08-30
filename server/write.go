@@ -91,7 +91,9 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 			origIdx = append(origIdx, i)
 		}
 		if len(writeItems) > 0 {
-			backendResults, err := h.backend.Writer.Write(ctx, writeItems)
+			backendResults, err := observeBackend(h.metrics, h.clk, "Write", func() ([]backend.Result[backend.WriteOutcome], error) {
+				return h.backend.Writer.Write(ctx, writeItems)
+			})
 			if err != nil {
 				h.metrics.IncRequestError("Write", "backend_error")
 				writeFault(w, backendErrorFault(err))
@@ -147,7 +149,7 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 	resp := xmlda.WriteResponse{
 		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
-		Errors:    xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
+		Errors:    xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
 	writeResponse(w, resp)
 }

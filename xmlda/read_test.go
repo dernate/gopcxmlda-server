@@ -9,7 +9,7 @@ import (
 )
 
 func TestReadRequest_RoundTrip(t *testing.T) {
-	maxAge := int64(500)
+	maxAge := int32(500)
 	req := ReadRequest{
 		Options: RequestOptions{ClientRequestHandle: "CRH1", ReturnItemTime: boolPtr(true)},
 		ItemList: ReadItemList{

@@ -23,11 +23,17 @@ import (
 // decodeItemParamsAttrs/encodeItemParamsAttrs below, from within their own
 // element's custom UnmarshalXML/MarshalXML.
 type ItemParams struct {
-	ItemPath              *string
-	ReqType               *QName
-	MaxAge                *int64 // milliseconds
+	ItemPath *string
+	ReqType  *QName
+	// MaxAge and RequestedSamplingRate are milliseconds, and both are
+	// xsd:int on the wire — signed and 32-bit. They are modeled that way
+	// rather than as unsigned values so a client sending a negative
+	// number (a common spelling of "no preference") is decoded and then
+	// normalized by the server, instead of failing the whole request with
+	// a parse fault for input the schema permits.
+	MaxAge                *int32
 	Deadband              *float64
-	RequestedSamplingRate *uint32 // milliseconds
+	RequestedSamplingRate *int32
 	EnableBuffering       *bool
 }
 
@@ -76,11 +82,12 @@ func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error)
 		p.ReqType = &qn
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "MaxAge"}); ok {
-		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return ItemParams{}, fmt.Errorf("xmlda: invalid MaxAge %q: %w", v, err)
 		}
-		p.MaxAge = &n
+		n32 := int32(n)
+		p.MaxAge = &n32
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "Deadband"}); ok {
 		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
@@ -90,12 +97,12 @@ func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error)
 		p.Deadband = &f
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "RequestedSamplingRate"}); ok {
-		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return ItemParams{}, fmt.Errorf("xmlda: invalid RequestedSamplingRate %q: %w", v, err)
 		}
-		u32 := uint32(u)
-		p.RequestedSamplingRate = &u32
+		n32 := int32(n)
+		p.RequestedSamplingRate = &n32
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "EnableBuffering"}); ok {
 		b, err := strconv.ParseBool(strings.TrimSpace(v))
@@ -115,16 +122,16 @@ func encodeItemParamsAttrs(p ItemParams) []xml.Attr {
 		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "ItemPath"}, Value: *p.ItemPath})
 	}
 	if p.ReqType != nil {
-		attrs = append(attrs, qnameAttr("ReqType", *p.ReqType)...)
+		attrs = append(attrs, qnameAttr(attrs, "ReqType", *p.ReqType)...)
 	}
 	if p.MaxAge != nil {
-		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "MaxAge"}, Value: strconv.FormatInt(*p.MaxAge, 10)})
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "MaxAge"}, Value: strconv.FormatInt(int64(*p.MaxAge), 10)})
 	}
 	if p.Deadband != nil {
 		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "Deadband"}, Value: strconv.FormatFloat(*p.Deadband, 'g', -1, 64)})
 	}
 	if p.RequestedSamplingRate != nil {
-		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "RequestedSamplingRate"}, Value: strconv.FormatUint(uint64(*p.RequestedSamplingRate), 10)})
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "RequestedSamplingRate"}, Value: strconv.FormatInt(int64(*p.RequestedSamplingRate), 10)})
 	}
 	if p.EnableBuffering != nil {
 		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "EnableBuffering"}, Value: strconv.FormatBool(*p.EnableBuffering)})
@@ -137,7 +144,7 @@ func encodeItemParamsAttrs(p ItemParams) []xml.Attr {
 // per-item request element that carries just hierarchical params plus
 // those two identifying attributes and no child content.
 func marshalRequestItem(e *xml.Encoder, start xml.StartElement, params ItemParams, itemName, clientItemHandle string) error {
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(params)...)
 	if itemName != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: itemName})
 	}

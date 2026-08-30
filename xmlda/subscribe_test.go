@@ -190,7 +190,7 @@ func TestSubscribeResponse_RoundTrip(t *testing.T) {
 }
 
 func TestSubscribeRequest_MarshalUnmarshalRoundTrip(t *testing.T) {
-	rate := uint32(1000)
+	rate := int32(1000)
 	deadband := 2.5
 	req := SubscribeRequest{
 		ReturnValuesOnReply:  true,

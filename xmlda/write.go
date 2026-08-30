@@ -21,7 +21,7 @@ type WriteItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l WriteItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func (r *WriteRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) erro
 // Value is present in RItemList's items only if ReturnValuesOnReply was
 // true; Timestamp only if RequestOptions.ReturnItemTime was true.
 type WriteResponse struct {
-	XMLName   xml.Name      `xml:"WriteResponse"`
+	XMLName   xml.Name      `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ WriteResponse"`
 	Result    ReplyBase     `xml:"WriteResult"`
 	RItemList ItemValueList `xml:"RItemList"`
 	Errors    Errors        `xml:"Errors"`

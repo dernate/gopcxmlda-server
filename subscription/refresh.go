@@ -37,6 +37,9 @@ type RefreshRequest struct {
 type RefreshItemResult struct {
 	Ref              backend.ItemRef
 	ClientItemHandle string
+	// ReqType echoes the type this item was subscribed with, for the
+	// server layer's coercion step; nil if the client requested none.
+	ReqType *xmlda.QName
 	// Sample is meaningful only if HaveSample is true.
 	Sample backend.ItemSample
 	// HaveSample is false when this entry reports an abnormal condition
@@ -105,6 +108,13 @@ func (m *Manager) PolledRefresh(ctx context.Context, req RefreshRequest) (Refres
 	acquired := make([]*subState, 0, len(subs))
 	defer func() {
 		for _, s := range acquired {
+			// lastPolledAt is refreshed on the way out as well as on the
+			// way in: the specification measures abandonment "since the
+			// last response to a refresh service call" (§2.5.4), not
+			// since the request arrived. For a long Hold+Wait the two are
+			// a minute or more apart, and only the later one reflects
+			// when the client actually got its answer.
+			s.touchPolledAt(m.clock.Now())
 			atomic.StoreInt32(&s.busyFlag, 0)
 		}
 	}()
@@ -237,15 +247,21 @@ func fanIn(callCtx context.Context, chans []<-chan struct{}) <-chan struct{} {
 
 // snapshotResult drains each subscription's changed/buffered items (or,
 // if returnAllItems, every item's last known value) into a RefreshResult.
-// A subscription that was cancelled concurrently (ctx.Err() != nil) is
-// silently omitted — REQ-SUBSCRIPTION-010's contract is only that the
-// *other* handles' data is still returned; a client polling the
-// now-invalid handle again later correctly gets it back via
-// InvalidHandles.
+//
+// A subscription cancelled while this very call was blocked (ctx.Err() !=
+// nil) is reported in InvalidHandles, exactly as a handle that was
+// already unknown when the call started: from the client's side the two
+// are the same fact ("this handle is no longer usable"), and
+// InvalidServerSubHandles is the field the specification gives for
+// saying so. Omitting it entirely — the previous behavior — returned a
+// formally successful, completely empty response that a client reads as
+// "no changes", leaving it to discover the subscription is gone only on
+// the next poll.
 func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllItems bool) RefreshResult {
 	result := RefreshResult{InvalidHandles: invalid}
 	for _, s := range subs {
 		if s.ctx.Err() != nil {
+			result.InvalidHandles = append(result.InvalidHandles, s.handle)
 			continue
 		}
 		s.mu.Lock()
@@ -258,6 +274,26 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 			it.mu.Lock()
 			switch {
 			case returnAllItems:
+				// "The server will wait the HoldTime but then return with
+				// all current values (and any buffered values if
+				// EnableBuffering)" — §3.6.1. The buffered entries come
+				// first, in the order they were recorded, so the client
+				// still sees the history it asked to have buffered;
+				// discarding them here (the previous behavior) meant one
+				// ReturnAllItems poll silently threw away everything
+				// EnableBuffering had collected.
+				if it.enableBuffering {
+					for _, u := range it.buffer {
+						itemResults = append(itemResults, RefreshItemResult{
+							Ref:              it.ref,
+							ClientItemHandle: it.clientItemHandle,
+							ReqType:          it.reqType,
+							Sample:           u.sample,
+							HaveSample:       u.haveSample,
+							ResultID:         u.resultID,
+						})
+					}
+				}
 				// An item currently in an abnormal condition reports that
 				// condition, not its stale last value dressed up as
 				// current: ReturnAllItems asks for every item's state, and
@@ -267,12 +303,14 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
+						ReqType:          it.reqType,
 						ResultID:         it.lastResultID,
 					})
 				case it.haveLast:
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
+						ReqType:          it.reqType,
 						Sample:           it.last,
 						HaveSample:       true,
 					})
@@ -283,6 +321,7 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
+						ReqType:          it.reqType,
 						Sample:           u.sample,
 						HaveSample:       u.haveSample,
 						ResultID:         u.resultID,

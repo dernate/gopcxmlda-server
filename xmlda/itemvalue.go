@@ -7,13 +7,46 @@ import (
 )
 
 // ItemValueList is the shared <RItemList> shape used by Read and Write
-// responses: a bare container of ItemValue. (The specification's
-// ReplyItemList also carries a "Reserved" attribute solely to defeat
-// certain WSDL code generators from flattening it into an array type —
-// a tooling artifact with no semantic value, deliberately not modeled
-// here.)
+// responses: the specification's ReplyItemList.
+//
+// It is emitted with xsi:type="opc:ReplyItemList" and an empty Reserved
+// attribute, matching the real captured traffic in
+// testdata/responses/read_182.response.xml. Neither carries information:
+// Reserved exists purely to stop certain WSDL code generators from
+// flattening the wrapper into a bare array, and the xsi:type is
+// redundant with the element name. Both are emitted anyway for the same
+// reason ReplyBase, ItemValue and OPCQuality already declare theirs —
+// strict and .NET-generated clients may expect the type annotation, and
+// applying that convention to three of the four wrapper types while
+// silently skipping the fourth is the kind of inconsistency that only
+// shows up against a client nobody tested with.
 type ItemValueList struct {
-	Items []ItemValue `xml:"Items"`
+	Items []ItemValue
+}
+
+// MarshalXML implements xml.Marshaler.
+func (l ItemValueList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ReplyItemList"})...)
+	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Reserved"}, Value: ""})
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	for _, it := range l.Items {
+		if err := e.EncodeElement(it, xml.StartElement{Name: xml.Name{Local: "Items"}}); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
+}
+
+// UnmarshalXML implements xml.Unmarshaler.
+func (l *ItemValueList) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	items, err := decodeRepeatedElements[ItemValue](d, "Items", "RItemList")
+	if err != nil {
+		return err
+	}
+	l.Items = items
+	return nil
 }
 
 // ItemValue is the wire shape for a data-bearing item, used by
@@ -53,7 +86,7 @@ type ItemValue struct {
 // because the schema declares them as members of a polymorphic type,
 // which strict/.NET-generated clients may expect xsi:type to disambiguate).
 func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, typeAttrs(QName{Space: Namespace, Local: "ItemValue"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ItemValue"})...)
 	if iv.ItemName != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: iv.ItemName})
 	}
@@ -64,24 +97,36 @@ func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ClientItemHandle"}, Value: iv.ClientItemHandle})
 	}
 	if !iv.ResultID.IsZero() {
-		start.Attr = append(start.Attr, qnameAttr("ResultID", iv.ResultID.QName)...)
-	}
-	if iv.DiagnosticInfo != "" {
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "DiagnosticInfo"}, Value: iv.DiagnosticInfo})
+		start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ResultID", iv.ResultID.QName)...)
 	}
 	if iv.Timestamp != nil {
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Timestamp"}, Value: iv.Timestamp.Format(time.RFC3339Nano)})
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Timestamp"}, Value: formatWireTime(*iv.Timestamp)})
 	}
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
-	if err := e.EncodeElement(iv.Quality, xml.StartElement{Name: xml.Name{Local: "Quality"}}); err != nil {
-		return err
+	// Child order is the schema's own xsd:sequence — DiagnosticInfo,
+	// Value, Quality (§3.1.5) — and a sequence is ordered, so a
+	// schema-validating or sequence-position-decoding client rejects any
+	// other order. The real captured traffic in
+	// testdata/responses/subscribe_680.response.xml agrees: Value then
+	// Quality.
+	if iv.DiagnosticInfo != "" {
+		// DiagnosticInfo is an ELEMENT in the schema, not an attribute:
+		// <s:element minOccurs="0" maxOccurs="1" name="DiagnosticInfo"
+		// type="s:string"/>. It used to be emitted as an attribute, which
+		// no schema-bound client would find.
+		if err := e.EncodeElement(iv.DiagnosticInfo, xml.StartElement{Name: xml.Name{Local: "DiagnosticInfo"}}); err != nil {
+			return err
+		}
 	}
 	if iv.Value != nil {
 		if err := e.EncodeElement(*iv.Value, xml.StartElement{Name: xml.Name{Local: "Value"}}); err != nil {
 			return err
 		}
+	}
+	if err := e.EncodeElement(iv.Quality, xml.StartElement{Name: xml.Name{Local: "Quality"}}); err != nil {
+		return err
 	}
 	return e.EncodeToken(start.End())
 }
@@ -99,10 +144,16 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 		ItemName         string     `xml:"ItemName,attr"`
 		ItemPath         *string    `xml:"ItemPath,attr"`
 		ClientItemHandle string     `xml:"ClientItemHandle,attr"`
-		DiagnosticInfo   string     `xml:"DiagnosticInfo,attr"`
 		Timestamp        *time.Time `xml:"Timestamp,attr"`
-		Quality          OPCQuality `xml:"Quality"`
-		Value            *Value     `xml:"Value"`
+		// Both spellings of DiagnosticInfo are accepted on decode. The
+		// element is the schema's own form and the one this library
+		// emits; the attribute is tolerated because this library itself
+		// emitted that form until the encoder was corrected, so a peer
+		// (or a stored fixture) may still carry it.
+		DiagnosticInfoElem string     `xml:"DiagnosticInfo"`
+		DiagnosticInfoAttr string     `xml:"DiagnosticInfo,attr"`
+		Quality            OPCQuality `xml:"Quality"`
+		Value              *Value     `xml:"Value"`
 	}
 	if err := d.DecodeElement(&shadow, &start); err != nil {
 		return fmt.Errorf("xmlda: decoding ItemValue: %w", err)
@@ -111,7 +162,10 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 	iv.ItemName = shadow.ItemName
 	iv.ItemPath = shadow.ItemPath
 	iv.ClientItemHandle = shadow.ClientItemHandle
-	iv.DiagnosticInfo = shadow.DiagnosticInfo
+	iv.DiagnosticInfo = shadow.DiagnosticInfoElem
+	if iv.DiagnosticInfo == "" {
+		iv.DiagnosticInfo = shadow.DiagnosticInfoAttr
+	}
 	iv.Timestamp = shadow.Timestamp
 	iv.Quality = shadow.Quality
 	iv.Value = shadow.Value

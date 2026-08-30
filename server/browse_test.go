@@ -18,10 +18,14 @@ import (
 // an unrecognized property to xmlda.Namespace regardless of what (if
 // anything) the backend actually declared.
 func TestToItemProperty_VendorProperty_NeverGetsStandardNamespace(t *testing.T) {
+	// toItemProperty is a Handler method now (it logs a warning for a
+	// vendor property with no namespace), so it needs a Handler.
+	h := newTestHandler(t, backend.Backend{Status: newTestStatus(), Reader: newTestReader()}, Config{}, nil)
+
 	// No Namespace set at all: must come back unqualified, not silently
 	// promoted to the OPC XML-DA namespace.
 	p := backend.Property{Name: "myVendorProp", Description: "a vendor property"}
-	ip := toItemProperty(p, false)
+	ip := h.toItemProperty(p, false)
 	if ip.Name.Space == xmlda.Namespace {
 		t.Fatalf("vendor property with no declared Namespace got the OPC XML-DA namespace: %+v", ip.Name)
 	}
@@ -31,7 +35,7 @@ func TestToItemProperty_VendorProperty_NeverGetsStandardNamespace(t *testing.T) 
 
 	// An explicitly declared vendor namespace must be honored as-is.
 	p2 := backend.Property{Name: "myVendorProp", Namespace: "http://example.com/vendor"}
-	ip2 := toItemProperty(p2, false)
+	ip2 := h.toItemProperty(p2, false)
 	if ip2.Name.Space != "http://example.com/vendor" || ip2.Name.Local != "myVendorProp" {
 		t.Fatalf("got %+v, want the declared vendor namespace preserved", ip2.Name)
 	}
@@ -39,7 +43,7 @@ func TestToItemProperty_VendorProperty_NeverGetsStandardNamespace(t *testing.T) 
 	// A standard property (recognized PropertyID) must still resolve to
 	// the OPC XML-DA namespace regardless of Namespace/Name.
 	p3 := backend.Property{ID: xmlda.PropDescription}
-	ip3 := toItemProperty(p3, false)
+	ip3 := h.toItemProperty(p3, false)
 	if ip3.Name.Space != xmlda.Namespace {
 		t.Fatalf("standard property: got %+v, want Space %q", ip3.Name, xmlda.Namespace)
 	}

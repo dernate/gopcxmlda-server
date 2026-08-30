@@ -141,7 +141,7 @@ func TestCreate_MaxConcurrentSubscriptions(t *testing.T) {
 	_, err := m.Create(context.Background(), CreateRequest{
 		Items: []CreateItemRequest{{Ref: ref2, ClientItemHandle: "CIH2"}},
 	})
-	if err != ErrTooManySubscriptions {
+	if !errors.Is(err, ErrTooManySubscriptions) {
 		t.Fatalf("got %v, want ErrTooManySubscriptions", err)
 	}
 	if m.count() != 1 {

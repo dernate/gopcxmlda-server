@@ -4,6 +4,19 @@
 // package xmlda. Output is always the spec-conformant SOAP 1.1 shape
 // (see ADR-004); input tolerates SOAP 1.1, SOAP 1.2, and the
 // non-conformant legacy fault shapes observed in testdata/faults/.
+//
+// Receivers on the wire types in this package are deliberately mixed:
+// MarshalXML takes a value receiver and UnmarshalXML a pointer receiver.
+// Neither half is a free choice. UnmarshalXML must be a pointer method to
+// populate the receiver at all, and MarshalXML must be a value method
+// because encoding/xml only consults the custom marshaler when the value
+// it holds implements xml.Marshaler or is addressable — a Value reached
+// through xml.Marshal, or as a field of a struct passed by value, is
+// neither. Moving MarshalXML to a pointer receiver does not fail loudly:
+// the encoder silently falls back to default struct encoding and emits
+// <Value></Value> with no xsi:type. Static analysis flags the mix
+// (staticcheck does not, GoLand's "mixed value and pointer receivers"
+// does); it is correct that the mix exists and wrong that it is a defect.
 package soap
 
 import (

@@ -48,17 +48,14 @@ func TestShutdown_NoGoroutineLeak_MixedPollAndPush(t *testing.T) {
 	// Several push-mode subscriptions (this backend implements
 	// ChangeNotifier, so every subscription uses push mode) — each costs
 	// exactly one drain goroutine, the documented, accepted cost.
-	var handles []Handle
 	for i := range 5 {
 		ref := backend.ItemRef{ItemName: "Item"}
 		pr.Set(ref, xmlda.NewInt32(int32(i)))
-		res, err := m.Create(context.Background(), CreateRequest{
+		if _, err := m.Create(context.Background(), CreateRequest{
 			Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH"}},
-		})
-		if err != nil {
+		}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		handles = append(handles, res.Handle)
 	}
 
 	if err := m.Shutdown(context.Background()); err != nil {

@@ -84,7 +84,7 @@ type ItemProperty struct {
 
 // MarshalXML implements xml.Marshaler.
 func (p ItemProperty) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, qnameAttr("Name", p.Name)...)
+	start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "Name", p.Name)...)
 	if p.Description != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Description"}, Value: p.Description})
 	}
@@ -95,7 +95,7 @@ func (p ItemProperty) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: p.ItemName})
 	}
 	if !p.ResultID.IsZero() {
-		start.Attr = append(start.Attr, qnameAttr("ResultID", p.ResultID.QName)...)
+		start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ResultID", p.ResultID.QName)...)
 	}
 	if err := e.EncodeToken(start); err != nil {
 		return err

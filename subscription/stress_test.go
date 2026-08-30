@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,7 +59,7 @@ func TestStress_ConcurrentCreateCancelRefresh(t *testing.T) {
 					// A disjoint-handle call (this worker's own,
 					// just-created, not shared with any other worker)
 					// must never report ErrBusy.
-					if err == ErrBusy {
+					if errors.Is(err, ErrBusy) {
 						atomic.AddInt64(&falseBusy, 1)
 					} else {
 						t.Errorf("PolledRefresh: %v", err)
@@ -107,10 +108,10 @@ func TestStress_SharedHandleOverlappingRefresh(t *testing.T) {
 			_, err := m.PolledRefresh(context.Background(), RefreshRequest{
 				Handles: []Handle{res.Handle}, HoldTime: &hold, WaitTime: 20 * time.Millisecond,
 			})
-			switch err {
-			case nil:
+			switch {
+			case err == nil:
 				atomic.AddInt64(&successes, 1)
-			case ErrBusy:
+			case errors.Is(err, ErrBusy):
 				atomic.AddInt64(&busies, 1)
 			default:
 				t.Errorf("PolledRefresh: %v", err)

@@ -1,9 +1,24 @@
 package server
 
 import (
+	"time"
+
 	"github.com/dernate/gopcxmlda-server/backend"
+	"github.com/dernate/gopcxmlda-server/clock"
+	"github.com/dernate/gopcxmlda-server/telemetry"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
+
+// hasUsableValue reports whether an item carrying result code c may
+// still carry a value on the wire. True for the zero code (no abnormal
+// condition) and for every success-with-caveat "S_"-prefixed code, false
+// only for critical "E_"-prefixed errors — §2.6's own distinction.
+//
+// Used everywhere an item's outcome is turned into a wire ItemValue, so
+// Read, Write, Subscribe and SubscriptionPolledRefresh agree on it.
+func hasUsableValue(c xmlda.ErrorCode) bool {
+	return c.IsZero() || c.IsSuccess()
+}
 
 // buildItemValue constructs the wire ItemValue for one item's outcome,
 // applying the quality-driven Value/Timestamp presence rule
@@ -48,9 +63,50 @@ func buildItemValue(ref backend.ItemRef, clientItemHandle string, sample backend
 // honoring RequestOptions.ReturnErrorText — when false, Errors entries
 // still identify which codes occurred (that's the core per-item result
 // mechanism, not "error text"), but carry no human-readable Text.
-func errorTextFunc(opts xmlda.RequestOptions) func(xmlda.ErrorCode) string {
+//
+// When text is wanted it goes through Handler.errorText, so an
+// application-supplied Config.ErrorText sees both the code and the locale
+// the server actually resolved for this request — the same locale it
+// reports in ReplyBase.RevisedLocaleID. Answering "de-DE" there and then
+// sending English text is the contradiction §2.6 asks servers to avoid.
+func (h *Handler) errorTextFunc(opts xmlda.RequestOptions, oc opContext) func(xmlda.ErrorCode) string {
 	if !opts.ReturnErrorTextOrDefault() {
 		return func(xmlda.ErrorCode) string { return "" }
 	}
-	return xmlda.StandardErrorText
+	locale := reviseLocale(opts.LocaleID, oc.status.SupportedLocaleIDs)
+	return func(c xmlda.ErrorCode) string { return h.errorText(c, locale) }
+}
+
+// msToDuration converts a millisecond count from the wire to a Duration,
+// mapping any non-positive value to zero.
+//
+// The fields it is used for (WaitTime, SubscriptionPingRate) are xsd:int
+// on the wire, so a client may legitimately send a negative number — the
+// schema permits it and this library now decodes it rather than faulting.
+// None of them has a meaning below zero, and every one already treats 0
+// as "unset / use the server's own policy", so folding negatives into
+// zero is the reading that keeps a nonsensical value from becoming a
+// negative timeout.
+func msToDuration(ms int32) time.Duration {
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// observeBackend times one backend call and reports it via
+// telemetry.Metrics.ObserveBackendLatency, then returns whatever the call
+// returned.
+//
+// The metric hook existed from the start and was never called, so every
+// Metrics implementation had to stub a method that produced nothing. It
+// is the one measurement that separates "this server is slow" from "the
+// data source behind it is slow", which is usually the first question
+// asked when a client complains, so wiring it is worth more than deleting
+// it.
+func observeBackend[T any](m telemetry.Metrics, clk clock.Clock, operation string, call func() (T, error)) (T, error) {
+	start := clk.Now()
+	v, err := call()
+	m.ObserveBackendLatency(operation, clk.Now().Sub(start))
+	return v, err
 }

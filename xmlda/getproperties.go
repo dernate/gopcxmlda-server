@@ -149,7 +149,7 @@ func (l PropertyReplyList) MarshalXML(e *xml.Encoder, start xml.StartElement) er
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: l.ItemName})
 	}
 	if !l.ResultID.IsZero() {
-		start.Attr = append(start.Attr, qnameAttr("ResultID", l.ResultID.QName)...)
+		start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ResultID", l.ResultID.QName)...)
 	}
 	if err := e.EncodeToken(start); err != nil {
 		return err
@@ -191,7 +191,7 @@ func (l *PropertyReplyList) UnmarshalXML(d *xml.Decoder, start xml.StartElement)
 // GetPropertiesResponse is the response for the GetProperties operation
 // (§3.9.2, pp.78-79). PropertyLists has one entry per requested item.
 type GetPropertiesResponse struct {
-	XMLName       xml.Name            `xml:"GetPropertiesResponse"`
+	XMLName       xml.Name            `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ GetPropertiesResponse"`
 	Result        ReplyBase           `xml:"GetPropertiesResult"`
 	PropertyLists []PropertyReplyList `xml:"PropertyLists"`
 	Errors        Errors              `xml:"Errors"`

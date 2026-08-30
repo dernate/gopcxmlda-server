@@ -78,7 +78,8 @@ func TestFilterHash_IdenticalRequestsMatch(t *testing.T) {
 			PropertyNames:       []xmlda.QName{{Space: xmlda.Namespace, Local: "description"}, {Local: "vendorProp"}},
 		}
 	}
-	if filterHash(build()) != filterHash(build()) {
+	first, second := filterHash(build()), filterHash(build())
+	if first != second {
 		t.Fatalf("expected two structurally identical requests to hash the same")
 	}
 }

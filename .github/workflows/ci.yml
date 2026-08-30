@@ -30,6 +30,45 @@ jobs:
       - name: Test (race detector)
         run: go test -race ./...
 
+  # The one verdict the Go test suite cannot produce about itself: Go's
+  # encoding/xml is lenient exactly where the specification is strict (it
+  # tolerates duplicate attributes and matches elements by local name), so
+  # for a long time this server emitted responses that no other parser
+  # would accept and every test still passed. This job hands the generated
+  # responses to libxml2 instead — first for well-formedness, then against
+  # the specification's own schema, transcribed in testdata/schema/.
+  schema-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install xmllint
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+
+      # Regenerate rather than validate the committed files, so this job
+      # validates what the encoder produces *now*, not what was checked in.
+      # TestGoldenResponses in the main job is what catches an unintended
+      # difference between the two.
+      - name: Generate golden responses from the current encoder
+        run: go test ./server -run TestGoldenResponses -update-golden
+
+      - name: Check every response is well-formed XML
+        run: xmllint --noout testdata/golden/*.response.xml
+
+      - name: Validate every response against the OPC XML-DA schema
+        run: |
+          set -e
+          for f in testdata/golden/*.response.xml; do
+            echo "== $f"
+            xmllint --noout --schema testdata/schema/soap11-envelope.xsd "$f"
+          done
+
   client-integration-test:
     runs-on: ubuntu-latest
     steps:
@@ -62,3 +101,41 @@ jobs:
       - name: Test against real gopcxmlda client (Dockerized server)
         working-directory: test/dockerintegration
         run: go test ./...
+
+  # go vet in build-and-test catches a narrow, high-confidence set. This
+  # job adds the checks that vet does not make: errcheck (an unhandled
+  # error return), errorlint (== and bare type assertions against errors,
+  # which are correct only until somebody wraps one with %w), staticcheck,
+  # and unused. See .golangci.yml for why the enabled set is this small.
+  #
+  # All three modules are linted: the two test/ modules have their own
+  # go.mod, so ./... at the repository root does not reach them, and both
+  # drive the server over real HTTP — exactly where an unchecked error
+  # return hides a test that silently asserts nothing.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Lint (root module)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+
+      - name: Lint (test/clientintegration)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          working-directory: test/clientintegration
+
+      - name: Lint (test/dockerintegration)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          working-directory: test/dockerintegration

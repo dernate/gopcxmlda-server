@@ -133,6 +133,6 @@ func postSOAPRealAsync(client *http.Client, addr, body string) (*http.Response, 
 
 func decodeResponseBody[T any](t *testing.T, resp *http.Response) *T {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return decodeResponse[T](t, resp)
 }

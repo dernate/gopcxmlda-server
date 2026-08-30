@@ -19,6 +19,7 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 	req := env.Body.Content
 
 	if h.backend.Properties == nil {
+		h.metrics.IncRequestError("GetProperties", "not_supported")
 		writeFault(w, fault(xmlda.ErrNotSupported, "GetProperties is not supported by this server"))
 		return
 	}
@@ -73,7 +74,9 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 		}
 	}
 
-	results, err := h.backend.Properties.GetProperties(ctx, reqs)
+	results, err := observeBackend(h.metrics, h.clk, "GetProperties", func() ([]backend.Result[[]backend.Property], error) {
+		return h.backend.Properties.GetProperties(ctx, reqs)
+	})
 	if err != nil {
 		h.metrics.IncRequestError("GetProperties", "backend_error")
 		writeFault(w, backendErrorFault(err))
@@ -91,13 +94,19 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 		if i < len(results) {
 			res = results[i]
 		}
+		// refs[i] already carries the effective path — the item's own
+		// ItemPath if it had one, the request-level default otherwise
+		// (§3.1.1's hierarchical parameters). Echoing only id.ItemPath
+		// dropped the request-level value, so a client that set the path
+		// once for the whole request got its items back unqualified and
+		// could not match them against what it asked for.
 		list := xmlda.PropertyReplyList{ItemName: id.ItemName, ResultID: res.ResultID}
-		if id.ItemPath != nil {
-			path := *id.ItemPath
+		if id.ItemPath != nil || req.ItemPath != nil {
+			path := refs[i].ItemPath
 			list.ItemPath = &path
 		}
 		for _, p := range res.Value {
-			list.Properties = append(list.Properties, toItemProperty(p, req.ReturnPropertyValues))
+			list.Properties = append(list.Properties, h.toItemProperty(p, req.ReturnPropertyValues))
 		}
 		// Only for an item the backend could resolve at all: an item that
 		// itself failed (e.g. E_UNKNOWNITEMNAME) reports no properties,
@@ -124,7 +133,7 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 	resp := xmlda.GetPropertiesResponse{
 		Result:        h.replyBase(oc, req.ClientRequestHandle, req.LocaleID),
 		PropertyLists: lists,
-		Errors:        xmlda.DedupeErrors(codes, errorTextFunc(opts)),
+		Errors:        xmlda.DedupeErrors(codes, h.errorTextFunc(opts, oc)),
 	}
 	writeResponse(w, resp)
 }

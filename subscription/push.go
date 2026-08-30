@@ -1,6 +1,8 @@
 package subscription
 
 import (
+	"context"
+
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
@@ -9,7 +11,7 @@ import (
 // long-lived drain goroutine for the subscription's lifetime — the one
 // documented, accepted goroutine cost of push efficiency (ADR-008). It
 // falls back to poll-mode if the initial WatchItems call fails.
-func (m *Manager) startPush(s *subState, cn backend.ChangeNotifier) {
+func (m *Manager) startPush(ctx context.Context, s *subState, cn backend.ChangeNotifier) {
 	s.mu.Lock()
 	items := append([]*itemState(nil), s.items...)
 	s.mu.Unlock()
@@ -81,6 +83,24 @@ func (m *Manager) startPush(s *subState, cn backend.ChangeNotifier) {
 		})
 	case <-timeout.C():
 		m.log.Warn("subscription: WatchItems did not respond within PollTimeout, falling back to polling", "handle", string(s.handle))
+		m.schedulePoll(s, s.minSamplingRate())
+	case <-s.ctx.Done():
+		// The subscription was cancelled, or the server began shutting
+		// down, while waiting on the backend. Returning here rather than
+		// falling through to schedulePoll matters twice over: this call
+		// runs synchronously inside Create (and so inside the client's
+		// Subscribe request), which would otherwise sit here for the
+		// whole PollTimeout with nobody left to answer; and starting a
+		// poll chain for an already-cancelled subscription only creates
+		// a timer for stopPolling to tear down again.
+		return
+	case <-ctx.Done():
+		// The Subscribe request itself was abandoned (client hung up, or
+		// its own deadline elapsed). The subscription lives on — s.ctx is
+		// still valid and the handle was already issued — so fall back to
+		// poll mode rather than leaving it with no refresh source at all.
+		m.log.Warn("subscription: Subscribe request ended while awaiting WatchItems, falling back to polling",
+			"handle", string(s.handle))
 		m.schedulePoll(s, s.minSamplingRate())
 	}
 }

@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -61,7 +62,7 @@ func TestReaper_AbandonsSubscriptionPastGracePeriod(t *testing.T) {
 	if m.count() != 0 {
 		t.Fatalf("expected the subscription to be reaped after exceeding its grace period, got count=%d", m.count())
 	}
-	if _, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}}); err != ErrNoSubscription {
+	if _, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}}); !errors.Is(err, ErrNoSubscription) {
 		t.Fatalf("expected the reaped handle to now be invalid, got err=%v", err)
 	}
 }

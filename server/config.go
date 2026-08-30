@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/subscription"
+	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
 // Config holds every tunable limit and policy for a Handler/Server. The
@@ -57,10 +58,60 @@ type Config struct {
 	// PollTimeout bounds each poll-mode backend.Reader.Read call
 	// (forwarded to subscription.Config).
 	PollTimeout time.Duration
+	// MaxBrowseElements bounds how many elements one Browse response may
+	// carry. It is both a clamp on the client's own MaxElementsReturned
+	// and a ceiling enforced on the backend's answer: Browse is the only
+	// operation whose result size the client may leave unbounded
+	// (MaxElementsReturned=0 means "no limit"), and the whole response is
+	// assembled in memory before anything is written. A truncated result
+	// is reported with MoreElements=true, so a client can page through it
+	// normally. Zero applies the built-in default (5000); a negative value
+	// explicitly requests no limit.
+	MaxBrowseElements int
+	// MaxTotalSubscribedItems bounds the number of subscribed items across
+	// all subscriptions at once. Without it, MaxConcurrentSubscriptions
+	// and MaxItemsPerSubscription multiply: the per-axis defaults alone
+	// permit ten million live items, each holding its own last sample.
+	// Zero applies the built-in default (200000); a negative value
+	// explicitly requests no limit.
+	MaxTotalSubscribedItems int
+
 	// ReadOnly, if true, globally disables Write regardless of whether
 	// the backend supplies a Writer — the specification's own
 	// recommended policy hook (REQ-SECURITY-002, §2.8).
 	ReadOnly bool
+
+	// ErrorText supplies the human-readable text for a result code in the
+	// response's Errors list. It receives the code and the locale the
+	// server resolved for the request (ReplyBase.RevisedLocaleID), and
+	// should fall back to xmlda.StandardErrorText for codes it does not
+	// handle.
+	//
+	// The specification asks for exactly this (§2.6: "The XML-DA server
+	// should also return the error text for the LocaleID specified in the
+	// request"), and it is also the only way to give a vendor result code
+	// any text at all — xmlda.StandardErrorText returns "" for codes it
+	// does not know, which omits the <Text> element that §3.1.9 says
+	// every OPCError carries.
+	//
+	// nil keeps the built-in behavior: xmlda.StandardErrorText, English,
+	// locale-independent.
+	ErrorText func(code xmlda.ErrorCode, locale string) string
+
+	// StatusCacheTTL is how long the ServerStatus fetched for a request's
+	// state check (REQ-SERVER-002 evaluates xmlda.RequiresFault before
+	// every operation) may be reused across requests. Without it every
+	// single request — Read, Write, Cancel, all of them — costs one extra
+	// backend GetStatus call, which for a backend that reaches a device to
+	// answer it doubles the load and adds its latency to every operation.
+	//
+	// ServerState does not change on a millisecond scale, so a short TTL
+	// costs nothing in correctness. GetStatus's own response is never
+	// served from this cache: that operation always re-fetches, so a
+	// client explicitly asking for the status still gets a live answer.
+	// Zero applies the built-in default (250ms); a negative value disables
+	// caching entirely (a fresh fetch per request, the previous behavior).
+	StatusCacheTTL time.Duration
 
 	// ReadHeaderTimeout bounds how long server.NewServer's http.Server
 	// waits to finish reading a request's headers, mitigating a
@@ -118,6 +169,15 @@ func (c Config) WithDefaults() Config {
 	if c.MaxConcurrentSubscriptions == 0 {
 		c.MaxConcurrentSubscriptions = 10000
 	}
+	if c.MaxBrowseElements == 0 {
+		c.MaxBrowseElements = 5000
+	}
+	if c.MaxTotalSubscribedItems == 0 {
+		c.MaxTotalSubscribedItems = 200000
+	}
+	if c.StatusCacheTTL == 0 {
+		c.StatusCacheTTL = 250 * time.Millisecond
+	}
 	if c.MaxRequestBodyBytes <= 0 {
 		c.MaxRequestBodyBytes = 4 << 20 // 4 MiB
 	}
@@ -152,5 +212,6 @@ func (c Config) subscriptionConfig() subscription.Config {
 		DefaultSamplingRate:         c.DefaultSamplingRate,
 		MaxBufferedSamplesPerItem:   c.MaxBufferedSamplesPerItem,
 		PollTimeout:                 c.PollTimeout,
+		MaxTotalSubscribedItems:     c.MaxTotalSubscribedItems,
 	}
 }

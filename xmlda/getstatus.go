@@ -35,10 +35,50 @@ type Status struct {
 	SupportedInterfaceVersions []string `xml:"SupportedInterfaceVersions"`
 }
 
-// GetStatusResponse is the response for the GetStatus operation.
+// MarshalXML implements xml.Marshaler. It exists only so StartTime goes
+// out in this library's canonical wire time form (formatWireTime: UTC,
+// millisecond precision) rather than through time.Time's own MarshalText,
+// which encoding/xml would otherwise call for an ",attr" field and which
+// emits the process's local offset and nanosecond precision.
+func (s Status) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "StartTime"}, Value: formatWireTime(s.StartTime)})
+	if s.ProductVersion != "" {
+		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ProductVersion"}, Value: s.ProductVersion})
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	// Child order follows the schema's xsd:sequence for ServerStatus:
+	// StatusInfo, VendorInfo, SupportedLocaleIDs*, SupportedInterfaceVersions*.
+	if s.StatusInfo != "" {
+		if err := e.EncodeElement(s.StatusInfo, xml.StartElement{Name: xml.Name{Local: "StatusInfo"}}); err != nil {
+			return err
+		}
+	}
+	if s.VendorInfo != "" {
+		if err := e.EncodeElement(s.VendorInfo, xml.StartElement{Name: xml.Name{Local: "VendorInfo"}}); err != nil {
+			return err
+		}
+	}
+	for _, l := range s.SupportedLocaleIDs {
+		if err := e.EncodeElement(l, xml.StartElement{Name: xml.Name{Local: "SupportedLocaleIDs"}}); err != nil {
+			return err
+		}
+	}
+	for _, v := range s.SupportedInterfaceVersions {
+		if err := e.EncodeElement(v, xml.StartElement{Name: xml.Name{Local: "SupportedInterfaceVersions"}}); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
+}
+
+// GetStatusResponse is the response for the GetStatus operation (§3.2.2).
+// The schema's GetStatusResponse carries exactly GetStatusResult and
+// Status — there is no Errors element, so this type has no Errors field:
+// modeling one would invite emitting a schema-invalid response.
 type GetStatusResponse struct {
-	XMLName xml.Name  `xml:"GetStatusResponse"`
+	XMLName xml.Name  `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ GetStatusResponse"`
 	Result  ReplyBase `xml:"GetStatusResult"`
 	Status  Status    `xml:"Status"`
-	Errors  Errors    `xml:"Errors"`
 }

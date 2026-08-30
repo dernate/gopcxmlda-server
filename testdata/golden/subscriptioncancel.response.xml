@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Header></SOAP-ENV:Header><SOAP-ENV:Body><SubscriptionCancelResponse xmlns="http://opcfoundation.org/webservices/XMLDA/1.0/" ClientRequestHandle="CRH-cancel"></SubscriptionCancelResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>

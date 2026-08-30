@@ -40,7 +40,7 @@ type SubscribeItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l SubscribeItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -75,8 +75,10 @@ type SubscribeRequest struct {
 	ReturnValuesOnReply bool
 	// SubscriptionPingRate is the liveness/abandonment timer, in
 	// milliseconds; 0 means "use the server's own default" — see
-	// REQ-SUBSCRIPTION-015 and open-questions.md OQ-10.
-	SubscriptionPingRate uint32
+	// REQ-SUBSCRIPTION-015 and open-questions.md OQ-10. It is xsd:int on
+	// the wire, so a negative value decodes and is then treated as 0
+	// rather than faulting the request.
+	SubscriptionPingRate int32
 	Options              RequestOptions
 	Params               ItemParams
 	ItemList             SubscribeItemList
@@ -87,9 +89,9 @@ func (r SubscribeRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) err
 	start.Name = xml.Name{Local: "Subscribe"}
 	start.Attr = append(start.Attr,
 		xml.Attr{Name: xml.Name{Local: "ReturnValuesOnReply"}, Value: strconv.FormatBool(r.ReturnValuesOnReply)},
-		xml.Attr{Name: xml.Name{Local: "SubscriptionPingRate"}, Value: strconv.FormatUint(uint64(r.SubscriptionPingRate), 10)},
+		xml.Attr{Name: xml.Name{Local: "SubscriptionPingRate"}, Value: strconv.FormatInt(int64(r.SubscriptionPingRate), 10)},
 	)
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(r.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(r.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -112,11 +114,11 @@ func (r *SubscribeRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) 
 		r.ReturnValuesOnReply = b
 	}
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "SubscriptionPingRate"}); ok {
-		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return fmt.Errorf("xmlda: invalid SubscriptionPingRate %q: %w", v, err)
 		}
-		r.SubscriptionPingRate = uint32(u)
+		r.SubscriptionPingRate = int32(n)
 	}
 	p, err := decodeItemParamsAttrs(d, start.Attr)
 	if err != nil {
@@ -144,14 +146,14 @@ func (r *SubscribeRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) 
 //
 // </Items>
 type SubscribeItemValue struct {
-	RevisedSamplingRate uint32
+	RevisedSamplingRate int32
 	ItemValue           ItemValue
 }
 
 // MarshalXML implements xml.Marshaler.
 func (s SubscribeItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, typeAttrs(QName{Space: Namespace, Local: "SubscribeItemValue"})...)
-	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatUint(uint64(s.RevisedSamplingRate), 10)})
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "SubscribeItemValue"})...)
+	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatInt(int64(s.RevisedSamplingRate), 10)})
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -164,11 +166,11 @@ func (s SubscribeItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) e
 // UnmarshalXML implements xml.Unmarshaler.
 func (s *SubscribeItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "RevisedSamplingRate"}); ok {
-		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return fmt.Errorf("xmlda: invalid RevisedSamplingRate %q: %w", v, err)
 		}
-		s.RevisedSamplingRate = uint32(u)
+		s.RevisedSamplingRate = int32(n)
 	}
 	var shadow struct {
 		ItemValue ItemValue `xml:"ItemValue"`
@@ -182,14 +184,14 @@ func (s *SubscribeItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement
 
 // SubscribeReplyItemList is Subscribe's <RItemList> element.
 type SubscribeReplyItemList struct {
-	RevisedSamplingRate uint32
+	RevisedSamplingRate int32
 	Items               []SubscribeItemValue
 }
 
 // MarshalXML implements xml.Marshaler.
 func (l SubscribeReplyItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, typeAttrs(QName{Space: Namespace, Local: "SubscribeReplyItemList"})...)
-	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatUint(uint64(l.RevisedSamplingRate), 10)})
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "SubscribeReplyItemList"})...)
+	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatInt(int64(l.RevisedSamplingRate), 10)})
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -204,11 +206,11 @@ func (l SubscribeReplyItemList) MarshalXML(e *xml.Encoder, start xml.StartElemen
 // UnmarshalXML implements xml.Unmarshaler.
 func (l *SubscribeReplyItemList) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "RevisedSamplingRate"}); ok {
-		u, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
 			return fmt.Errorf("xmlda: invalid RevisedSamplingRate %q: %w", v, err)
 		}
-		l.RevisedSamplingRate = uint32(u)
+		l.RevisedSamplingRate = int32(n)
 	}
 	items, err := decodeRepeatedElements[SubscribeItemValue](d, "Items", "RItemList")
 	if err != nil {
@@ -222,7 +224,7 @@ func (l *SubscribeReplyItemList) UnmarshalXML(d *xml.Decoder, start xml.StartEle
 // pp.58-60). ServerSubHandle is the empty string iff no requested item
 // was valid (no subscription created) — REQ-SUBSCRIPTION-002.
 type SubscribeResponse struct {
-	XMLName         xml.Name               `xml:"SubscribeResponse"`
+	XMLName         xml.Name               `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ SubscribeResponse"`
 	ServerSubHandle string                 `xml:"ServerSubHandle,attr"`
 	Result          ReplyBase              `xml:"SubscribeResult"`
 	RItemList       SubscribeReplyItemList `xml:"RItemList"`

@@ -40,7 +40,7 @@ type ReadItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l ReadItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -78,7 +78,7 @@ type ReadRequest struct {
 // MarshalXML implements xml.Marshaler.
 func (r ReadRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	start.Name = xml.Name{Local: "Read"}
-	start.Attr = append(start.Attr, encodeItemParamsAttrs(r.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(r.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func (r *ReadRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 // RItemList's item count and order must match the request
 // (REQ-READ-003).
 type ReadResponse struct {
-	XMLName   xml.Name      `xml:"ReadResponse"`
+	XMLName   xml.Name      `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ ReadResponse"`
 	Result    ReplyBase     `xml:"ReadResult"`
 	RItemList ItemValueList `xml:"RItemList"`
 	Errors    Errors        `xml:"Errors"`

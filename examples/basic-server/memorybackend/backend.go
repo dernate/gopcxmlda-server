@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,7 +72,7 @@ func New() *Backend {
 		items: map[backend.ItemRef]*item{},
 		tree: map[string][]string{
 			"":     {"Demo"},
-			"Demo": {"Counter", "Temperature", "Switch", "Message"},
+			"Demo": {"Counter", "Temperature", "Switch", "Message", "Readings"},
 		},
 		start:  time.Now(),
 		ctx:    ctx,
@@ -82,6 +83,13 @@ func New() *Backend {
 	b.addItem("Demo/Temperature", xmlda.NewFloat64(21.5), false, "A simulated read-only temperature reading.")
 	b.addItem("Demo/Switch", xmlda.NewBool(false), true, "A writable boolean switch.")
 	b.addItem("Demo/Message", xmlda.NewString("hello"), true, "A writable string value.")
+	// An array-typed item. Arrays are ordinary process data in OPC (a
+	// VT_ARRAY tag is the normal way a device exposes a block of
+	// registers), and every example here was scalar-only for a while —
+	// which is exactly why the missing xmlda.NewArrayValue went unnoticed
+	// for so long. Keeping one in the example keeps that path exercised.
+	b.addItem("Demo/Readings", xmlda.NewArrayValue(xmlda.NewFloat64Array([]float64{0, 0, 0, 0})), false,
+		"A simulated read-only block of four sensor readings (ArrayOfDouble).")
 	b.items[backend.ItemRef{ItemName: "Demo/Counter"}].hasRange = true
 	b.items[backend.ItemRef{ItemName: "Demo/Counter"}].rangeMin = 0
 	b.items[backend.ItemRef{ItemName: "Demo/Counter"}].rangeMax = 1000
@@ -121,6 +129,7 @@ func (b *Backend) simulate(ctx context.Context) {
 	defer ticker.Stop()
 	counterRef := backend.ItemRef{ItemName: "Demo/Counter"}
 	tempRef := backend.ItemRef{ItemName: "Demo/Temperature"}
+	readingsRef := backend.ItemRef{ItemName: "Demo/Readings"}
 	var counter int32
 	for {
 		select {
@@ -132,6 +141,12 @@ func (b *Backend) simulate(ctx context.Context) {
 
 			temp := 21.5 + (rand.Float64()-0.5)*2
 			b.setValue(tempRef, xmlda.NewFloat64(temp))
+
+			readings := make([]float64, 4)
+			for i := range readings {
+				readings[i] = float64(counter) + float64(i)/10
+			}
+			b.setValue(readingsRef, xmlda.NewArrayValue(xmlda.NewFloat64Array(readings)))
 		}
 	}
 }
@@ -373,17 +388,12 @@ func propertiesFor(itm *item, all bool, ids []xmlda.PropertyID, includeValue boo
 		if all {
 			return true
 		}
-		for _, w := range ids {
-			if w == id {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(ids, id)
 	}
 
 	var props []backend.Property
 	if wanted(xmlda.PropDataType) {
-		props = append(props, backend.Property{ID: xmlda.PropDataType, Value: xmlda.NewString(string(value.Type()))})
+		props = append(props, backend.Property{ID: xmlda.PropDataType, Value: xmlda.NewQNameValue(value.TypeName())})
 	}
 	if wanted(xmlda.PropDescription) {
 		props = append(props, backend.Property{ID: xmlda.PropDescription, Value: xmlda.NewString(description)})

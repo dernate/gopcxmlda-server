@@ -16,6 +16,12 @@ import (
 // not a specification requirement).
 var ErrTooManySubscriptions = errors.New("subscription: maximum number of concurrent subscriptions reached")
 
+// ErrTooManyItems is returned by Create when Config.MaxTotalSubscribedItems
+// would be exceeded — the server-wide item budget, distinct from the
+// per-subscription and per-request item limits the server layer enforces.
+// Mapped to the same E_OUTOFMEMORY fault as ErrTooManySubscriptions.
+var ErrTooManyItems = errors.New("subscription: maximum number of subscribed items across all subscriptions reached")
+
 // ErrShuttingDown is returned by Create once BeginShutdown has run: the
 // Manager will accept no new subscriptions. The server layer maps this to
 // an E_SERVERSTATE fault (the specification's code for "the server cannot
@@ -30,6 +36,13 @@ type CreateItemRequest struct {
 	RequestedSamplingRate time.Duration // 0 = fastest practical
 	Deadband              float64       // 0-100%, analog/array types only
 	EnableBuffering       bool
+	// ReqType is the client's requested value type for this item
+	// (§3.1.3's hierarchical ReqType, which SubscribeRequestItemList and
+	// SubscribeRequestItem both carry). This engine stores it and hands
+	// it back on every result; it never coerces itself — that is pure
+	// xmlda.Value logic the server layer applies on the way out, exactly
+	// as it does for Read.
+	ReqType *xmlda.QName
 }
 
 // CreateRequest is the input to Manager.Create (the Subscribe operation's
@@ -46,6 +59,9 @@ type CreateRequest struct {
 type CreateItemResult struct {
 	ClientItemHandle    string
 	RevisedSamplingRate time.Duration
+	// ReqType echoes the requested type, for the server layer's coercion
+	// step; nil if the client requested none.
+	ReqType *xmlda.QName
 	// ResultID is the zero ErrorCode iff this item was valid and is now
 	// part of the subscription.
 	ResultID xmlda.ErrorCode
@@ -106,6 +122,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		itemResult := CreateItemResult{
 			ClientItemHandle:    it.ClientItemHandle,
 			RevisedSamplingRate: rate,
+			ReqType:             it.ReqType,
 			ResultID:            res.ResultID,
 		}
 		if res.ResultID.IsZero() {
@@ -116,6 +133,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 				revisedSamplingRate:   rate,
 				deadband:              it.Deadband,
 				enableBuffering:       it.EnableBuffering,
+				reqType:               it.ReqType,
 				haveLast:              true,
 				last:                  res.Value,
 			})
@@ -167,11 +185,21 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		cancel()
 		return CreateResult{}, ErrTooManySubscriptions
 	}
+	// The server-wide item budget, checked in the same critical section
+	// for the same reason as the subscription count: a limit only on the
+	// number of subscriptions says nothing about how much memory they
+	// hold between them.
+	if m.cfg.MaxTotalSubscribedItems > 0 &&
+		m.totalItemsLocked()+len(items) > m.cfg.MaxTotalSubscribedItems {
+		m.mu.Unlock()
+		cancel()
+		return CreateResult{}, ErrTooManyItems
+	}
 	m.subs[s.handle] = s
 	m.mu.Unlock()
 	m.metrics.SetActiveSubscriptions(m.count())
 
-	m.startRefreshing(s)
+	m.startRefreshing(ctx, s)
 
 	out.Handle = s.handle
 	return out, nil

@@ -73,7 +73,7 @@ func New() *Backend {
 			"Plant/BuildingA/Line1/Motor1": {"Speed", "Temperature", "Running"},
 			"Plant/BuildingA/Line2/Motor1": {"Speed", "Temperature", "Running"},
 			"Plant/BuildingB":              {"Tank1"},
-			"Plant/BuildingB/Tank1":        {"Level", "Valve", "Label", "Capacity"},
+			"Plant/BuildingB/Tank1":        {"Level", "Valve", "Label", "Capacity", "Sensors"},
 		},
 		start:  time.Now(),
 		ctx:    ctx,
@@ -93,6 +93,13 @@ func New() *Backend {
 	b.addItem("Plant/BuildingB/Tank1/Valve", xmlda.NewBool(false), true, "Writable inlet valve state.")
 	b.addItem("Plant/BuildingB/Tank1/Label", xmlda.NewString("Tank 1"), true, "Writable free-text label.")
 	b.addItem("Plant/BuildingB/Tank1/Capacity", xmlda.NewInt32(10000), false, "Read-only tank capacity in liters.")
+	// An array-typed item, so the Dockerized end-to-end suite drives an
+	// ArrayOf<X> value over real HTTP through the reference client — the
+	// one value shape no backend in this repository used to produce, and
+	// therefore the one the wire path was never exercised for.
+	b.addItem("Plant/BuildingB/Tank1/Sensors",
+		xmlda.NewArrayValue(xmlda.NewFloat64Array([]float64{0, 0, 0})), false,
+		"Simulated read-only array of three tank sensor readings (ArrayOfDouble).")
 
 	b.wg.Go(func() { b.simulate(ctx) })
 	return b
@@ -132,6 +139,21 @@ func (b *Backend) simulate(ctx context.Context) {
 				itm.ts = time.Now()
 				itm.mu.Unlock()
 			}
+			// The array item ticks too, so a soak-test subscription sees
+			// an ArrayOf<X> value change over time rather than only at
+			// creation.
+			ref := backend.ItemRef{ItemName: "Plant/BuildingB/Tank1/Sensors"}
+			b.mu.RLock()
+			itm := b.items[ref]
+			b.mu.RUnlock()
+			itm.mu.Lock()
+			readings := make([]float64, 3)
+			for i := range readings {
+				readings[i] = 20 + rand.Float64()*10
+			}
+			itm.value = xmlda.NewArrayValue(xmlda.NewFloat64Array(readings))
+			itm.ts = time.Now()
+			itm.mu.Unlock()
 		}
 	}
 }
@@ -263,7 +285,7 @@ func propertiesFor(itm *item, includeValue bool) []backend.Property {
 	itm.mu.Unlock()
 
 	props := []backend.Property{
-		{ID: xmlda.PropDataType, Value: xmlda.NewString(string(value.Type()))},
+		{ID: xmlda.PropDataType, Value: xmlda.NewQNameValue(value.TypeName())},
 		{ID: xmlda.PropDescription, Value: xmlda.NewString(description)},
 	}
 	if includeValue {

@@ -46,14 +46,19 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 			ref.ItemPath = *p.ItemPath
 		}
 		refs[i] = ref
+		// A negative MaxAge is legal xsd:int with no meaning for
+		// "maximum acceptable age"; 0 ("most accurate / force a device
+		// read", REQ-READ-004) is the conservative reading.
 		var maxAge time.Duration
-		if p.MaxAge != nil {
+		if p.MaxAge != nil && *p.MaxAge > 0 {
 			maxAge = time.Duration(*p.MaxAge) * time.Millisecond
 		}
 		readItems[i] = backend.ReadRequestItem{Ref: ref, MaxAge: maxAge}
 	}
 
-	results, err := h.backend.Reader.Read(ctx, readItems)
+	results, err := observeBackend(h.metrics, h.clk, "Read", func() ([]backend.Result[backend.ItemSample], error) {
+		return h.backend.Reader.Read(ctx, readItems)
+	})
 	if err != nil {
 		h.metrics.IncRequestError("Read", "backend_error")
 		writeFault(w, backendErrorFault(err))
@@ -73,7 +78,15 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 		}
 		resultID := res.ResultID
 		sample := res.Value
-		haveSample := resultID.IsZero()
+		// A success-with-caveat code still carries a usable value: §2.6
+		// is explicit that "in case of a critical error the returned
+		// value may not be useful. For non-critical exceptions the
+		// returned value IS useful, although the client may need to
+		// react to an abnormal condition." Treating every non-zero
+		// ResultID as "no sample" silently dropped the value for
+		// S_CLAMP/S_DATAQUEUEOVERFLOW/S_UNSUPPORTEDRATE — the one case
+		// where the client is entitled to both the code and the data.
+		haveSample := hasUsableValue(resultID)
 
 		if haveSample && merged[i].ReqType != nil {
 			coerced, ok := coerceToReqType(sample.Value, merged[i].ReqType)
@@ -92,7 +105,7 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 	resp := xmlda.ReadResponse{
 		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
-		Errors:    xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
+		Errors:    xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
 	writeResponse(w, resp)
 }

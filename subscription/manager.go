@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
@@ -52,6 +53,13 @@ type Config struct {
 	// PollTimeout bounds each individual poll-mode backend.Reader.Read
 	// call.
 	PollTimeout time.Duration
+	// MaxTotalSubscribedItems caps the number of subscribed items across
+	// all subscriptions at once; <= 0 means unlimited. It exists because
+	// the per-axis limits multiply: MaxConcurrentSubscriptions and the
+	// server's per-subscription item cap together permit a live item
+	// count neither limit alone suggests, and every item holds its own
+	// last sample plus up to MaxBufferedSamplesPerItem buffered ones.
+	MaxTotalSubscribedItems int
 }
 
 func (c Config) withDefaults() Config {
@@ -161,6 +169,10 @@ type itemState struct {
 	revisedSamplingRate   time.Duration
 	deadband              float64 // 0-100%, analog/array types only
 	enableBuffering       bool
+	// reqType is the client's requested value type, carried through
+	// untouched so every result can report it back to the server layer,
+	// which is where coercion happens.
+	reqType *xmlda.QName
 
 	mu sync.Mutex
 	// haveLast reports whether last holds a real sample. It stays true
@@ -243,6 +255,14 @@ func (s *subState) touchPolledAt(now time.Time) {
 	s.mu.Unlock()
 }
 
+// isBusy reports whether a SubscriptionPolledRefresh call currently holds
+// this subscription (REQ-SUBSCRIPTION-009's busy flag). Read by the
+// abandonment reaper, which must never terminate a subscription a client
+// is actively polling — see reapOnce.
+func (s *subState) isBusy() bool {
+	return atomic.LoadInt32(&s.busyFlag) != 0
+}
+
 // Shutdown cancels every subscription's context (unblocking any in-flight
 // PolledRefresh call and halting poll/push scheduling immediately) and
 // then waits for background goroutines to exit, bounded by ctx.
@@ -310,6 +330,87 @@ func (m *Manager) count() int {
 	defer m.mu.RUnlock()
 	return len(m.subs)
 }
+
+// totalItemsLocked returns the number of subscribed items across every
+// live subscription. m.mu must be held.
+//
+// Each subscription's item slice is fixed at Create time and never
+// changes afterwards (OPC XML-DA has no "add item to existing
+// subscription" operation), so this needs no per-subscription lock.
+func (m *Manager) totalItemsLocked() int {
+	n := 0
+	for _, s := range m.subs {
+		n += len(s.items)
+	}
+	return n
+}
+
+// armTimer arms a clock.Clock.AfterFunc timer whose callback is tracked
+// by m.wg for its whole lifetime — from the moment it is armed, not from
+// the moment it fires.
+//
+// sync.WaitGroup requires that a positive Add which takes the counter off
+// zero happens before Wait. Calling Add as the callback's first statement
+// does not satisfy that: between "the timer fired and its goroutine was
+// scheduled" and "the callback executed its first line" the counter is
+// still zero, so a concurrent Wait can return while a backend call is
+// about to start. Timer.Stop does not close the window either — it
+// reports false precisely when the callback has already begun.
+//
+// Counting from arming closes it. The returned timer's Stop releases the
+// counter when, and only when, it actually prevented the callback from
+// running; otherwise the callback releases it on the way out. Exactly one
+// of the two happens, and sync.Once makes a double release impossible
+// even under a racing Stop.
+//
+// Self-rescheduling chains (schedulePoll, scheduleReap) arm the next
+// timer from inside the current callback, before its deferred release
+// runs, so the counter never dips to zero between links.
+func (m *Manager) armTimer(d time.Duration, f func()) clock.Timer {
+	m.wg.Add(1)
+	var once sync.Once
+	release := func() { once.Do(m.wg.Done) }
+	t := m.clock.AfterFunc(d, func() {
+		defer release()
+		f()
+	})
+	return &trackedTimer{inner: t, release: release}
+}
+
+// trackedTimer is armTimer's return value: a clock.Timer whose Stop also
+// releases the WaitGroup counter armTimer took.
+//
+// The underlying timer is held in a named field rather than embedded, so
+// Reset cannot be inherited by accident: armTimer's accounting is a
+// one-shot arm/fire-or-stop pair, and resetting a stopped timer would
+// re-arm a callback whose counter has already been released — a
+// WaitGroup counter going negative, which panics. Nothing in this
+// package resets a timer, and this makes that a compile-time fact
+// instead of a comment.
+type trackedTimer struct {
+	inner   clock.Timer
+	release func()
+}
+
+// Stop stops the underlying timer, releasing the WaitGroup counter if the
+// callback was actually prevented from running.
+func (t *trackedTimer) Stop() bool {
+	stopped := t.inner.Stop()
+	if stopped {
+		t.release()
+	}
+	return stopped
+}
+
+// Reset is not supported on a wg-tracked timer; see trackedTimer.
+func (t *trackedTimer) Reset(time.Duration) bool {
+	panic("subscription: trackedTimer.Reset is not supported — arm a new timer via armTimer instead")
+}
+
+// C returns the underlying timer's channel. An AfterFunc timer's channel
+// never fires (clock.Timer's own contract); this exists only to satisfy
+// the interface.
+func (t *trackedTimer) C() <-chan time.Time { return t.inner.C() }
 
 // recoverBackgroundPanic recovers a panic occurring within op, a
 // background call that reaches into third-party backend/telemetry code

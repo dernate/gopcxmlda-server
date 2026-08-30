@@ -21,7 +21,10 @@ func filterHash(req xmlda.BrowseRequest) string {
 	if req.ItemPath != nil {
 		itemPath = *req.ItemPath
 	}
-	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%t",
+	// The error returns below are discarded deliberately: hash.Hash
+	// documents that its Write never returns one, so there is no failure
+	// here to handle or propagate.
+	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%t",
 		req.ItemName, itemPath, req.BrowseFilter, req.ElementNameFilter, req.VendorFilter,
 		req.MaxElementsReturned, req.ReturnAllProperties, req.ReturnPropertyValues)
 	// PropertyNames belongs in the hash too: it selects which properties
@@ -30,7 +33,7 @@ func filterHash(req xmlda.BrowseRequest) string {
 	// into. Length-prefixing each name keeps the digest unambiguous —
 	// without it, {"ab","c"} and {"a","bc"} would hash identically.
 	for _, pn := range req.PropertyNames {
-		fmt.Fprintf(h, "\x00%d:%s\x00%d:%s", len(pn.Space), pn.Space, len(pn.Local), pn.Local)
+		_, _ = fmt.Fprintf(h, "\x00%d:%s\x00%d:%s", len(pn.Space), pn.Space, len(pn.Local), pn.Local)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

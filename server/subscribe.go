@@ -47,8 +47,11 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 		}
 		refs[i] = ref
 
+		// A negative RequestedSamplingRate is legal xsd:int that means
+		// nothing here; treat it as 0 ("fastest practical"), which is
+		// also what an absent attribute means.
 		var rate time.Duration
-		if p.RequestedSamplingRate != nil {
+		if p.RequestedSamplingRate != nil && *p.RequestedSamplingRate > 0 {
 			rate = time.Duration(*p.RequestedSamplingRate) * time.Millisecond
 		}
 		var deadband float64
@@ -65,16 +68,24 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 			RequestedSamplingRate: rate,
 			Deadband:              deadband,
 			EnableBuffering:       enableBuffering,
+			// ReqType is hierarchical for Subscribe exactly as it is for
+			// Read (the schema carries it on SubscribeRequestItemList and
+			// SubscribeRequestItem alike). It used to be merged here and
+			// then dropped, so a client subscribing an unsignedShort item
+			// as xsd:double silently got unsignedShort back — neither the
+			// conversion it asked for nor the E_BADTYPE that would have
+			// told it so.
+			ReqType: p.ReqType,
 		}
 	}
 
 	res, err := h.subs.Create(ctx, subscription.CreateRequest{
 		Items:                items,
 		ReturnValuesOnReply:  req.ReturnValuesOnReply,
-		SubscriptionPingRate: time.Duration(req.SubscriptionPingRate) * time.Millisecond,
+		SubscriptionPingRate: msToDuration(req.SubscriptionPingRate),
 	})
 	if err != nil {
-		if errors.Is(err, subscription.ErrTooManySubscriptions) {
+		if errors.Is(err, subscription.ErrTooManySubscriptions) || errors.Is(err, subscription.ErrTooManyItems) {
 			h.metrics.IncRequestError("Subscribe", "limit_exceeded")
 			writeFault(w, limitExceededFault(err.Error()))
 			return
@@ -94,19 +105,20 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 	listItems := make([]xmlda.SubscribeItemValue, len(res.Items))
 	codes := make([]xmlda.ErrorCode, len(res.Items))
 	for i, itemRes := range res.Items {
-		iv := buildItemValue(refs[i], itemRes.ClientItemHandle, itemRes.Sample, itemRes.HaveSample, itemRes.ResultID, "", req.Options)
+		sample, haveSample, resultID := applyReqType(itemRes.Sample, itemRes.HaveSample, itemRes.ResultID, itemRes.ReqType)
+		iv := buildItemValue(refs[i], itemRes.ClientItemHandle, sample, haveSample, resultID, "", req.Options)
 		listItems[i] = xmlda.SubscribeItemValue{
-			RevisedSamplingRate: uint32(itemRes.RevisedSamplingRate / time.Millisecond),
+			RevisedSamplingRate: int32(itemRes.RevisedSamplingRate / time.Millisecond),
 			ItemValue:           iv,
 		}
-		codes[i] = itemRes.ResultID
+		codes[i] = resultID
 	}
 
 	resp := xmlda.SubscribeResponse{
 		ServerSubHandle: string(res.Handle),
 		Result:          h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList:       xmlda.SubscribeReplyItemList{Items: listItems},
-		Errors:          xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
+		Errors:          xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
 	writeResponse(w, resp)
 }

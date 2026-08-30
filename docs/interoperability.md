@@ -42,6 +42,35 @@ documented below and in the test file itself):
   *this server* chose (always `"opc"`, deterministically); and its `SubscriptionPolledRefresh` method
   hardcodes `WaitTime=500` and `ReturnAllItems=false` with no way to override either through its public API.
 
+## Responses are namespace-qualified, as the schema requires
+
+The specification's WSDL declares its schema with `elementFormDefault="qualified"` and
+`targetNamespace="http://opcfoundation.org/webservices/XMLDA/1.0/"`, so every element in a response —
+`ReadResponse`, `ReadResult`, `RItemList`, `Items`, `Value`, `Quality`, `Errors`, and an array value's
+`<double>` children — belongs to the OPC XML-DA namespace. This server opens the operation element with
+`xmlns="http://opcfoundation.org/webservices/XMLDA/1.0/"` and lets every descendant inherit it, matching the
+real captured traffic in `testdata/responses/` byte for byte in shape.
+
+This was not always true. Until 2026-08-30 the payload went out in *no* namespace at all, which a
+match-by-local-name client (this library's own decoder, and `github.com/dernate/gopcxmlda`) accepts without
+complaint and a WSDL-generated proxy (.NET WCF/ASMX, JAX-WS, gSOAP, Python zeep) rejects outright with
+"element ReadResponse from namespace '' was not expected". If you built a client against this server before
+that date and worked around a missing namespace, remove the workaround.
+
+The same fix window also corrected two other things a schema-bound client would have tripped over:
+`ItemValue`'s children are now emitted in the schema's `xsd:sequence` order (`DiagnosticInfo`, `Value`,
+`Quality` — `Value` before `Quality`, not after), and `DiagnosticInfo` is an element rather than an
+attribute. Decoding still accepts the old attribute spelling, since a peer may still send it.
+
+## Signed wire fields accept negative values instead of faulting
+
+`WaitTime`, `SubscriptionPingRate`, `RequestedSamplingRate`, `MaxAge` and `MaxElementsReturned` are all
+`xsd:int` in the schema — signed. They used to be decoded as unsigned, so a client sending `WaitTime="-1"`
+(a common spelling of "no preference", and valid against the schema this repository now ships) got a
+whole-operation parse fault. They are decoded as signed now and normalized at the server boundary: a
+non-positive value means the same as an absent one, which for every one of these fields is "use the server's
+own policy".
+
 ## Namespace prefixes are never semantically significant — only the URI is
 
 `xmlda.resolveQName` resolves every `xsi:type`, `ResultID`, `ItemProperty.Name`, and `OPCError.ID` value by

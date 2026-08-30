@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Header></SOAP-ENV:Header><SOAP-ENV:Body><SOAP-ENV:Fault><faultcode xmlns:q0="http://opcfoundation.org/webservices/XMLDA/1.0/">q0:E_NOTSUPPORTED</faultcode><faultstring>The requested operation or combination of options is not supported.</faultstring><detail></detail></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>

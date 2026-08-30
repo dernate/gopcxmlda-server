@@ -3,6 +3,7 @@ package server
 import (
 	"math"
 
+	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
@@ -19,6 +20,16 @@ import (
 func coerceToReqType(v xmlda.Value, reqType *xmlda.QName) (xmlda.Value, bool) {
 	if reqType == nil || reqType.IsZero() || reqType.Local == "anyType" {
 		return v, true
+	}
+	// ReqType is an xsd:QName, so its namespace is part of its identity.
+	// Matching on the local name alone accepted e.g. ReqType="vendor:int"
+	// from any namespace at all and silently coerced to xsd:int — a type
+	// this server does not actually know, which is E_BADTYPE. Scalars live
+	// in the XSD namespace; anything else (including the OPC namespace's
+	// own ArrayOf<X> types, which this coercion does not support) is
+	// rejected below.
+	if reqType.Space != xmlda.XSDNamespace {
+		return xmlda.Value{}, false
 	}
 	target := xmlda.ScalarType(reqType.Local)
 	if v.Kind() != xmlda.KindScalar {
@@ -280,4 +291,29 @@ func numericToScalar(f float64, target xmlda.ScalarType) (xmlda.Value, bool) {
 	default:
 		return xmlda.Value{}, false
 	}
+}
+
+// applyReqType applies a subscribed item's requested type to one outcome
+// on its way to the wire, mirroring what handleRead does inline for a
+// Read result.
+//
+// Coercion lives here rather than in the subscription engine on purpose:
+// it is pure xmlda.Value logic with no bearing on scheduling, buffering
+// or change detection, and the engine stores every sample in the
+// backend's native type. Both Subscribe's initial values and every
+// SubscriptionPolledRefresh entry pass through this one function, so a
+// subscription cannot report one type at creation and another later.
+//
+// A value that cannot be converted becomes E_BADTYPE with no value, the
+// same outcome Read produces (REQ-TYPE-006).
+func applyReqType(sample backend.ItemSample, haveSample bool, resultID xmlda.ErrorCode, reqType *xmlda.QName) (backend.ItemSample, bool, xmlda.ErrorCode) {
+	if !haveSample || reqType == nil {
+		return sample, haveSample, resultID
+	}
+	coerced, ok := coerceToReqType(sample.Value, reqType)
+	if !ok {
+		return backend.ItemSample{}, false, xmlda.ErrBadType
+	}
+	sample.Value = coerced
+	return sample, true, resultID
 }

@@ -22,13 +22,21 @@ documented in [`docs/specification/open-questions.md`](specification/open-questi
   without the fuzzing engine's exploration.
 - **No official OPC Foundation conformance test suite has been run** against this library. Nothing in this
   repository should be read as a conformance claim — see `docs/protocol-support.md` for the precise,
-  per-operation implemented/tested status instead.
+  per-operation implemented/tested status instead. Since 2026-08-30 every response this server produces *is*
+  validated against the specification's own schema (transcribed into `testdata/schema/opcxmlda.xsd`) by
+  `xmllint` in CI, which is a real external check but still narrower than a conformance suite: it verifies
+  document structure, not protocol behavior over time.
 
 ## Specification areas with a documented, deliberately conservative interpretation
 
 These are not bugs — they are documented decisions where the specification was ambiguous, silent, or
 internally inconsistent. Full rationale for each is in `docs/specification/open-questions.md`.
 
+- **Deadband is measured as a percentage of the last reported value, not of the item's engineering-unit
+  range.** The specification defines it against the EU range (highEU/lowEU), which is an item *property* the
+  subscription layer has no access to. The comparison is against the last value actually reported to the
+  client — not the last value read — so a value drifting by just under the band on every poll still
+  eventually crosses it, rather than walking away unnoticed.
 - **Deadband + buffer overflow interaction** (OQ-4): the specification itself flags that a deadband-filtered
   sample which was nonetheless buffered can still be purged under buffer pressure, potentially leaving only
   the final in-deadband value — described in the spec as a caveat, not resolved. This library implements
@@ -72,9 +80,20 @@ their *semantics*, because only the backend can know what they mean for its data
   not a leak (each is bound to its subscription's own cancellable context). Poll-mode subscriptions cost
   effectively zero idle goroutines (a shared, self-rescheduling timer chain), so a server expecting very
   large subscription counts on a push-capable backend should account for this difference when sizing.
-- Numeric `ReqType` coercion (`Read`) supports a **numeric-to-numeric subset only**, with explicit range
-  checking. String/array/unknown-type coercion is deliberately unsupported (`E_BADTYPE`) rather than
-  attempted best-effort — see `docs/protocol-support.md`.
+- **Deadband is applied against the last reported value** — see the entry above; the poll chain itself
+  schedules each tick relative to when the previous one was *due*, not to when its backend call returned, so
+  a slow backend no longer stretches every item's real sampling interval past the `RevisedSamplingRate` the
+  client was told.
+- Numeric `ReqType` coercion (`Read` and `Subscribe`) supports a **numeric-to-numeric subset only**, with
+  explicit range checking. String/array/unknown-type coercion is deliberately unsupported (`E_BADTYPE`)
+  rather than attempted best-effort — see `docs/protocol-support.md`. A `ReqType` outside the XSD namespace
+  is `E_BADTYPE` too: the namespace is part of a QName's identity, so a vendor type that merely shares a
+  local name with an XSD one is not that type.
+- **The per-axis subscription limits multiply, so there is also a server-wide one.**
+  `MaxConcurrentSubscriptions` (10000) and `MaxItemsPerSubscription` (1000) together would permit ten million
+  live items, each holding its own last sample and up to `MaxBufferedSamplesPerItem` buffered ones.
+  `Config.MaxTotalSubscribedItems` (200000) bounds the product; a deployment expecting either axis near its
+  maximum should size all three together rather than any one in isolation.
 
 ## Not implemented
 

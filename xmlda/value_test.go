@@ -2,6 +2,7 @@ package xmlda
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -154,6 +155,39 @@ func TestNewDecimal_ValidEdgeForms(t *testing.T) {
 	}
 }
 
+// TestNewDecimalFromFloat64 pins the invariant that makes the constructor
+// safe to use at all: whatever it hands back must be text NewDecimal would
+// have accepted. Nothing downstream revalidates a Decimal — marshalScalar
+// stringifies it verbatim — so this constructor is the only gate between a
+// float64 and the xsd:decimal element content on the wire.
+func TestNewDecimalFromFloat64(t *testing.T) {
+	for _, f := range []float64{0, 1, -1, 0.5, -0.125, 123.45, 1e21, -1e21, math.SmallestNonzeroFloat64, math.MaxFloat64} {
+		d, err := NewDecimalFromFloat64(f)
+		if err != nil {
+			t.Fatalf("NewDecimalFromFloat64(%v): unexpected error: %v", f, err)
+		}
+		if _, err := NewDecimal(d.String()); err != nil {
+			t.Errorf("NewDecimalFromFloat64(%v) produced %q, which NewDecimal rejects: %v", f, d, err)
+		}
+	}
+}
+
+// TestNewDecimalFromFloat64_NonFinite covers the three float64 values with
+// no xsd:decimal lexical form at all. strconv.FormatFloat spells them
+// "NaN", "+Inf" and "-Inf"; xsd:decimal's grammar admits none of the
+// three, so they have to be refused here rather than silently emitted.
+func TestNewDecimalFromFloat64_NonFinite(t *testing.T) {
+	for _, f := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		d, err := NewDecimalFromFloat64(f)
+		if err == nil {
+			t.Fatalf("NewDecimalFromFloat64(%v) = %q, want an error: no such xsd:decimal literal exists", f, d)
+		}
+		if d != "" {
+			t.Errorf("NewDecimalFromFloat64(%v) returned %q alongside its error, want the zero Decimal", f, d)
+		}
+	}
+}
+
 func TestValue_DateTimeRoundTrip(t *testing.T) {
 	// Matches the real fixture's timestamp format: explicit UTC offset,
 	// millisecond fraction. testdata/responses/subscribe_680.response.xml
@@ -279,7 +313,7 @@ func TestValue_Nil(t *testing.T) {
 	}
 	if _, err := got.Int32(); err == nil {
 		t.Fatalf("expected typed accessor to fail on a nil value")
-	} else if te, ok := err.(*TypeError); !ok || !te.Nil {
+	} else if te := (*TypeError)(nil); !errors.As(err, &te) || !te.Nil {
 		t.Fatalf("expected *TypeError with Nil=true, got %v (%T)", err, err)
 	}
 }
@@ -525,7 +559,7 @@ func TestArray_TypedAccessors_WrongTypeErrors(t *testing.T) {
 	for name, check := range checks {
 		t.Run(name, func(t *testing.T) {
 			err := check()
-			if _, ok := err.(*TypeError); !ok {
+			if te := (*TypeError)(nil); !errors.As(err, &te) {
 				t.Fatalf("%s() on an int32 array: got err %v (%T), want *TypeError", name, err, err)
 			}
 		})
@@ -569,7 +603,7 @@ func TestValue_ArrayOfAnyType_WithinMaxDepth_RoundTrips(t *testing.T) {
 
 	// Unwrap `depth` levels of ArrayOfAnyType to reach the original leaf.
 	cur := got
-	for i := 0; i < depth; i++ {
+	for i := range depth {
 		arr, err := cur.Array()
 		if err != nil {
 			t.Fatalf("level %d: Array: %v", i, err)
@@ -792,8 +826,8 @@ func TestArray_TypeError_PopulatesTypeNameAndAttributesToArray(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected an error calling Strings() on an int32 array")
 	}
-	te, ok := err.(*TypeError)
-	if !ok {
+	var te *TypeError
+	if !errors.As(err, &te) {
 		t.Fatalf("expected *TypeError, got %T", err)
 	}
 	if te.TypeName.IsZero() {

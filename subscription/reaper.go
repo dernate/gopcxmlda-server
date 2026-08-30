@@ -17,16 +17,10 @@ func (m *Manager) startReaper() {
 }
 
 func (m *Manager) scheduleReap() {
-	t := m.clock.AfterFunc(m.cfg.ReapInterval, func() {
-		// See schedulePoll's comment (poll.go) on why Add happens
-		// unconditionally as the callback's very first statement, before
-		// the ctx check, rather than after it: this closes the window
-		// where a concurrent Manager.Wait could otherwise return before
-		// an already-firing callback's real work (reapOnce) is visible to
-		// it. It remains safe for an armed-but-never-fired timer, since a
-		// callback that never executes never reaches this line at all.
-		m.wg.Add(1)
-		defer m.wg.Done()
+	// armTimer (see manager.go) tracks this callback in m.wg from the
+	// moment it is armed, so a concurrent Manager.Wait cannot return
+	// while a sweep is pending or running.
+	t := m.armTimer(m.cfg.ReapInterval, func() {
 		if m.rootCtx.Err() != nil {
 			return // shut down: stop the chain
 		}
@@ -77,6 +71,17 @@ func (m *Manager) reapOnce() {
 	m.mu.RLock()
 	var toReap []Handle
 	for handle, s := range m.subs {
+		if s.isBusy() {
+			// A PolledRefresh is in flight for this subscription right
+			// now — that IS the client's liveness signal, and it is the
+			// strongest one available. Without this check the sweep
+			// reaps a subscription mid-call whenever the client's own
+			// requested Hold+Wait outlasts the grace period, which is
+			// entirely ordinary: a SubscriptionPingRate of 3s (as in the
+			// real captured traffic) gives a 6s grace against a Hold+Wait
+			// that may legitimately run to MaxPolledRefreshWait.
+			continue
+		}
 		s.mu.Lock()
 		abandoned := now.Sub(s.lastPolledAt) > reapGrace(s.pingRate, m.cfg.ReapGraceMultiplier)
 		s.mu.Unlock()
@@ -114,6 +119,11 @@ func (m *Manager) terminateIfStillAbandoned(handle Handle, asOf time.Time) bool 
 	defer m.mu.Unlock()
 	s, ok := m.subs[handle]
 	if !ok {
+		return false
+	}
+	// Re-checked here too, not just in the decision pass: a PolledRefresh
+	// may have started in the window between the two.
+	if s.isBusy() {
 		return false
 	}
 	s.mu.Lock()

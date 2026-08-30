@@ -79,6 +79,28 @@ func (k Kind) String() string {
 // worked examples).
 var decimalPattern = regexp.MustCompile(`^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)$`)
 
+// durationPattern validates the lexical form of xsd:duration per the XSD
+// Part 2 grammar: an optional sign, a mandatory "P", at least one
+// component, and a "T" separator required if and only if a time component
+// follows. Without it any string at all was accepted as a duration and
+// echoed straight back onto the wire — the one scalar type with no
+// validation, while xsd:decimal right below has had it all along.
+var durationPattern = regexp.MustCompile(
+	`^-?P(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$`)
+
+// ValidDuration reports whether s is a well-formed xsd:duration literal.
+// The regexp alone would accept the degenerate "P" and "PT", which the
+// grammar forbids: at least one component is required.
+func ValidDuration(s string) bool {
+	if s == "P" || s == "PT" || s == "-P" || s == "-PT" {
+		return false
+	}
+	if strings.HasSuffix(s, "T") {
+		return false
+	}
+	return durationPattern.MatchString(s)
+}
+
 // Decimal preserves the exact lexical xsd:decimal wire text. VT_CY (the
 // OPC Variant type decimal maps to) is fixed-point with no exact float64
 // representation, so Decimal is a validated string, not a float64 — see
@@ -98,8 +120,17 @@ func NewDecimal(s string) (Decimal, error) {
 // wire-format fidelity should prefer NewDecimal with the original literal
 // text instead, since the float64-to-decimal-text conversion may not
 // reproduce the exact digits of a value that originated as decimal text.
-func NewDecimalFromFloat64(f float64) Decimal {
-	return Decimal(strconv.FormatFloat(f, 'f', -1, 64))
+//
+// It returns an error for NaN and \u00b1Inf: xsd:decimal has no lexical form
+// for either (unlike xsd:double, which spells them "NaN"/"INF"), and
+// strconv.FormatFloat would otherwise hand back "NaN"/"+Inf" \u2014 text that
+// NewDecimal rejects and that nothing downstream revalidates before it
+// reaches the wire.
+func NewDecimalFromFloat64(f float64) (Decimal, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", fmt.Errorf("xmlda: %v has no xsd:decimal lexical representation", f)
+	}
+	return Decimal(strconv.FormatFloat(f, 'f', -1, 64)), nil
 }
 
 // Float64 parses d as a float64, accepting the precision loss inherent in
@@ -209,6 +240,19 @@ func (v Value) IsNil() bool { return v.isNil }
 // IsUnknown reports whether v.Kind() is KindUnknown.
 func (v Value) IsUnknown() bool { return v.kind == KindUnknown }
 
+// IsValid reports whether v was actually constructed — that is, whether
+// it has a declared type and can therefore be marshaled. It is false for
+// exactly one thing: the zero Value, which no constructor and no decode
+// ever produces (see Value's doc comment).
+//
+// Callers accepting a Value across the backend boundary should check this
+// before putting one on the wire. A zero Value reaching MarshalXML fails
+// the whole encode, which the server can only report as a
+// whole-operation E_FAIL — turning one backend slip (a Property whose
+// ResultID says "no value available", with Value left at its zero) into a
+// discarded response for every other item in the same request.
+func (v Value) IsValid() bool { return !v.typeName.IsZero() }
+
 // Equal reports whether v and other represent the same value: same Kind,
 // same declared type, same nil-ness, and equal content (using
 // time.Time.Equal for time-typed scalars/arrays rather than ==, since a
@@ -297,6 +341,30 @@ func decodeNilKind(typeName QName) (Kind, ScalarType) {
 		return KindScalar, st
 	}
 	return KindUnknown, ""
+}
+
+// NewArrayValue wraps a as a Value, the way the NewX constructors below
+// wrap a scalar. It is how a backend returns an array-typed item: the
+// NewXArray constructors (NewFloat64Array, NewStringArray, ...) build an
+// Array, but backend.ItemSample.Value — and every other place a value
+// crosses the public API — takes a Value, and Value's fields are
+// unexported by design.
+//
+// The ArrayOf<X> xsi:type is already carried by a (set by whichever
+// NewXArray built it), so nothing needs to be named twice:
+//
+//	sample.Value = xmlda.NewArrayValue(xmlda.NewFloat64Array([]float64{1.5, 2.5}))
+//	// → <Value xsi:type="opc:ArrayOfDouble"><double>1.5</double>…</Value>
+//
+// The zero Array (never built by a constructor) has no declared type and
+// yields a Value that fails to marshal, exactly as the zero Value does —
+// see Value's own doc comment.
+//
+// There is deliberately no NewUint8Array: a byte array is base64Binary on
+// the wire, not an ArrayOf<X> (the schema defines no ArrayOfUnsignedByte),
+// so use NewBytes for one.
+func NewArrayValue(a Array) Value {
+	return Value{kind: KindArray, typ: a.elemType, typeName: a.typeName, array: a}
 }
 
 // NewString returns a scalar Value of XSD type string.
@@ -395,9 +463,12 @@ func NewDate(t time.Time) Value {
 }
 
 // NewDuration returns a scalar Value of XSD type duration, wrapping the
-// given ISO-8601 duration literal (e.g. "P1D"). The literal is not
-// validated beyond being stored as-is, since the spec transmits it as
-// opaque VT_BSTR.
+// given ISO-8601 duration literal (e.g. "P1D").
+//
+// The literal is stored as given; it is validated on the way to the wire
+// (see formatScalar), so a malformed one fails the encode with a clear
+// error rather than being shipped as an xsd:duration a peer cannot
+// parse. Callers wanting the check up front can use ValidDuration.
 func NewDuration(iso8601 string) Value {
 	return Value{kind: KindScalar, typ: TypeDuration, typeName: QName{XSDNamespace, "duration"}, scalar: iso8601}
 }
@@ -1124,7 +1195,11 @@ func parseScalar(st ScalarType, text string) (any, error) {
 	case TypeDate:
 		return parseXSDDate(text)
 	case TypeDuration:
-		return strings.TrimSpace(text), nil
+		d := strings.TrimSpace(text)
+		if !ValidDuration(d) {
+			return nil, fmt.Errorf("xmlda: %q is not a valid xsd:duration literal", d)
+		}
+		return d, nil
 	default:
 		return nil, fmt.Errorf("xmlda: unsupported scalar type %q", st)
 	}
@@ -1133,50 +1208,138 @@ func parseScalar(st ScalarType, text string) (any, error) {
 // formatScalar renders val (as produced by parseScalar or one of the NewX
 // constructors) as its xsd literal text. It does not handle TypeQName.
 func formatScalar(st ScalarType, val any) (string, error) {
+	// Every assertion below is checked. An unchecked one would panic on a
+	// Value whose declared ScalarType and stored payload disagree — which
+	// no constructor or decode in this package produces, but which a
+	// panic is the wrong way to report: it unwinds through the encoder
+	// into ServeHTTP's recover and reaches the client as a bare E_FAIL
+	// with the actual cause only in a stack trace.
+	bad := func(want string) (string, error) {
+		return "", fmt.Errorf("xmlda: value declared as %s holds %T, not %s (internal inconsistency)", st, val, want)
+	}
 	switch st {
 	case TypeString:
-		return val.(string), nil
+		v, ok := val.(string)
+		if !ok {
+			return bad("string")
+		}
+		return v, nil
 	case TypeBoolean:
-		if val.(bool) {
+		v, ok := val.(bool)
+		if !ok {
+			return bad("bool")
+		}
+		if v {
 			return "true", nil
 		}
 		return "false", nil
 	case TypeFloat:
-		return formatXSDFloat(float64(val.(float32)), 32), nil
+		v, ok := val.(float32)
+		if !ok {
+			return bad("float32")
+		}
+		return formatXSDFloat(float64(v), 32), nil
 	case TypeDouble:
-		return formatXSDFloat(val.(float64), 64), nil
+		v, ok := val.(float64)
+		if !ok {
+			return bad("float64")
+		}
+		return formatXSDFloat(v, 64), nil
 	case TypeDecimal:
-		return val.(Decimal).String(), nil
+		v, ok := val.(Decimal)
+		if !ok {
+			return bad("Decimal")
+		}
+		return v.String(), nil
 	case TypeLong:
-		return strconv.FormatInt(val.(int64), 10), nil
+		v, ok := val.(int64)
+		if !ok {
+			return bad("int64")
+		}
+		return strconv.FormatInt(v, 10), nil
 	case TypeInt:
-		return strconv.FormatInt(int64(val.(int32)), 10), nil
+		v, ok := val.(int32)
+		if !ok {
+			return bad("int32")
+		}
+		return strconv.FormatInt(int64(v), 10), nil
 	case TypeShort:
-		return strconv.FormatInt(int64(val.(int16)), 10), nil
+		v, ok := val.(int16)
+		if !ok {
+			return bad("int16")
+		}
+		return strconv.FormatInt(int64(v), 10), nil
 	case TypeByte:
-		return strconv.FormatInt(int64(val.(int8)), 10), nil
+		v, ok := val.(int8)
+		if !ok {
+			return bad("int8")
+		}
+		return strconv.FormatInt(int64(v), 10), nil
 	case TypeUnsignedLong:
-		return strconv.FormatUint(val.(uint64), 10), nil
+		v, ok := val.(uint64)
+		if !ok {
+			return bad("uint64")
+		}
+		return strconv.FormatUint(v, 10), nil
 	case TypeUnsignedInt:
-		return strconv.FormatUint(uint64(val.(uint32)), 10), nil
+		v, ok := val.(uint32)
+		if !ok {
+			return bad("uint32")
+		}
+		return strconv.FormatUint(uint64(v), 10), nil
 	case TypeUnsignedShort:
-		return strconv.FormatUint(uint64(val.(uint16)), 10), nil
+		v, ok := val.(uint16)
+		if !ok {
+			return bad("uint16")
+		}
+		return strconv.FormatUint(uint64(v), 10), nil
 	case TypeUnsignedByte:
-		return strconv.FormatUint(uint64(val.(uint8)), 10), nil
+		v, ok := val.(uint8)
+		if !ok {
+			return bad("uint8")
+		}
+		return strconv.FormatUint(uint64(v), 10), nil
 	case TypeBase64Binary:
-		return base64.StdEncoding.EncodeToString(val.([]byte)), nil
+		v, ok := val.([]byte)
+		if !ok {
+			return bad("[]byte")
+		}
+		return base64.StdEncoding.EncodeToString(v), nil
 	case TypeDateTime:
-		return val.(time.Time).Format(time.RFC3339Nano), nil
+		v, ok := val.(time.Time)
+		if !ok {
+			return bad("time.Time")
+		}
+		return formatWireTime(v), nil
 	case TypeTime:
+		v, ok := val.(time.Time)
+		if !ok {
+			return bad("time.Time")
+		}
 		// Only the time-of-day component is ever on the wire for xsd:time —
 		// Format simply ignores the date fields of the stored time.Time
 		// (which NewTime keeps as originally passed, e.g. a caller's
 		// "now"), symmetric with parseXSDTime dropping them on decode.
-		return val.(time.Time).Format("15:04:05.999999999"), nil
+		return v.Format("15:04:05.999999999"), nil
 	case TypeDate:
-		return val.(time.Time).Format("2006-01-02"), nil
+		v, ok := val.(time.Time)
+		if !ok {
+			return bad("time.Time")
+		}
+		return v.Format("2006-01-02"), nil
 	case TypeDuration:
-		return val.(string), nil
+		v, ok := val.(string)
+		if !ok {
+			return bad("string")
+		}
+		// Checked on the way out as well as on the way in: NewDuration
+		// accepts any string (its signature has no error to return), so
+		// this is the only place a caller-constructed duration is
+		// validated before it becomes wire bytes.
+		if !ValidDuration(v) {
+			return "", fmt.Errorf("xmlda: %q is not a valid xsd:duration literal", v)
+		}
+		return v, nil
 	default:
 		return "", fmt.Errorf("xmlda: unsupported scalar type %q", st)
 	}
@@ -1202,14 +1365,14 @@ func formatScalar(st ScalarType, val any) (string, error) {
 // name. Putting xsi:type first costs nothing and happens to make that
 // client's Read/Write/Subscribe/GetProperties value decoding work; see
 // docs/interoperability.md.
-func typeAttrs(tn QName) []xml.Attr {
+func typeAttrs(existing []xml.Attr, tn QName) []xml.Attr {
 	if tn.Space == "" {
 		return []xml.Attr{
 			{Name: xml.Name{Local: "xsi:type"}, Value: tn.Local},
 			{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
 		}
 	}
-	prefix := prefixForNamespace(tn.Space)
+	prefix := prefixIn(existing, tn.Space)
 	return []xml.Attr{
 		{Name: xml.Name{Local: "xsi:type"}, Value: prefix + ":" + tn.Local},
 		{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
@@ -1228,6 +1391,46 @@ func prefixForNamespace(space string) string {
 	}
 }
 
+// prefixIn returns the prefix to use for space on an element that already
+// carries the attributes in existing: the conventional one from
+// prefixForNamespace when it is free or already bound to this very URI,
+// and a numbered variant ("ext2", "ext3", ...) when it is taken by a
+// different URI.
+//
+// Every non-standard namespace shares the conventional prefix "ext", so
+// one element declaring two QNames from two different vendor namespaces
+// would otherwise emit xmlns:ext twice with different values — a
+// duplicate attribute, and therefore a document no conforming parser
+// accepts. That is not a contrived case: §3.1.9 requires a vendor result
+// code to carry a vendor namespace and §3.1.10 requires the same of a
+// vendor item property, and nothing obliges the two to be the same
+// vendor. An ItemProperty naming one and failing with the other hits it.
+//
+// mergeAttrs cannot repair this on its own: by the time it sees the
+// declaration, the attribute *value* ("ext:E_VENDOR") has already been
+// built around the prefix, so the choice has to be made here, before the
+// value is rendered.
+func prefixIn(existing []xml.Attr, space string) string {
+	base := prefixForNamespace(space)
+	boundTo := func(p string) (string, bool) {
+		for _, a := range existing {
+			if a.Name.Local == "xmlns:"+p {
+				return a.Value, true
+			}
+		}
+		return "", false
+	}
+	if uri, taken := boundTo(base); !taken || uri == space {
+		return base
+	}
+	for n := 2; ; n++ {
+		cand := base + strconv.Itoa(n)
+		if uri, taken := boundTo(cand); !taken || uri == space {
+			return cand
+		}
+	}
+}
+
 // --- MarshalXML / UnmarshalXML ---
 
 // MarshalXML implements xml.Marshaler. It renders v exactly as the
@@ -1237,7 +1440,8 @@ func (v Value) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	if v.typeName.IsZero() {
 		return fmt.Errorf("xmlda: cannot marshal a Value with no declared type")
 	}
-	start.Attr = append(append([]xml.Attr{}, start.Attr...), typeAttrs(v.typeName)...)
+	base := append([]xml.Attr{}, start.Attr...)
+	start.Attr = mergeAttrs(base, typeAttrs(base, v.typeName)...)
 	if v.isNil {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xsi:nil"}, Value: "true"})
 		if err := e.EncodeToken(start); err != nil {
@@ -1278,6 +1482,19 @@ func writeRawInnerXML(e *xml.Encoder, raw []byte) error {
 			}
 			return fmt.Errorf("xmlda: re-encoding unknown value's inner XML: %w", err)
 		}
+		// Only content tokens are relayed. This inner XML came verbatim
+		// from a peer (ADR-003 preserves an unrecognized xsi:type's bytes
+		// exactly), and a Write with ReturnValuesOnReply echoes it
+		// straight back into a response — so an xml.Directive or
+		// xml.ProcInst in the request would be re-emitted mid-document,
+		// producing invalid XML with no error to signal it, since the
+		// encode itself succeeds. Comments are dropped for the same
+		// reason: they carry no value and only widen the pass-through.
+		switch tok.(type) {
+		case xml.StartElement, xml.EndElement, xml.CharData:
+		default:
+			continue
+		}
 		if err := e.EncodeToken(xml.CopyToken(tok)); err != nil {
 			return err
 		}
@@ -1304,11 +1521,14 @@ func (v Value) marshalScalar(e *xml.Encoder, start xml.StartElement) error {
 }
 
 func (v Value) marshalQNameScalar(e *xml.Encoder, start xml.StartElement) error {
-	qn := v.scalar.(QName)
+	qn, ok := v.scalar.(QName)
+	if !ok {
+		return fmt.Errorf("xmlda: value declared as QName holds %T (internal inconsistency)", v.scalar)
+	}
 	text := qn.Local
 	if qn.Space != "" {
-		prefix := prefixForNamespace(qn.Space)
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: qn.Space})
+		prefix := prefixIn(start.Attr, qn.Space)
+		start.Attr = mergeAttrs(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: qn.Space})
 		text = prefix + ":" + qn.Local
 	} else {
 		// Explicitly declare "no default namespace" in this scope so an
@@ -1316,7 +1536,7 @@ func (v Value) marshalQNameScalar(e *xml.Encoder, start xml.StartElement) error 
 		// nothing else in the document happens to declare a default
 		// namespace (see resolveQName: an unprefixed value with no
 		// default namespace in scope is otherwise unresolvable).
-		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: ""})
+		start.Attr = mergeAttrs(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns"}, Value: ""})
 	}
 	if err := e.EncodeToken(start); err != nil {
 		return err
@@ -1333,7 +1553,7 @@ func (v Value) marshalArray(e *xml.Encoder, start xml.StartElement) error {
 	}
 	elemLocal := string(v.array.elemType)
 	n := v.array.Len()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if v.array.elemType == TypeAnyType {
 			elem := v.array.data.([]Value)[i]
 			if err := elem.MarshalXML(e, xml.StartElement{Name: xml.Name{Local: "anyType"}}); err != nil {
@@ -1456,7 +1676,7 @@ func (v *Value) unmarshalXML(d *xml.Decoder, start xml.StartElement, depth int) 
 		return v.decodeScalar(d, start, st, tn)
 	}
 	if et, ok := arrayElemTypesByQName[tn]; ok {
-		return v.decodeArray(d, start, et, tn, depth)
+		return v.decodeArray(d, et, tn, depth)
 	}
 	return v.decodeUnknown(d, start, tn)
 }
@@ -1484,7 +1704,7 @@ func (v *Value) decodeScalar(d *xml.Decoder, start xml.StartElement, st ScalarTy
 	return nil
 }
 
-func (v *Value) decodeArray(d *xml.Decoder, start xml.StartElement, elemType ScalarType, tn QName, depth int) error {
+func (v *Value) decodeArray(d *xml.Decoder, elemType ScalarType, tn QName, depth int) error {
 	if elemType == TypeAnyType {
 		elems, err := decodeAnyTypeArray(d, depth)
 		if err != nil {

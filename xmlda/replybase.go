@@ -6,6 +6,28 @@ import (
 	"time"
 )
 
+// wireTimeLayout is the xsd:dateTime form this library emits everywhere:
+// UTC, fixed millisecond precision, explicit "+00:00" offset. It matches
+// the real captured traffic under testdata/responses/ byte for byte
+// (e.g. RcvTime="2026-08-24T18:22:45.921+00:00").
+//
+// The previous time.RFC3339Nano emitted the process's local offset and a
+// variable-length fractional part ("…12:06:56.123718397+02:00"). Both are
+// legal xsd:dateTime, but neither is what peers expect: the specification
+// treats item timestamps as UTC throughout (property 108, timeZone, is
+// defined as the offset "between the item's UTC Timestamp and…"), and
+// clients that compare or subtract timestamps naively — without applying
+// the offset — silently read a server in a non-UTC zone as hours off.
+const wireTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// formatWireTime renders t as an xsd:dateTime in this library's single
+// canonical wire form. Used for every dateTime the server emits:
+// ReplyBase's RcvTime/ReplyTime, ItemValue's Timestamp, Status's
+// StartTime, and dateTime-typed Values.
+func formatWireTime(t time.Time) string {
+	return t.UTC().Format(wireTimeLayout)
+}
+
 // ServerState reflects the server's overall operating condition (§3.1.7).
 type ServerState string
 
@@ -66,10 +88,10 @@ type ReplyBase struct {
 // type, which strict/.NET-generated clients may expect xsi:type to
 // disambiguate.
 func (r ReplyBase) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = append(start.Attr, typeAttrs(QName{Space: Namespace, Local: "ReplyBase"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ReplyBase"})...)
 	start.Attr = append(start.Attr,
-		xml.Attr{Name: xml.Name{Local: "RcvTime"}, Value: r.RcvTime.Format(time.RFC3339Nano)},
-		xml.Attr{Name: xml.Name{Local: "ReplyTime"}, Value: r.ReplyTime.Format(time.RFC3339Nano)},
+		xml.Attr{Name: xml.Name{Local: "RcvTime"}, Value: formatWireTime(r.RcvTime)},
+		xml.Attr{Name: xml.Name{Local: "ReplyTime"}, Value: formatWireTime(r.ReplyTime)},
 	)
 	if r.ClientRequestHandle != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ClientRequestHandle"}, Value: r.ClientRequestHandle})

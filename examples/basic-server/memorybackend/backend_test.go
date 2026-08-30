@@ -215,23 +215,52 @@ func TestBrowse_Pagination_ContinuationPointRoundTrip(t *testing.T) {
 		t.Fatalf("page 1: got %+v, want 2 elements, MoreElements=true, a non-empty ContinuationPoint", page1)
 	}
 
-	page2, err := b.Browse(context.Background(), backend.BrowseRequest{
-		Ref:                 backend.ItemRef{ItemName: "Demo"},
-		MaxElementsReturned: 2,
-		ContinuationPoint:   page1.ContinuationPoint,
-	})
-	if err != nil {
-		t.Fatalf("Browse (page 2): %v", err)
-	}
-	if len(page2.Elements) != 2 || page2.MoreElements || page2.ContinuationPoint != "" {
-		t.Fatalf("page 2: got %+v, want the remaining 2 elements, MoreElements=false, no further ContinuationPoint", page2)
-	}
-
+	// Page through to exhaustion rather than assuming a fixed number of
+	// pages: the demo address space is example content that grows (it
+	// gained an array-typed item, which is how this test first noticed),
+	// and what actually matters is that continuation points keep working
+	// until MoreElements goes false and every child has been seen exactly
+	// once.
 	seen := elementNames(page1.Elements)
-	for k := range elementNames(page2.Elements) {
-		seen[k] = true
+	total := len(page1.Elements)
+	page := page1
+	for i := 0; page.MoreElements; i++ {
+		if i > 20 {
+			t.Fatal("pagination did not terminate after 20 pages")
+		}
+		if page.ContinuationPoint == "" {
+			t.Fatalf("page %d reports MoreElements but supplies no ContinuationPoint", i+2)
+		}
+		next, err := b.Browse(context.Background(), backend.BrowseRequest{
+			Ref:                 backend.ItemRef{ItemName: "Demo"},
+			MaxElementsReturned: 2,
+			ContinuationPoint:   page.ContinuationPoint,
+		})
+		if err != nil {
+			t.Fatalf("Browse (page %d): %v", i+2, err)
+		}
+		if len(next.Elements) == 0 {
+			t.Fatalf("page %d returned no elements while MoreElements was set", i+2)
+		}
+		if len(next.Elements) > 2 {
+			t.Fatalf("page %d returned %d elements, more than MaxElementsReturned=2", i+2, len(next.Elements))
+		}
+		for name := range elementNames(next.Elements) {
+			if seen[name] {
+				t.Fatalf("page %d repeated element %q from an earlier page", i+2, name)
+			}
+			seen[name] = true
+		}
+		total += len(next.Elements)
+		page = next
 	}
-	for _, want := range []string{"Counter", "Temperature", "Switch", "Message"} {
+	if page.ContinuationPoint != "" {
+		t.Fatalf("the final page still supplies ContinuationPoint %q", page.ContinuationPoint)
+	}
+	if len(seen) != total {
+		t.Fatalf("saw %d distinct names across %d returned elements — some element was repeated", len(seen), total)
+	}
+	for _, want := range []string{"Counter", "Temperature", "Switch", "Message", "Readings"} {
 		if !seen[want] {
 			t.Fatalf("paginating through all pages missed expected item %q, saw %v", want, seen)
 		}

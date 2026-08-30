@@ -137,7 +137,7 @@ func soakFloat(v any) (float64, bool) {
 		if len(n) == 1 {
 			return float64(n[0]), true
 		}
-	case []interface{}:
+	case []any:
 		// How the reference client decodes an array-typed value, which
 		// is the form the write worker below sends.
 		if len(n) == 1 {
@@ -218,9 +218,7 @@ func TestDockerServer_SteadyState(t *testing.T) {
 	// the handle stays valid for the whole window and records the values
 	// and timestamps observed, so the test can prove afterwards that the
 	// data actually moved rather than repeating one frozen sample.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		c := soakClient(client)
 		for time.Now().Before(deadline) {
 			crh, _, err := gopcxmlda.GenerateClientHandles(0)
@@ -273,15 +271,13 @@ func TestDockerServer_SteadyState(t *testing.T) {
 				seenMu.Unlock()
 			}
 		}
-	}()
+	})
 
 	// Worker 2 — continuous write/read-back round trips. Nothing else
 	// writes Motor1/Speed (the simulator only nudges the Temperature and
 	// Level items), so the value read back must match the value just
 	// written, every time, for the whole window.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		c := soakClient(client)
 		const item = "Plant/BuildingA/Line1/Motor1/Speed"
 		want := int32(0)
@@ -326,13 +322,11 @@ func TestDockerServer_SteadyState(t *testing.T) {
 			writes.Add(1)
 			time.Sleep(50 * time.Millisecond)
 		}
-	}()
+	})
 
 	// Worker 3 — periodic Browse/GetStatus, checking the server keeps
 	// reporting a stable address space and a running state throughout.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		c := soakClient(client)
 		for time.Now().Before(deadline) {
 			scrh, _, err := gopcxmlda.GenerateClientHandles(0)
@@ -366,7 +360,7 @@ func TestDockerServer_SteadyState(t *testing.T) {
 			browses.Add(1)
 			time.Sleep(500 * time.Millisecond)
 		}
-	}()
+	})
 
 	wg.Wait()
 	failures.report(t, "steady-state load")
@@ -441,6 +435,11 @@ func TestDockerServer_SteadyState(t *testing.T) {
 		crh, _ := newHandles(t, 0)
 		resp, err := client.SubscriptionPolledRefresh(ctx, abandonedHandle, 0, "", &crh,
 			clientOptions(), gopcxmlda.TServerTime{UseClientTime: true})
+		// A SOAP fault reaches the caller as a non-nil error with the
+		// decoded reply still filled in, so resp.Fault is what
+		// distinguishes "the server reaped it" from any other failure.
+		// A transport or decode error yields the zero reply instead,
+		// whose empty FaultCode falls through to the fatal case below.
 		switch {
 		case err != nil && strings.Contains(resp.Fault.FaultCode, "E_NOSUBSCRIPTION"):
 			reaped = true
@@ -482,7 +481,7 @@ func TestDockerServer_SteadyState(t *testing.T) {
 		t.Fatalf("reading container logs: %v", err)
 	}
 	var bad []string
-	for _, line := range strings.Split(string(logs), "\n") {
+	for line := range strings.SplitSeq(string(logs), "\n") {
 		if strings.Contains(line, "level=ERROR") || strings.Contains(line, "panic") {
 			bad = append(bad, strings.TrimSpace(line))
 		}

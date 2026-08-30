@@ -1,0 +1,519 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OPC XML-DA 1.0 schema, transcribed verbatim from the <types><s:schema>
+  block of the WSDL in docs/OPCDataAccessXMLSpecification.pdf (pp. 83-94).
+
+  It is here so this server's own output can be validated against the
+  specification by a real schema processor (xmllint), not only round-tripped
+  through Go's own lenient decoder — see TestResponsesAreWellFormed and the
+  "schema-validate" CI job. Nothing in the library reads this file at
+  runtime.
+
+  Three deliberate, documented departures from a byte-for-byte
+  transcription, all required to make the schema usable standalone:
+
+  1. The WSDL declares these types inside a <wsdl:types> element with the
+     schema's prefixes bound there. Here the same declarations are bound on
+     <xs:schema> itself.
+  2. ItemValue's <Value> and ArrayOfAnyType's <anyType> elements are
+     declared without a type in the WSDL, which in XSD means anyType — kept
+     as-is, so a Value's xsi:type is not checked by the schema (the Go test
+     checkValueTypes checks it instead).
+  3. SubscriptionPolledRefresh's WaitTime attribute: see the comment at
+     its declaration. The published WSDL is not schema-valid there.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:s0="http://opcfoundation.org/webservices/XMLDA/1.0/"
+           targetNamespace="http://opcfoundation.org/webservices/XMLDA/1.0/"
+           elementFormDefault="qualified">
+
+  <!-- ===================== GetStatus ===================== -->
+
+  <xs:element name="GetStatus">
+    <xs:complexType>
+      <xs:attribute name="LocaleID" type="xs:string"/>
+      <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="GetStatusResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="GetStatusResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="Status" type="s0:ServerStatus"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="ReplyBase">
+    <xs:attribute name="RcvTime" type="xs:dateTime" use="required"/>
+    <xs:attribute name="ReplyTime" type="xs:dateTime" use="required"/>
+    <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+    <xs:attribute name="RevisedLocaleID" type="xs:string"/>
+    <xs:attribute name="ServerState" type="s0:serverState" use="required"/>
+  </xs:complexType>
+
+  <xs:simpleType name="serverState">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="running"/>
+      <xs:enumeration value="failed"/>
+      <xs:enumeration value="noConfig"/>
+      <xs:enumeration value="suspended"/>
+      <xs:enumeration value="test"/>
+      <xs:enumeration value="commFault"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="ServerStatus">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="1" name="StatusInfo" type="xs:string"/>
+      <xs:element minOccurs="0" maxOccurs="1" name="VendorInfo" type="xs:string"/>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="SupportedLocaleIDs" type="xs:string"/>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="SupportedInterfaceVersions" type="s0:interfaceVersion"/>
+    </xs:sequence>
+    <xs:attribute name="StartTime" type="xs:dateTime" use="required"/>
+    <xs:attribute name="ProductVersion" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:simpleType name="interfaceVersion">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="XML_DA_Version_1_0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- ===================== Read ===================== -->
+
+  <xs:element name="Read">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="Options" type="s0:RequestOptions"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="ItemList" type="s0:ReadRequestItemList"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="RequestOptions">
+    <xs:attribute default="true" name="ReturnErrorText" type="xs:boolean"/>
+    <xs:attribute default="false" name="ReturnDiagnosticInfo" type="xs:boolean"/>
+    <xs:attribute default="false" name="ReturnItemTime" type="xs:boolean"/>
+    <xs:attribute default="false" name="ReturnItemPath" type="xs:boolean"/>
+    <xs:attribute default="false" name="ReturnItemName" type="xs:boolean"/>
+    <xs:attribute name="RequestDeadline" type="xs:dateTime"/>
+    <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+    <xs:attribute name="LocaleID" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:complexType name="ReadRequestItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:ReadRequestItem"/>
+    </xs:sequence>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ReqType" type="xs:QName"/>
+    <xs:attribute name="MaxAge" type="xs:int"/>
+  </xs:complexType>
+
+  <xs:complexType name="ReadRequestItem">
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ReqType" type="xs:QName"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="ClientItemHandle" type="xs:string"/>
+    <xs:attribute name="MaxAge" type="xs:int"/>
+  </xs:complexType>
+
+  <xs:element name="ReadResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="ReadResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="RItemList" type="s0:ReplyItemList"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="ReplyItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:ItemValue"/>
+    </xs:sequence>
+    <xs:attribute name="Reserved" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:complexType name="ItemValue">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="1" name="DiagnosticInfo" type="xs:string"/>
+      <xs:element minOccurs="0" maxOccurs="1" name="Value"/>
+      <xs:element minOccurs="0" maxOccurs="1" name="Quality" type="s0:OPCQuality"/>
+    </xs:sequence>
+    <xs:attribute name="ValueTypeQualifier" type="xs:QName"/>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="ClientItemHandle" type="xs:string"/>
+    <xs:attribute name="Timestamp" type="xs:dateTime"/>
+    <xs:attribute name="ResultID" type="xs:QName"/>
+  </xs:complexType>
+
+  <xs:complexType name="OPCQuality">
+    <xs:attribute default="good" name="QualityField" type="s0:qualityBits"/>
+    <xs:attribute default="none" name="LimitField" type="s0:limitBits"/>
+    <xs:attribute default="0" name="VendorField" type="xs:unsignedByte"/>
+  </xs:complexType>
+
+  <xs:simpleType name="qualityBits">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="bad"/>
+      <xs:enumeration value="badConfigurationError"/>
+      <xs:enumeration value="badNotConnected"/>
+      <xs:enumeration value="badDeviceFailure"/>
+      <xs:enumeration value="badSensorFailure"/>
+      <xs:enumeration value="badLastKnownValue"/>
+      <xs:enumeration value="badCommFailure"/>
+      <xs:enumeration value="badOutOfService"/>
+      <xs:enumeration value="badWaitingForInitialData"/>
+      <xs:enumeration value="uncertain"/>
+      <xs:enumeration value="uncertainLastUsableValue"/>
+      <xs:enumeration value="uncertainSensorNotAccurate"/>
+      <xs:enumeration value="uncertainEUExceeded"/>
+      <xs:enumeration value="uncertainSubNormal"/>
+      <xs:enumeration value="good"/>
+      <xs:enumeration value="goodLocalOverride"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="limitBits">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="none"/>
+      <xs:enumeration value="low"/>
+      <xs:enumeration value="high"/>
+      <xs:enumeration value="constant"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="OPCError">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="1" name="Text" type="xs:string"/>
+    </xs:sequence>
+    <xs:attribute name="ID" type="xs:QName" use="required"/>
+  </xs:complexType>
+
+  <!-- ===================== Array value types ===================== -->
+
+  <xs:complexType name="ArrayOfFloat">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="float" type="xs:float"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfInt">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="int" type="xs:int"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfUnsignedInt">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="unsignedInt" type="xs:unsignedInt"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfLong">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="long" type="xs:long"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfUnsignedLong">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="unsignedLong" type="xs:unsignedLong"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfDouble">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="double" type="xs:double"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfUnsignedShort">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="unsignedShort" type="xs:unsignedShort"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfBoolean">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="boolean" type="xs:boolean"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfString">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="string" nillable="true" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfDateTime">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="dateTime" type="xs:dateTime"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfAnyType">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="anyType" nillable="true"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfDecimal">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="decimal" type="xs:decimal"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfByte">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="byte" type="xs:byte"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="ArrayOfShort">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="short" type="xs:short"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- ===================== Write ===================== -->
+
+  <xs:element name="Write">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="Options" type="s0:RequestOptions"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="ItemList" type="s0:WriteRequestItemList"/>
+      </xs:sequence>
+      <xs:attribute name="ReturnValuesOnReply" type="xs:boolean" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="WriteRequestItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:ItemValue"/>
+    </xs:sequence>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:element name="WriteResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="WriteResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="RItemList" type="s0:ReplyItemList"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ===================== Subscribe ===================== -->
+
+  <xs:element name="Subscribe">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="Options" type="s0:RequestOptions"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="ItemList" type="s0:SubscribeRequestItemList"/>
+      </xs:sequence>
+      <xs:attribute name="ReturnValuesOnReply" type="xs:boolean" use="required"/>
+      <xs:attribute default="0" name="SubscriptionPingRate" type="xs:int"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="SubscribeRequestItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:SubscribeRequestItem"/>
+    </xs:sequence>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ReqType" type="xs:QName"/>
+    <xs:attribute name="Deadband" type="xs:float"/>
+    <xs:attribute name="RequestedSamplingRate" type="xs:int"/>
+    <xs:attribute name="EnableBuffering" type="xs:boolean"/>
+  </xs:complexType>
+
+  <xs:complexType name="SubscribeRequestItem">
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ReqType" type="xs:QName"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="ClientItemHandle" type="xs:string"/>
+    <xs:attribute name="Deadband" type="xs:float"/>
+    <xs:attribute name="RequestedSamplingRate" type="xs:int"/>
+    <xs:attribute name="EnableBuffering" type="xs:boolean"/>
+  </xs:complexType>
+
+  <xs:complexType name="SubscribeReplyItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:SubscribeItemValue"/>
+    </xs:sequence>
+    <xs:attribute name="RevisedSamplingRate" type="xs:int"/>
+  </xs:complexType>
+
+  <xs:complexType name="SubscribeItemValue">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="1" name="ItemValue" type="s0:ItemValue"/>
+    </xs:sequence>
+    <xs:attribute name="RevisedSamplingRate" type="xs:int"/>
+  </xs:complexType>
+
+  <xs:element name="SubscribeResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="SubscribeResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="1" name="RItemList" type="s0:SubscribeReplyItemList"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+      <xs:attribute name="ServerSubHandle" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ============== SubscriptionPolledRefresh ============== -->
+
+  <xs:element name="SubscriptionPolledRefresh">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="Options" type="s0:RequestOptions"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="ServerSubHandles" type="xs:string"/>
+      </xs:sequence>
+      <xs:attribute name="HoldTime" type="xs:dateTime" use="optional"/>
+      <!-- The WSDL writes this as: default="0" ... use="required".
+           That combination is illegal in XSD ("The value of the attribute
+           'use' must be 'optional' if the attribute 'default' is
+           present"), so the published schema does not compile as written.
+           Since the specification also gives WaitTime a default, the
+           default is what it clearly means, and use is relaxed to
+           optional here — the third and last departure from a verbatim
+           transcription, all of them listed at the top of this file. -->
+      <xs:attribute default="0" name="WaitTime" type="xs:int" use="optional"/>
+      <xs:attribute default="false" name="ReturnAllItems" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="SubscribePolledRefreshReplyItemList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Items" type="s0:ItemValue"/>
+    </xs:sequence>
+    <xs:attribute name="SubscriptionHandle" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:element name="SubscriptionPolledRefreshResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="SubscriptionPolledRefreshResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="InvalidServerSubHandles" type="xs:string"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="RItemList" type="s0:SubscribePolledRefreshReplyItemList"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+      <xs:attribute default="false" name="DataBufferOverflow" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ===================== SubscriptionCancel ===================== -->
+
+  <xs:element name="SubscriptionCancel">
+    <xs:complexType>
+      <xs:attribute name="ServerSubHandle" type="xs:string"/>
+      <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="SubscriptionCancelResponse">
+    <xs:complexType>
+      <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ===================== Browse ===================== -->
+
+  <xs:element name="Browse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="PropertyNames" type="xs:QName"/>
+      </xs:sequence>
+      <xs:attribute name="LocaleID" type="xs:string"/>
+      <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+      <xs:attribute name="ItemPath" type="xs:string"/>
+      <xs:attribute name="ItemName" type="xs:string"/>
+      <xs:attribute name="ContinuationPoint" type="xs:string"/>
+      <xs:attribute default="0" name="MaxElementsReturned" type="xs:int"/>
+      <xs:attribute default="all" name="BrowseFilter" type="s0:browseFilter"/>
+      <xs:attribute name="ElementNameFilter" type="xs:string"/>
+      <xs:attribute name="VendorFilter" type="xs:string"/>
+      <xs:attribute default="false" name="ReturnAllProperties" type="xs:boolean"/>
+      <xs:attribute default="false" name="ReturnPropertyValues" type="xs:boolean"/>
+      <xs:attribute default="false" name="ReturnErrorText" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:simpleType name="browseFilter">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="all"/>
+      <xs:enumeration value="branch"/>
+      <xs:enumeration value="item"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="BrowseElement">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Properties" type="s0:ItemProperty"/>
+    </xs:sequence>
+    <xs:attribute name="Name" type="xs:string"/>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="IsItem" type="xs:boolean" use="required"/>
+    <xs:attribute name="HasChildren" type="xs:boolean" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="ItemProperty">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="1" name="Value"/>
+    </xs:sequence>
+    <xs:attribute name="Name" type="xs:QName" use="required"/>
+    <xs:attribute name="Description" type="xs:string"/>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="ResultID" type="xs:QName"/>
+  </xs:complexType>
+
+  <xs:element name="BrowseResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="BrowseResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Elements" type="s0:BrowseElement"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+      <xs:attribute name="ContinuationPoint" type="xs:string"/>
+      <xs:attribute default="false" name="MoreElements" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- ===================== GetProperties ===================== -->
+
+  <xs:element name="GetProperties">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="ItemIDs" type="s0:ItemIdentifier"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="PropertyNames" type="xs:QName"/>
+      </xs:sequence>
+      <xs:attribute name="LocaleID" type="xs:string"/>
+      <xs:attribute name="ClientRequestHandle" type="xs:string"/>
+      <xs:attribute name="ItemPath" type="xs:string"/>
+      <xs:attribute default="false" name="ReturnAllProperties" type="xs:boolean"/>
+      <xs:attribute default="false" name="ReturnPropertyValues" type="xs:boolean"/>
+      <xs:attribute default="false" name="ReturnErrorText" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:complexType name="ItemIdentifier">
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:complexType name="PropertyReplyList">
+    <xs:sequence>
+      <xs:element minOccurs="0" maxOccurs="unbounded" name="Properties" type="s0:ItemProperty"/>
+    </xs:sequence>
+    <xs:attribute name="ItemPath" type="xs:string"/>
+    <xs:attribute name="ItemName" type="xs:string"/>
+    <xs:attribute name="ResultID" type="xs:QName"/>
+  </xs:complexType>
+
+  <xs:element name="GetPropertiesResponse">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element minOccurs="0" maxOccurs="1" name="GetPropertiesResult" type="s0:ReplyBase"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="PropertyLists" type="s0:PropertyReplyList"/>
+        <xs:element minOccurs="0" maxOccurs="unbounded" name="Errors" type="s0:OPCError"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

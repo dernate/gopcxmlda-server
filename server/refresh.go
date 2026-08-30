@@ -49,7 +49,7 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	// Hold and Wait share one budget: capping each separately still let
 	// their sum reach twice the cap, which then raced the request's own
 	// context deadline.
-	waitTime := min(time.Duration(req.WaitTime)*time.Millisecond, h.cfg.MaxPolledRefreshWait)
+	waitTime := min(msToDuration(req.WaitTime), h.cfg.MaxPolledRefreshWait)
 	if req.HoldTime != nil {
 		remaining := h.cfg.MaxPolledRefreshWait - max(req.HoldTime.Sub(now), 0)
 		waitTime = min(waitTime, max(remaining, 0))
@@ -97,8 +97,9 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 			// Good-quality, typeless value that then failed to encode —
 			// turning one failing item into a whole-operation E_FAIL for
 			// the entire subscription.
-			items[i] = buildItemValue(it.Ref, it.ClientItemHandle, it.Sample, it.HaveSample, it.ResultID, "", req.Options)
-			codes = append(codes, it.ResultID)
+			sample, haveSample, resultID := applyReqType(it.Sample, it.HaveSample, it.ResultID, it.ReqType)
+			items[i] = buildItemValue(it.Ref, it.ClientItemHandle, sample, haveSample, resultID, "", req.Options)
+			codes = append(codes, resultID)
 		}
 		rItemLists = append(rItemLists, xmlda.SubscriptionPolledRefreshReplyItemList{
 			SubscriptionHandle: string(subRes.Handle),
@@ -111,7 +112,7 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 		Result:                  h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		InvalidServerSubHandles: invalidHandles,
 		RItemList:               rItemLists,
-		Errors:                  xmlda.DedupeErrors(codes, errorTextFunc(req.Options)),
+		Errors:                  xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
 	writeResponse(w, resp)
 }

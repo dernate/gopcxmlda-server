@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/soap"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
@@ -25,11 +26,15 @@ func (h *Handler) handleGetStatus(ctx context.Context, w http.ResponseWriter, do
 	// locale-less fetch and then told, via RevisedLocaleID, that its
 	// locale was honored. Only re-fetch when a locale was requested and
 	// the backend claims to support it; otherwise the first fetch already
-	// holds the right answer.
+	// holds the right answer — and for this operation that first fetch is
+	// always a live one, since ServeHTTP bypasses Config.StatusCacheTTL
+	// for GetStatus specifically (see statusFor).
 	status := oc.status
 	revised := reviseLocale(req.LocaleID, status.SupportedLocaleIDs)
 	if revised != "" && req.LocaleID != "" {
-		localized, err := h.backend.Status.GetStatus(ctx, revised)
+		localized, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
+			return h.backend.Status.GetStatus(ctx, revised)
+		})
 		if err != nil {
 			h.metrics.IncRequestError("GetStatus", "backend_error")
 			writeFault(w, backendErrorFault(err))

@@ -13,9 +13,12 @@ import (
 // startRefreshing begins keeping s's items up to date: push-mode if the
 // backend's Reader also implements backend.ChangeNotifier, poll-mode
 // otherwise (see ADR-008).
-func (m *Manager) startRefreshing(s *subState) {
+// ctx is the caller's request context (Create's), used only to bound how
+// long the push-mode handshake waits on the backend — never as the
+// subscription's own lifetime, which is s.ctx.
+func (m *Manager) startRefreshing(ctx context.Context, s *subState) {
 	if cn, ok := m.backend.Reader.(backend.ChangeNotifier); ok {
-		m.startPush(s, cn)
+		m.startPush(ctx, s, cn)
 		return
 	}
 	m.schedulePoll(s, s.minSamplingRate())
@@ -50,23 +53,34 @@ func (s *subState) minSamplingRate() time.Duration {
 // until it eventually fires, which for a slow sampling rate can be a long
 // time after the subscription is already gone.
 func (m *Manager) schedulePoll(s *subState, in time.Duration) {
-	t := m.clock.AfterFunc(in, func() {
-		// Add/Done bracket exactly this one callback invocation — the
-		// genuine goroutine that exists "only while a poll callback is
-		// actually executing" (docs/architecture/subscription-model.md).
-		// Add happens unconditionally as the very first statement, before
-		// the ctx check below, so a concurrent Manager.Wait cannot return
-		// while this callback's backend call is still in flight. It is
-		// safe for an armed-but-never-fired timer: a callback that never
-		// executes never reaches this line.
-		m.wg.Add(1)
-		defer m.wg.Done()
+	// armTimer, not clock.AfterFunc directly: the WaitGroup counter is
+	// taken when the timer is armed and released when its callback
+	// finishes (or when Stop prevents it), so Manager.Wait cannot return
+	// while a poll is pending or in flight. See armTimer's doc comment
+	// for why counting from inside the callback was not enough.
+	due := m.clock.Now().Add(in)
+	t := m.armTimer(in, func() {
 		if s.ctx.Err() != nil {
 			return
 		}
 		m.pollOnceBounded(s)
 		if s.ctx.Err() == nil {
-			m.schedulePoll(s, s.minSamplingRate())
+			// The next tick is placed relative to when this one was DUE,
+			// not to when its work finished. Rescheduling "one full
+			// interval from now" made the effective period rate + backend
+			// duration + semaphore wait, so a slow backend silently
+			// stretched every item's real sampling interval past the
+			// RevisedSamplingRate the client was promised. A backend
+			// slower than the interval itself would drift without bound.
+			//
+			// max(..., 0) collapses a missed deadline into "fire again
+			// immediately" rather than a negative delay: falling behind
+			// must not turn into a busy loop that also never catches up.
+			next := s.minSamplingRate()
+			if elapsed := m.clock.Now().Sub(due); elapsed > 0 {
+				next = max(next-elapsed, 0)
+			}
+			m.schedulePoll(s, next)
 		}
 	})
 	if !s.setTimer(t) {
@@ -223,7 +237,20 @@ func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorC
 		// if the value happens to be identical to the last good one.
 		changed = !it.lastResultID.IsZero() || !it.haveLast ||
 			sampleChanged(it.last, sample, it.deadband)
-		it.last = sample
+		if changed {
+			// it.last is the last value REPORTED to the client, not the
+			// last value read — that is what a deadband is defined
+			// against. Advancing it on a suppressed reading turned the
+			// deadband into a rate-of-change filter: with a 10% deadband
+			// and 5%-per-poll drift, every single step compares against
+			// the previous reading, stays under the band, and the value
+			// walks from 100 to 200 without the client ever being told.
+			//
+			// With no deadband this is behaviorally identical to the
+			// unconditional assignment, since "unchanged" then means the
+			// values compare equal anyway.
+			it.last = sample
+		}
 		it.haveLast = true
 		u = update{sample: sample, haveSample: true}
 	}

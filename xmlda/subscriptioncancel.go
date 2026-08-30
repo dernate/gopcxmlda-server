@@ -18,6 +18,6 @@ type SubscriptionCancelRequest struct {
 // open-questions.md OQ-9) — this response shape has no field to report
 // otherwise.
 type SubscriptionCancelResponse struct {
-	XMLName             xml.Name `xml:"SubscriptionCancelResponse"`
+	XMLName             xml.Name `xml:"http://opcfoundation.org/webservices/XMLDA/1.0/ SubscriptionCancelResponse"`
 	ClientRequestHandle string   `xml:"ClientRequestHandle,attr,omitempty"`
 }
