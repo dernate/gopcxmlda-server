@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/clock"
 	"github.com/dernate/gopcxmlda-server/soap"
+	"github.com/dernate/gopcxmlda-server/telemetry"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
@@ -286,4 +288,156 @@ func decodeResponse[T any](t *testing.T, resp *http.Response) *T {
 		t.Fatalf("expected non-nil response content")
 	}
 	return env.Body.Content
+}
+
+// readBody reads resp's body as a string. Used by tests that assert on the
+// response BYTES rather than the decoded form — the shape of defect that
+// Go's own lenient decoder hides, since it fills in the same zero value
+// whether an element was present or absent (see
+// TestRead_FailedItemOmitsQuality).
+func readBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return string(data)
+}
+
+// decodeResponseFrom is decodeResponse over bytes already read, for a test
+// that needs to assert on both the bytes and the decoded form.
+func decodeResponseFrom[T any](t *testing.T, raw string) *T {
+	t.Helper()
+	var env soap.Envelope[T]
+	if err := xmlda.Decode([]byte(raw), &env); err != nil {
+		t.Fatalf("decoding response: %v\nbody: %s", err, raw)
+	}
+	if env.Body.Fault != nil {
+		t.Fatalf("unexpected fault: %+v", env.Body.Fault)
+	}
+	if env.Body.Content == nil {
+		t.Fatal("expected non-nil response content")
+	}
+	return env.Body.Content
+}
+
+// runtimeNumGoroutine wraps runtime.NumGoroutine so goroutine-accounting
+// assertions read as intent rather than as a stray runtime import.
+func runtimeNumGoroutine() int { return runtime.NumGoroutine() }
+
+func newRWBackend(t *testing.T) (backend.Backend, *testStatus, *testReader) {
+	t.Helper()
+	st := newTestStatus()
+	r := newTestReader()
+	return backend.Backend{Status: st, Reader: r, Writer: &testWriter{reader: r}}, st, r
+}
+
+// itemByHandle finds the reply item carrying clientItemHandle.
+func itemByHandle(t *testing.T, items []xmlda.ItemValue, handle string) xmlda.ItemValue {
+	t.Helper()
+	for _, iv := range items {
+		if iv.ClientItemHandle == handle {
+			return iv
+		}
+	}
+	t.Fatalf("no reply item with ClientItemHandle %q in %d items", handle, len(items))
+	return xmlda.ItemValue{}
+}
+
+// --- shared helpers ---
+
+// steppableClock is a clock.Clock whose Now a test advances by hand while
+// timers still run on the real clock — the shape a test needs when it must
+// control an expiry check without also freezing the HTTP handler's own
+// waits.
+type steppableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppableClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func (c *steppableClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppableClock) After(d time.Duration) <-chan time.Time { return clock.Real{}.After(d) }
+
+func (c *steppableClock) NewTimer(d time.Duration) clock.Timer { return clock.Real{}.NewTimer(d) }
+
+func (c *steppableClock) AfterFunc(d time.Duration, f func()) clock.Timer {
+	return clock.Real{}.AfterFunc(d, f)
+}
+
+func (c *steppableClock) Sleep(d time.Duration) { clock.Real{}.Sleep(d) }
+
+// Regression tests for the server-layer defects found in the wire-format
+// review. Each one fails against the behavior that shipped before the
+// corresponding fix; the comment on each says what that behavior was.
+
+// --- H2: a property with no value must not destroy the response ---
+
+// valuelessProperties returns one item whose properties include one that
+// the backend could not read: a per-property ResultID with the Value left
+// at its zero. That is a legitimate backend outcome and the single most
+// likely one for E_INVALIDPID.
+type valuelessProperties struct{}
+
+func (valuelessProperties) GetProperties(_ context.Context, reqs []backend.PropertyRequest) ([]backend.Result[[]backend.Property], error) {
+	out := make([]backend.Result[[]backend.Property], len(reqs))
+	for i := range reqs {
+		out[i] = backend.Result[[]backend.Property]{Value: []backend.Property{
+			{ID: xmlda.PropDescription, Value: xmlda.NewString("readable")},
+			{ID: xmlda.PropHighEU, ResultID: xmlda.ErrInvalidPID}, // no Value
+		}}
+	}
+	return out, nil
+}
+
+// --- H4: success-with-caveat codes keep their value ---
+
+// successCodeReader reports S_CLAMP together with a perfectly usable
+// value, the combination §2.6 explicitly describes ("for non-critical
+// exceptions the returned value is useful").
+type successCodeReader struct{}
+
+func (successCodeReader) Read(_ context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
+	out := make([]backend.Result[backend.ItemSample], len(items))
+	for i := range items {
+		out[i] = backend.Result[backend.ItemSample]{
+			ResultID: xmlda.SuccessClamp,
+			Value: backend.ItemSample{
+				Value:   xmlda.NewInt32(1000),
+				Quality: xmlda.NewGoodQuality(),
+			},
+		}
+	}
+	return out, nil
+}
+
+// --- backend latency is actually observed ---
+
+// recordingMetrics captures ObserveBackendLatency calls.
+type recordingMetrics struct {
+	telemetry.Metrics
+	mu  sync.Mutex
+	ops []string
+}
+
+func (m *recordingMetrics) ObserveBackendLatency(op string, _ time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ops = append(m.ops, op)
+}
+
+func (m *recordingMetrics) seen() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ops...)
 }

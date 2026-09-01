@@ -1018,17 +1018,58 @@ func elementAt(a Array, i int) (any, error) {
 
 // --- scalar parsing/formatting ---
 
+// dateTimeLayouts are the accepted lexical forms of an xsd:dateTime.
+//
+// The list is wider than RFC 3339 on purpose. xsd:dateTime's timezone
+// offset is OPTIONAL (XSD Part 2 §3.2.7: a value with no offset denotes
+// an unspecified/local zone), and a date alone is accepted as an interop
+// tolerance for peers that shorten a midnight value. Go's own
+// time.Time.UnmarshalText — which encoding/xml calls for any time.Time
+// field — accepts only RFC 3339 and so rejects a conforming offsetless
+// value outright; that is why no dateTime anywhere in this package is
+// decoded through a plain time.Time field. See wireTime (replybase.go).
 var dateTimeLayouts = []string{
 	time.RFC3339Nano,
 	"2006-01-02T15:04:05.999999999",
+	"2006-01-02Z07:00",
 	"2006-01-02",
+}
+
+// endOfDayPattern matches xsd:dateTime's end-of-day time component, which
+// the grammar admits only with zero minutes and seconds.
+var endOfDayPattern = regexp.MustCompile(`T24:00:00(\.0+)?`)
+
+// normalizeEndOfDay rewrites the xsd:dateTime end-of-day form
+// "<date>T24:00:00" into the equivalent "<date+1>T00:00:00", reporting
+// whether it did. XSD Part 2 defines 24:00:00 as a synonym for midnight
+// of the following day; Go's time.Parse rejects hour 24 outright, so a
+// conforming peer using that form would otherwise fault the request.
+//
+// The rewrite only applies when the matched text is the whole time
+// component — what follows must be either nothing or a timezone
+// designator — so a value that merely contains those digits elsewhere is
+// left alone.
+func normalizeEndOfDay(s string) (string, bool) {
+	loc := endOfDayPattern.FindStringIndex(s)
+	if loc == nil {
+		return s, false
+	}
+	rest := s[loc[1]:]
+	if rest != "" && rest != "Z" && !strings.HasPrefix(rest, "+") && !strings.HasPrefix(rest, "-") {
+		return s, false
+	}
+	return s[:loc[0]] + "T00:00:00" + rest, true
 }
 
 func parseXSDDateTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
+	base, endOfDay := normalizeEndOfDay(s)
 	var lastErr error
 	for _, layout := range dateTimeLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
+		if t, err := time.Parse(layout, base); err == nil {
+			if endOfDay {
+				t = t.AddDate(0, 0, 1)
+			}
 			return t, nil
 		} else {
 			lastErr = err
@@ -1641,6 +1682,13 @@ const maxAnyTypeArrayDepth = 64
 // UnmarshalXML implements xml.Unmarshaler. It never fails on an
 // unrecognized xsi:type — see ADR-003 — and never panics on malformed
 // input; all failures are returned as errors.
+//
+// Whatever it returns, it leaves the decoder positioned immediately after
+// start's matching end tag. That invariant is what lets a caller treat a
+// rejected <Value> as one item's own condition (ItemValue.DecodeErr,
+// mapped to a per-item E_BADTYPE) and carry on decoding the items after
+// it, instead of the whole request having to be abandoned because the
+// token stream is no longer where the caller thinks it is.
 func (v *Value) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	return v.unmarshalXML(d, start, 0)
 }
@@ -1649,17 +1697,34 @@ func (v *Value) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 // counter threaded through ArrayOfAnyType recursion (see
 // maxAnyTypeArrayDepth) that xml.Unmarshaler's fixed method signature has
 // no room for.
+//
+// It enforces the always-consumed invariant documented on UnmarshalXML:
+// decodeElement reports whether it got as far as this element's end tag,
+// and anything that failed before that is finished off with d.Skip().
 func (v *Value) unmarshalXML(d *xml.Decoder, start xml.StartElement, depth int) error {
+	consumed, err := v.decodeElement(d, start, depth)
+	if err != nil && !consumed {
+		if skipErr := d.Skip(); skipErr != nil {
+			return errors.Join(err, skipErr)
+		}
+	}
+	return err
+}
+
+// decodeElement decodes start into v, reporting whether start's element
+// was fully consumed from d (which, on the error paths, is what tells
+// unmarshalXML whether it still has to skip the remainder).
+func (v *Value) decodeElement(d *xml.Decoder, start xml.StartElement, depth int) (consumed bool, err error) {
 	if depth > maxAnyTypeArrayDepth {
-		return fmt.Errorf("xmlda: ArrayOfAnyType nesting exceeds the maximum depth of %d", maxAnyTypeArrayDepth)
+		return false, fmt.Errorf("xmlda: ArrayOfAnyType nesting exceeds the maximum depth of %d", maxAnyTypeArrayDepth)
 	}
 	rawType, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "type"})
 	if !ok {
-		return fmt.Errorf("xmlda: <%s> is missing a required xsi:type attribute", start.Name.Local)
+		return false, fmt.Errorf("xmlda: <%s> is missing a required xsi:type attribute", start.Name.Local)
 	}
-	tn, err := resolveQName(d, rawType)
+	tn, err := resolveQNameIn(d, start.Attr, rawType)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	isNil := false
@@ -1669,7 +1734,7 @@ func (v *Value) unmarshalXML(d *xml.Decoder, start xml.StartElement, depth int) 
 	if isNil {
 		kind, typ := decodeNilKind(tn)
 		v.kind, v.typ, v.typeName, v.isNil = kind, typ, tn, true
-		return d.Skip()
+		return true, d.Skip()
 	}
 
 	if st, ok := scalarTypesByQName[tn]; ok {
@@ -1681,37 +1746,45 @@ func (v *Value) unmarshalXML(d *xml.Decoder, start xml.StartElement, depth int) 
 	return v.decodeUnknown(d, start, tn)
 }
 
-func (v *Value) decodeScalar(d *xml.Decoder, start xml.StartElement, st ScalarType, tn QName) error {
+// decodeScalar always reports consumed=true: d.DecodeElement into a
+// chardata-only holder reads through the element's end tag, and the only
+// way it can fail is a token-level error, which means the document is
+// malformed past this point anyway. Everything that can fail afterwards
+// (QName resolution, literal parsing) happens with the element already
+// behind us.
+func (v *Value) decodeScalar(d *xml.Decoder, start xml.StartElement, st ScalarType, tn QName) (bool, error) {
 	var holder struct {
 		Text string `xml:",chardata"`
 	}
 	if err := d.DecodeElement(&holder, &start); err != nil {
-		return fmt.Errorf("xmlda: decoding scalar %s: %w", tn, err)
+		return true, fmt.Errorf("xmlda: decoding scalar %s: %w", tn, err)
 	}
 	if st == TypeQName {
-		qn, err := resolveQName(d, strings.TrimSpace(holder.Text))
+		qn, err := resolveQNameIn(d, start.Attr, holder.Text)
 		if err != nil {
-			return err
+			return true, err
 		}
 		v.kind, v.typ, v.typeName, v.scalar = KindScalar, st, tn, qn
-		return nil
+		return true, nil
 	}
 	scalar, err := parseScalar(st, holder.Text)
 	if err != nil {
-		return err
+		return true, err
 	}
 	v.kind, v.typ, v.typeName, v.scalar = KindScalar, st, tn, scalar
-	return nil
+	return true, nil
 }
 
-func (v *Value) decodeArray(d *xml.Decoder, elemType ScalarType, tn QName, depth int) error {
+func (v *Value) decodeArray(d *xml.Decoder, elemType ScalarType, tn QName, depth int) (bool, error) {
 	if elemType == TypeAnyType {
 		elems, err := decodeAnyTypeArray(d, depth)
 		if err != nil {
-			return fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
+			// A failure inside the element list stopped short of the
+			// array's own end tag.
+			return false, fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
 		}
 		v.kind, v.typ, v.typeName, v.array = KindArray, elemType, tn, Array{elemType: elemType, typeName: tn, data: elems}
-		return nil
+		return true, nil
 	}
 
 	wantLocal := string(elemType)
@@ -1819,13 +1892,13 @@ func (v *Value) decodeArray(d *xml.Decoder, elemType ScalarType, tn QName, depth
 			return r.(time.Time), nil
 		})
 	default:
-		return fmt.Errorf("xmlda: array %s: unsupported element type %q", tn, elemType)
+		return false, fmt.Errorf("xmlda: array %s: unsupported element type %q", tn, elemType)
 	}
 	if err != nil {
-		return fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
+		return false, fmt.Errorf("xmlda: decoding array %s: %w", tn, err)
 	}
 	v.kind, v.typ, v.typeName, v.array = KindArray, elemType, tn, Array{elemType: elemType, typeName: tn, data: data}
-	return nil
+	return true, nil
 }
 
 // decodeScalarArray reads repeated <wantLocal>text</wantLocal> child
@@ -1884,13 +1957,15 @@ func decodeAnyTypeArray(d *xml.Decoder, depth int) ([]Value, error) {
 	}
 }
 
-func (v *Value) decodeUnknown(d *xml.Decoder, start xml.StartElement, tn QName) error {
+// decodeUnknown always reports consumed=true, for the same reason
+// decodeScalar does: an innerxml decode reads through the end tag.
+func (v *Value) decodeUnknown(d *xml.Decoder, start xml.StartElement, tn QName) (bool, error) {
 	var holder struct {
 		Inner []byte `xml:",innerxml"`
 	}
 	if err := d.DecodeElement(&holder, &start); err != nil {
-		return fmt.Errorf("xmlda: decoding unrecognized-type value %s: %w", tn, err)
+		return true, fmt.Errorf("xmlda: decoding unrecognized-type value %s: %w", tn, err)
 	}
 	v.kind, v.typeName, v.raw = KindUnknown, tn, RawValue{TypeName: tn, InnerXML: holder.Inner}
-	return nil
+	return true, nil
 }

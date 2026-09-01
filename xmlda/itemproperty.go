@@ -126,7 +126,7 @@ func (p *ItemProperty) UnmarshalXML(d *xml.Decoder, start xml.StartElement) erro
 		return fmt.Errorf("xmlda: decoding <%s Name=%q>: %w", start.Name.Local, nameRaw, err)
 	}
 
-	name, err := resolveQName(d, nameRaw)
+	name, err := resolveQNameIn(d, start.Attr, nameRaw)
 	if err != nil {
 		return err
 	}
@@ -137,7 +137,7 @@ func (p *ItemProperty) UnmarshalXML(d *xml.Decoder, start xml.StartElement) erro
 	p.Value = shadow.Value
 
 	if hasResult {
-		rid, err := resolveQName(d, resultRaw)
+		rid, err := resolveQNameIn(d, start.Attr, resultRaw)
 		if err != nil {
 			return err
 		}

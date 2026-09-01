@@ -144,14 +144,25 @@ type Writer interface {
 	Write(ctx context.Context, items []WriteRequestItem) ([]Result[WriteOutcome], error)
 }
 
-// BrowseRequest is one Browse call (§3.8.1). ContinuationPoint here is
-// the backend's own private, opaque pagination cursor — the framework
-// wraps it with a hash of the request's filters before exposing it on
-// the wire, so backends never need to implement continuation-point
-// validation themselves (REQ-BROWSE-002).
+// BrowseRequest is one Browse call (§3.8.1).
 type BrowseRequest struct {
 	// Ref with a blank ItemName means "browse the address space root".
-	Ref                  ItemRef
+	Ref ItemRef
+	// ContinuationPoint is the backend's own private, opaque pagination
+	// cursor, exactly as the backend last returned it. The framework wraps
+	// it for the wire behind a keyed MAC that also binds the request's
+	// filter set, so a cursor arriving here is one THIS server process
+	// issued, for THIS filter set, within its configured lifetime
+	// (REQ-BROWSE-002).
+	//
+	// That is an authenticity guarantee, not a validity one, and the
+	// distinction matters: a backend must still treat this as untrusted
+	// input. A token the server issued can be replayed within its
+	// lifetime, and the address space it pointed into may have changed
+	// underneath it — so a cursor used as an index, an offset, a key or a
+	// path must be range-checked and existence-checked like any other
+	// client-supplied value. Return an error (or an empty page) for a
+	// cursor that no longer makes sense; never dereference it blindly.
 	ContinuationPoint    string
 	MaxElementsReturned  int
 	Filter               xmlda.BrowseFilter
@@ -249,6 +260,48 @@ type ChangeEvent struct {
 	Ref    ItemRef
 	Sample ItemSample
 	Err    error
+}
+
+// RateRequest is one item's requested sampling rate, for
+// SamplingRateReviser.ReviseSamplingRates.
+type RateRequest struct {
+	Ref ItemRef
+	// RequestedSamplingRate is the rate the server would otherwise promise
+	// the client: the client's own RequestedSamplingRate, or the server's
+	// configured default when the client asked for "fastest practical"
+	// (0). Never zero.
+	RequestedSamplingRate time.Duration
+}
+
+// SamplingRateReviser is an OPTIONAL enhancement of Reader, detected via a
+// type assertion (reader.(SamplingRateReviser)) — the same idiom as
+// ChangeNotifier, and for the same reason: it is an enhanced-Reader
+// capability, not an independent operation.
+//
+// Implement it when the data source cannot honor arbitrary sampling
+// rates. Without it, Subscribe's RevisedSamplingRate is always exactly
+// what the client asked for, which for a device with a fixed scan cycle
+// is a promise the server cannot keep: a client requesting 50 ms against
+// a 1-second PLC cycle was told 50 ms and then served at 1 second, with
+// no way to find out. RevisedSamplingRate and S_UNSUPPORTEDRATE exist in
+// the specification precisely for that conversation (§3.5.2), and a
+// backend is the only party that knows the answer.
+type SamplingRateReviser interface {
+	// ReviseSamplingRates returns one rate per item in reqs, in the same
+	// order (len(result) == len(reqs) always): the rate this backend will
+	// actually achieve for that item.
+	//
+	// A returned rate that differs from the requested one is reported to
+	// the client as that item's RevisedSamplingRate together with
+	// S_UNSUPPORTEDRATE — a success code, so the item is still subscribed
+	// and still carries values. A returned zero (or negative) means "no
+	// opinion": the requested rate stands.
+	//
+	// A non-nil error abandons revision for the whole request — every item
+	// keeps its requested rate — rather than failing the Subscribe: an
+	// unavailable rate negotiation is a worse reason to refuse a
+	// subscription than to serve it at the rate the client named.
+	ReviseSamplingRates(ctx context.Context, reqs []RateRequest) ([]time.Duration, error)
 }
 
 // ChangeNotifier is an OPTIONAL enhancement of Reader, detected via a

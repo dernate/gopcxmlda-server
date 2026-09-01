@@ -60,6 +60,68 @@ type Config struct {
 	// count neither limit alone suggests, and every item holds its own
 	// last sample plus up to MaxBufferedSamplesPerItem buffered ones.
 	MaxTotalSubscribedItems int
+	// MaxTotalBufferedSamples caps the number of buffered (undelivered)
+	// samples held across every subscribed item at once; <= 0 means
+	// unlimited. It exists for the same reason MaxTotalSubscribedItems
+	// does, one axis further out: MaxBufferedSamplesPerItem bounds one
+	// item, and the product of the two bounds nothing anybody configured.
+	// On exhaustion a buffering item keeps only its Latest Changed Value
+	// (always retained, REQ-SUBSCRIPTION-007) and reports the loss through
+	// DataBufferOverflow.
+	MaxTotalBufferedSamples int
+}
+
+// sampleBudget is the server-wide accounting for buffered samples
+// (Config.MaxTotalBufferedSamples).
+//
+// It counts entries held in the buffers of items that have
+// EnableBuffering set — and only those. A non-buffering item's single
+// latest-value slot is deliberately outside the budget: it is bounded by
+// the item count, which MaxTotalSubscribedItems already governs, and
+// making it compete for this budget would let buffered history starve the
+// plain change delivery every subscription depends on.
+type sampleBudget struct {
+	max int64 // <= 0: unlimited
+	n   atomic.Int64
+}
+
+// acquire takes one slot, reporting false if the budget is exhausted.
+func (b *sampleBudget) acquire() bool {
+	if b == nil || b.max <= 0 {
+		return true
+	}
+	if b.n.Add(1) > b.max {
+		b.n.Add(-1)
+		return false
+	}
+	return true
+}
+
+// add takes n slots unconditionally, past the budget if necessary. Used
+// only for the one entry per item that is never given up: an item must be
+// able to report its Latest Changed Value even under a full budget, and
+// that floor is bounded by the item count rather than by this budget.
+func (b *sampleBudget) add(n int64) {
+	if b == nil || b.max <= 0 || n == 0 {
+		return
+	}
+	b.n.Add(n)
+}
+
+// release returns n slots.
+func (b *sampleBudget) release(n int64) {
+	if b == nil || b.max <= 0 || n <= 0 {
+		return
+	}
+	b.n.Add(-n)
+}
+
+// count reports the slots currently held. Test/diagnostic use only.
+func (b *sampleBudget) count() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.n.Load()
 }
 
 func (c Config) withDefaults() Config {
@@ -106,6 +168,10 @@ type Manager struct {
 
 	pollSem chan struct{}
 
+	// budget bounds buffered samples across every subscription
+	// (Config.MaxTotalBufferedSamples).
+	budget *sampleBudget
+
 	// reapTimer is the pending abandonment-reaper timer, guarded by mu and
 	// stopped by BeginShutdown (see reaper.go).
 	reapTimer clock.Timer
@@ -138,6 +204,7 @@ func NewManager(be backend.Backend, clk clock.Clock, log telemetry.Logger, metri
 		rootCtx:    ctx,
 		rootCancel: cancel,
 		pollSem:    make(chan struct{}, cfg.MaxConcurrentPolls),
+		budget:     &sampleBudget{max: int64(cfg.MaxTotalBufferedSamples)},
 	}
 	m.startReaper()
 	return m
@@ -366,15 +433,38 @@ func (m *Manager) totalItemsLocked() int {
 // Self-rescheduling chains (schedulePoll, scheduleReap) arm the next
 // timer from inside the current callback, before its deferred release
 // runs, so the counter never dips to zero between links.
-func (m *Manager) armTimer(d time.Duration, f func()) clock.Timer {
+//
+// The Add itself happens under m.mu, together with a shutdown check, and
+// that pairing is what makes the whole scheme safe rather than merely
+// well-intentioned. sync.WaitGroup forbids an Add that takes the counter
+// off zero from racing a Wait, and Create used to be able to do exactly
+// that: it releases m.mu after inserting the subscription and only then
+// calls startRefreshing, so a BeginShutdown+Wait that won the mutex in
+// between could observe a zero counter, return — and race this Add. The
+// race detector reported it, and sync.WaitGroup itself can panic on it
+// ("Add called concurrently with Wait"). BeginShutdown calls rootCancel
+// while holding this same mutex, so once shutdown has begun no further
+// Add can pass the check below, and Wait has nothing left to race.
+//
+// The returned Timer is nil, and ok false, when shutdown has already
+// begun: there is no point arming a timer whose callback would only
+// observe a cancelled context and return.
+func (m *Manager) armTimer(d time.Duration, f func()) (clock.Timer, bool) {
+	m.mu.Lock()
+	if m.rootCtx.Err() != nil {
+		m.mu.Unlock()
+		return nil, false
+	}
 	m.wg.Add(1)
+	m.mu.Unlock()
+
 	var once sync.Once
 	release := func() { once.Do(m.wg.Done) }
 	t := m.clock.AfterFunc(d, func() {
 		defer release()
 		f()
 	})
-	return &trackedTimer{inner: t, release: release}
+	return &trackedTimer{inner: t, release: release}, true
 }
 
 // trackedTimer is armTimer's return value: a clock.Timer whose Stop also
@@ -441,5 +531,25 @@ func (m *Manager) terminate(handle Handle) bool {
 	}
 	s.cancel()
 	s.stopPolling()
+	s.releaseBuffers(m.budget)
 	return true
+}
+
+// releaseBuffers returns every budgeted buffered sample this subscription
+// still holds. Called on every path that removes a subscription — without
+// it the server-wide budget leaks by the undelivered backlog of each
+// cancelled or reaped subscription, and eventually refuses buffering to
+// live ones on behalf of subscriptions that no longer exist.
+func (s *subState) releaseBuffers(b *sampleBudget) {
+	s.mu.Lock()
+	items := append([]*itemState(nil), s.items...)
+	s.mu.Unlock()
+	for _, it := range items {
+		it.mu.Lock()
+		if it.enableBuffering {
+			b.release(int64(len(it.buffer)))
+		}
+		it.buffer = nil
+		it.mu.Unlock()
+	}
 }

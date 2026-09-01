@@ -1,8 +1,14 @@
 package server
 
 import (
+	"net/http"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/dernate/gopcxmlda-server/backend"
+	"github.com/dernate/gopcxmlda-server/clock"
+	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
 // TestConfig_WithDefaults_ZeroMeansDefault_NegativeMeansUnlimited checks
@@ -111,4 +117,37 @@ func TestNewServer_WiresConnectionTimeoutsFromConfig(t *testing.T) {
 	if s.httpServer.IdleTimeout != 42*time.Second {
 		t.Fatalf("IdleTimeout: got %v, want 42s", s.httpServer.IdleTimeout)
 	}
+}
+
+// TestConfig_MaxConcurrentRequests_NegativeDisablesTheSemaphore pins the convention
+// every other limit in Config follows: zero takes the default, a negative
+// value explicitly opts out.
+func TestConfig_MaxConcurrentRequests_NegativeDisablesTheSemaphore(t *testing.T) {
+	cfg := Config{MaxConcurrentRequests: -1}.WithDefaults()
+	if cfg.MaxConcurrentRequests != -1 {
+		t.Errorf("WithDefaults clobbered an explicit -1 into %d", cfg.MaxConcurrentRequests)
+	}
+	// Parenthesized: Go's parser rejects a bare composite literal in an
+	// if statement's init clause.
+	if got := (Config{}).WithDefaults().MaxConcurrentRequests; got != 1024 {
+		t.Errorf("the default is %d, want 1024", got)
+	}
+
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	h := newTestHandler(t, be, cfg, clock.Real{})
+	if h.reqSem != nil {
+		t.Error("a semaphore was created despite the limit being disabled")
+	}
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := doPostSOAP(h, readRequestBody([]string{"A"})).StatusCode; got != http.StatusOK {
+				t.Errorf("got status %d, want 200 with the limit disabled", got)
+			}
+		}()
+	}
+	wg.Wait()
 }

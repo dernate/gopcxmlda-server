@@ -7,9 +7,11 @@ import (
 )
 
 // wireTimeLayout is the xsd:dateTime form this library emits everywhere:
-// UTC, fixed millisecond precision, explicit "+00:00" offset. It matches
-// the real captured traffic under testdata/responses/ byte for byte
-// (e.g. RcvTime="2026-08-24T18:22:45.921+00:00").
+// UTC, fixed millisecond precision, with Go's "Z" spelling of the zero
+// offset (e.g. RcvTime="2026-08-24T18:22:45.921Z"). The real captured
+// traffic under testdata/responses/ spells the same instant
+// "…921+00:00"; both are the identical xsd:dateTime value, and "Z" is
+// what Go's Z07:00 layout produces for UTC.
 //
 // The previous time.RFC3339Nano emitted the process's local offset and a
 // variable-length fractional part ("…12:06:56.123718397+02:00"). Both are
@@ -26,6 +28,43 @@ const wireTimeLayout = "2006-01-02T15:04:05.000Z07:00"
 // StartTime, and dateTime-typed Values.
 func formatWireTime(t time.Time) string {
 	return t.UTC().Format(wireTimeLayout)
+}
+
+// wireTime carries an xsd:dateTime that arrives as an XML *attribute*.
+//
+// It exists because encoding/xml decodes a time.Time attribute field
+// through time.Time.UnmarshalText, which accepts only RFC 3339 — a
+// strictly narrower grammar than xsd:dateTime, whose timezone offset is
+// optional and whose lexical space also admits the end-of-day form
+// "T24:00:00" and surrounding whitespace. A conforming peer sending
+// HoldTime="2026-08-30T12:00:00" (no offset) therefore used to fault the
+// whole request, which for SubscriptionPolledRefresh means the client
+// cannot poll its subscription at all. parseXSDDateTime already accepted
+// those forms for element content; this type is what routes attribute
+// values through the same parser.
+//
+// It is unexported and used only inside the shadow structs the request
+// types decode into, so the public API keeps plain *time.Time fields.
+type wireTime struct{ t time.Time }
+
+// UnmarshalXMLAttr implements xml.UnmarshalerAttr.
+func (w *wireTime) UnmarshalXMLAttr(attr xml.Attr) error {
+	t, err := parseXSDDateTime(attr.Value)
+	if err != nil {
+		return err
+	}
+	w.t = t
+	return nil
+}
+
+// timePtr returns w's time as a fresh *time.Time, or nil if w is nil
+// (the attribute was absent).
+func (w *wireTime) timePtr() *time.Time {
+	if w == nil {
+		return nil
+	}
+	t := w.t
+	return &t
 }
 
 // ServerState reflects the server's overall operating condition (§3.1.7).

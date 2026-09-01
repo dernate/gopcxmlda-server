@@ -24,7 +24,19 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 		return
 	}
 
-	backendCursor, ok := parseContinuationToken(req.ContinuationPoint, *req)
+	// BrowseFilter is an enumeration in the schema, and E_INVALIDFILTER is
+	// the specification's code for a value outside it. Forwarding an
+	// unrecognized filter to the backend instead left it to guess, with no
+	// vocabulary to say the request made no sense. (An absent attribute is
+	// not this case: xmlda.BrowseRequest.UnmarshalXML substitutes the
+	// schema's own default of "all".)
+	if !req.BrowseFilter.IsValid() {
+		h.metrics.IncRequestError("Browse", "invalid_filter")
+		writeFault(w, fault(xmlda.ErrInvalidFilter, xmlda.StandardErrorText(xmlda.ErrInvalidFilter)))
+		return
+	}
+
+	backendCursor, ok := h.parseContinuationToken(req.ContinuationPoint, *req)
 	if !ok {
 		h.metrics.IncRequestError("Browse", "invalid_continuation_point")
 		writeFault(w, fault(xmlda.ErrInvalidContinuationPoint, xmlda.StandardErrorText(xmlda.ErrInvalidContinuationPoint)))
@@ -87,6 +99,14 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 
 	includeValues := req.ReturnPropertyValues
 	elements := make([]xmlda.BrowseElement, len(bres.Elements))
+	// Every per-property condition a returned element carries needs an
+	// Errors entry, exactly as Read/Write/GetProperties produce for their
+	// own items: §3.8.2 gives BrowseResponse an Errors list, and this
+	// handler was the only one of the six that never filled it — so a
+	// property that failed to read (E_INVALIDPID, E_ACCESS_DENIED) arrived
+	// with a ResultID and no text, in a response a client reads as
+	// error-free.
+	var codes []xmlda.ErrorCode
 	for i, el := range bres.Elements {
 		be := xmlda.BrowseElement{Name: el.Name, IsItem: el.IsItem, HasChildren: el.HasChildren}
 		if el.Ref != nil {
@@ -98,16 +118,23 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 			be.Properties = make([]xmlda.ItemProperty, len(el.Properties))
 			for j, p := range el.Properties {
 				be.Properties[j] = h.toItemProperty(p, includeValues)
+				codes = append(codes, p.ResultID)
 			}
 		}
 		elements[i] = be
 	}
 
+	opts := xmlda.RequestOptions{
+		ClientRequestHandle: req.ClientRequestHandle,
+		LocaleID:            req.LocaleID,
+		ReturnErrorText:     req.ReturnErrorText,
+	}
 	resp := xmlda.BrowseResponse{
 		MoreElements:      moreElements,
-		ContinuationPoint: buildContinuationToken(*req, bres.ContinuationPoint),
+		ContinuationPoint: h.buildContinuationToken(*req, bres.ContinuationPoint),
 		Result:            h.replyBase(oc, req.ClientRequestHandle, req.LocaleID),
 		Elements:          elements,
+		Errors:            xmlda.DedupeErrors(codes, h.errorTextFunc(opts, oc)),
 	}
 	writeResponse(w, resp)
 }

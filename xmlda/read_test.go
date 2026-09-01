@@ -1,7 +1,9 @@
 package xmlda
 
 import (
+	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,8 +65,8 @@ func TestReadResponse_OrderPreservedAndPerItemErrors(t *testing.T) {
 		Result: ReplyBase{RcvTime: ts, ReplyTime: ts, ServerState: ServerStateRunning},
 		RItemList: ItemValueList{
 			Items: []ItemValue{
-				{ItemName: "A", Value: &v1, Quality: NewGoodQuality()},
-				{ItemName: "B", ResultID: ErrUnknownItemName, Quality: NewQuality(QualityBad, LimitNone, 0)},
+				{ItemName: "A", Value: &v1, Quality: qualityPtr(NewGoodQuality())},
+				{ItemName: "B", ResultID: ErrUnknownItemName, Quality: qualityPtr(NewQuality(QualityBad, LimitNone, 0))},
 			},
 		},
 		Errors: DedupeErrors([]ErrorCode{ErrUnknownItemName}, nil),
@@ -302,5 +304,82 @@ func TestReadResponse_RealFixture_ArrayOfDouble(t *testing.T) {
 		if gotVals[i] != want {
 			t.Fatalf("value %d: got %v, want %v", i, gotVals[i], want)
 		}
+	}
+}
+
+// --- an item-level problem is that item's condition, not the request's ---
+
+// TestReadRequest_MalformedItemAttributeIsPerItem pins the core case:
+// three good items plus one with a malformed MaxAge used to produce a
+// whole-operation SOAP fault, reporting nothing at all about the three
+// that were fine. OPC XML-DA models this as the one item's own ResultID
+// (§2.6, §3.1.9).
+func TestReadRequest_MalformedItemAttributeIsPerItem(t *testing.T) {
+	doc := `<Read xmlns="` + Namespace + `"><Options/><ItemList>` +
+		`<Items ItemName="ok1"/>` +
+		`<Items ItemName="bad" MaxAge="not-a-number"/>` +
+		`<Items ItemName="ok2" ItemPath="Plant"/>` +
+		`</ItemList></Read>`
+	var req ReadRequest
+	if err := Decode([]byte(doc), &req); err != nil {
+		t.Fatalf("one malformed item attribute still fails the whole request: %v", err)
+	}
+	items := req.ItemList.Items
+	if len(items) != 3 {
+		t.Fatalf("got %d items, want 3 — a rejected item must still occupy its slot", len(items))
+	}
+	if items[0].DecodeErr != nil || items[2].DecodeErr != nil {
+		t.Errorf("a healthy item was marked as failed: %v / %v", items[0].DecodeErr, items[2].DecodeErr)
+	}
+	if items[1].DecodeErr == nil {
+		t.Fatal("the malformed item carries no DecodeErr")
+	}
+	var ide *ItemDecodeError
+	if !errors.As(items[1].DecodeErr, &ide) {
+		t.Fatalf("DecodeErr is %T, want *ItemDecodeError", items[1].DecodeErr)
+	}
+	if ide.Field != "MaxAge" {
+		t.Errorf("Field = %q, want MaxAge", ide.Field)
+	}
+	if got := ItemResultIDFor(items[1].DecodeErr); got != ErrFail {
+		t.Errorf("ItemResultIDFor = %v, want E_FAIL", got)
+	}
+	if diag := ItemDiagnosticFor(items[1].DecodeErr); !strings.Contains(diag, "MaxAge") {
+		t.Errorf("the diagnostic does not name the field: %q", diag)
+	}
+	// The rejected item keeps the attributes that WERE readable, so the
+	// server can still echo its identity back.
+	if items[1].ItemName != "bad" {
+		t.Errorf("ItemName was lost: %q", items[1].ItemName)
+	}
+	// And the items after it decoded normally — proof the token stream
+	// stayed in sync across the rejection.
+	if items[2].Params.ItemPath == nil || *items[2].Params.ItemPath != "Plant" {
+		t.Errorf("the item after the rejected one lost its ItemPath: %+v", items[2].Params)
+	}
+}
+
+// TestReadRequest_UnresolvableReqTypeIsPerItemBadType pins that an
+// unresolvable ReqType prefix maps to E_BADTYPE, the same code a client
+// gets for a type this server understands but cannot produce — so both
+// spellings of "I cannot give you that type" read identically.
+func TestReadRequest_UnresolvableReqTypeIsPerItemBadType(t *testing.T) {
+	doc := `<Read xmlns="` + Namespace + `"><Options/><ItemList>` +
+		`<Items ItemName="ok"/>` +
+		`<Items ItemName="bad" ReqType="nosuchprefix:double"/>` +
+		`</ItemList></Read>`
+	var req ReadRequest
+	if err := Decode([]byte(doc), &req); err != nil {
+		t.Fatalf("whole request failed: %v", err)
+	}
+	items := req.ItemList.Items
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	if items[1].DecodeErr == nil {
+		t.Fatal("an unbound ReqType prefix produced no DecodeErr")
+	}
+	if got := ItemResultIDFor(items[1].DecodeErr); got != ErrBadType {
+		t.Errorf("ItemResultIDFor = %v, want E_BADTYPE", got)
 	}
 }

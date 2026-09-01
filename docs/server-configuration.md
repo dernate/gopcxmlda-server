@@ -42,15 +42,20 @@ All fields are optional; zero values fall back to the defaults listed here.
 | `MaxConcurrentSubscriptions` | 10000 | Max subscriptions across the whole server; 0 = unlimited. |
 | `MaxRequestBodyBytes` | 4 MiB | HTTP body size limit, enforced via `http.MaxBytesReader` before any XML parsing. |
 | `RequestTimeout` | 30s | Bounds every non-`SubscriptionPolledRefresh` operation. |
-| `MaxPolledRefreshWait` | 90s | Caps the client-requested Hold+Wait duration for `SubscriptionPolledRefresh`. |
+| `MaxPolledRefreshWait` | 120s | Caps the client-requested Hold+Wait duration for `SubscriptionPolledRefresh`. A longer `HoldTime` is clamped to this, not rejected — see `StrictHoldTime`. The default matches the specification's own guidance ("generally no more than a minute or two", §3.1.6), since a ceiling below what clients actually pick turns every poll into a clamp. |
+| `StrictHoldTime` | `false` | Reject a `HoldTime` beyond `MaxPolledRefreshWait` with `E_INVALIDHOLDTIME` instead of clamping it. Set this only where a client silently getting a shorter hold than it asked for is the worse failure. (A `HoldTime` of exactly the zero `dateTime` is always rejected either way: it is the signature of an uninitialized value, not a request.) |
+| `MaxConcurrentRequests` | 1024 | Max requests in flight at once across the whole server; the excess is refused with `E_BUSY` rather than queued. Size it above the number of concurrent long-polls you expect, not to your request rate — short operations barely occupy a slot. Negative = unlimited. |
+| `ContinuationPointTTL` | 10m | How long a `Browse` continuation point this server issued stays usable. Tokens are authenticated with a per-process key, so they never survive a restart regardless. Negative = no expiry. |
 | `MaxConcurrentPolls` | 32 | Bounds concurrent poll-mode backend calls across all subscriptions. |
 | `ReapInterval` | 10s | How often the abandonment reaper sweeps for abandoned subscriptions. |
 | `ReapGraceMultiplier` | 2.0 | Abandonment grace period = `SubscriptionPingRate × this`. |
 | `DefaultSubscriptionPingRate` | 60s | Substituted when a client sends `SubscriptionPingRate=0`. |
 | `DefaultSamplingRate` | 1s | Substituted when a client requests `RequestedSamplingRate=0`. |
 | `MaxBufferedSamplesPerItem` | 100 | Per-item buffered-change limit before the oldest are purged. |
+| `MaxTotalBufferedSamples` | 1000000 | Server-wide buffered-sample budget. The per-item cap says nothing about the total, and `MaxTotalSubscribedItems × MaxBufferedSamplesPerItem` alone permits twenty million entries. On exhaustion a buffering item keeps only its Latest Changed Value (which REQ-SUBSCRIPTION-007 preserves regardless) and the next reply sets `DataBufferOverflow`. Negative = unlimited. |
 | `PollTimeout` | 30s | Bounds each individual poll-mode `backend.Reader.Read` call. |
 | `ReadOnly` | `false` | If `true`, every `Write` item resolves to `E_ACCESS_DENIED` regardless of whether the backend has a `Writer` — the specification's own recommended policy hook (§2.8). |
+| `RequiresFault` | `nil` | Decides whether an operation must be rejected outright given the server's current `ServerState`, before any backend call (REQ-SERVER-002). `nil` applies `xmlda.RequiresFault`, this library's own reading of §2.6. It is a hook because that reading is a policy, not a protocol constant — the default lets `SubscriptionPolledRefresh` through under `suspended` and treats `commFault` and `test` as fully operational, all defensible and none obligatory. |
 
 Set only the fields you need to change:
 
@@ -60,6 +65,12 @@ server.Config{
 	ReadOnly:           true,
 }
 ```
+
+Three of these fields follow a convention worth stating once: **zero means "use the default", and a
+negative value means "no limit"**. It applies to `MaxItemsPerRequest`, `MaxItemsPerSubscription`,
+`MaxConcurrentSubscriptions`, `MaxBrowseElements`, `MaxTotalSubscribedItems`, `MaxTotalBufferedSamples`,
+`MaxConcurrentRequests` and `ContinuationPointTTL` — so a `Config{}` caller keeps every safe default, and
+opting out of a limit has to be written down deliberately.
 
 ## TLS and authentication
 

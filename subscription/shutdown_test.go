@@ -308,3 +308,123 @@ func TestShutdown_StopsPollScheduling(t *testing.T) {
 		t.Fatalf("expected no further polls after Shutdown, got %d more reads", got-countBefore)
 	}
 }
+
+// // --- WaitGroup Add must not race Wait ---
+
+// TestShutdown_ConcurrentCreate_NoWaitGroupRace pins the fix for the shutdown race
+// the race detector found.
+//
+// Create released m.mu after inserting the subscription and only then
+// called startRefreshing, which arms the poll timer and so takes a
+// WaitGroup slot. A BeginShutdown+Wait that won the mutex in between
+// could therefore observe a zero counter, return — and race that Add.
+// sync.WaitGroup forbids exactly that ("Add called concurrently with
+// Wait") and can panic on it; short of a panic, Wait returned while a
+// poll chain was still being armed, breaking the one guarantee
+// Manager.Wait exists to provide.
+//
+// Run under -race, this is the test that reproduced it. It also asserts
+// Shutdown itself never reports an error, which is what a leaked
+// background goroutine would show up as.
+func TestShutdown_ConcurrentCreate_NoWaitGroupRace(t *testing.T) {
+	iterations := 400
+	if testing.Short() {
+		iterations = 50
+	}
+	for i := range iterations {
+		r := newFakeReader()
+		r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+		// A live clock and a very short sampling rate, so the poll chain
+		// really does arm and fire inside the race window.
+		m := NewManager(backend.Backend{Reader: r}, nil, nil, nil, Config{
+			ReapInterval:        time.Hour,
+			DefaultSamplingRate: time.Millisecond,
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		start := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = m.Create(context.Background(), CreateRequest{
+				Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.Shutdown(ctx); err != nil {
+				t.Errorf("iteration %d: Shutdown: %v", i, err)
+			}
+		}()
+		close(start)
+		wg.Wait()
+	}
+	runtime.GC()
+}
+
+// TestArmTimer_DeclinesAfterShutdown pins the mechanism directly: once
+// BeginShutdown has run, armTimer takes no further WaitGroup slot and
+// reports that it armed nothing. That is what makes the Add/Wait pairing
+// safe rather than merely unlikely to collide.
+func TestArmTimer_DeclinesAfterShutdown(t *testing.T) {
+	m := NewManager(backend.Backend{Reader: newFakeReader()}, nil, nil, nil, Config{ReapInterval: time.Hour})
+	m.BeginShutdown()
+
+	fired := make(chan struct{}, 1)
+	timer, armed := m.armTimer(time.Millisecond, func() { fired <- struct{}{} })
+	if armed {
+		t.Error("armTimer armed a timer after BeginShutdown")
+		timer.Stop()
+	}
+	if timer != nil {
+		t.Errorf("armTimer returned a non-nil timer (%T) while declining", timer)
+	}
+	// Wait must return promptly: nothing was added that it could block on.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Wait(ctx); err != nil {
+		t.Errorf("Wait after a declined arm: %v", err)
+	}
+	select {
+	case <-fired:
+		t.Error("the declined timer's callback ran anyway")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// TestSchedulePoll_AfterShutdownIsNoOp pins that the callers handle the
+// declined arm rather than dereferencing a nil timer — the failure mode a
+// bare `return nil` signal invites.
+func TestSchedulePoll_AfterShutdownIsNoOp(t *testing.T) {
+	r := newFakeReader()
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	m := NewManager(backend.Backend{Reader: r}, nil, nil, nil, Config{ReapInterval: time.Hour})
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	m.mu.RLock()
+	s := m.subs[res.Handle]
+	m.mu.RUnlock()
+	if s == nil {
+		t.Fatal("subscription not registered")
+	}
+
+	m.BeginShutdown()
+	// Would panic on a nil timer if schedulePoll did not check.
+	m.schedulePoll(s, time.Millisecond)
+	m.scheduleReap()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.Wait(ctx); err != nil {
+		t.Errorf("Wait: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/dernate/gopcxmlda-server/backend"
@@ -160,5 +161,154 @@ func TestHandleRead_ReturnItemNameGating(t *testing.T) {
 	got := decodeResponse[xmlda.ReadResponse](t, resp)
 	if got.RItemList.Items[0].ItemName != "" {
 		t.Fatalf("expected ItemName to be omitted by default, got %q", got.RItemList.Items[0].ItemName)
+	}
+}
+
+// --- one bad item costs that item, not the request ---
+
+// TestHandleRead_MalformedItemIsPerItemCondition pins the end-to-end shape:
+// three readable items and one with a malformed
+// MaxAge used to produce a SOAP fault carrying nothing about any of them.
+// Now the good items return their values and the bad one returns its own
+// ResultID, which is what §2.6/§3.1.9's per-item Errors model is for.
+func TestHandleRead_MalformedItemIsPerItemCondition(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	for _, n := range []string{"ok1", "ok2", "ok3"} {
+		r.Set(backend.ItemRef{ItemName: n}, xmlda.NewInt32(1))
+	}
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `">` +
+		`<Options ReturnItemName="true" ReturnDiagnosticInfo="true"/><ItemList>` +
+		`<Items ItemName="ok1" ClientItemHandle="H1"/>` +
+		`<Items ItemName="ok2" ClientItemHandle="H2" MaxAge="not-a-number"/>` +
+		`<Items ItemName="ok3" ClientItemHandle="H3"/>` +
+		`</ItemList></Read>` + soapEnvelopeClose
+
+	resp := postSOAP(t, h, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200 — one malformed item still faults the whole Read", resp.StatusCode)
+	}
+	out := decodeResponse[xmlda.ReadResponse](t, resp)
+	items := out.RItemList.Items
+	if len(items) != 3 {
+		t.Fatalf("got %d reply items, want one per request item", len(items))
+	}
+
+	for _, handle := range []string{"H1", "H3"} {
+		iv := itemByHandle(t, items, handle)
+		if !iv.ResultID.IsZero() {
+			t.Errorf("%s: ResultID = %v, want none", handle, iv.ResultID)
+		}
+		if iv.Value == nil {
+			t.Errorf("%s: value was dropped", handle)
+		}
+	}
+
+	bad := itemByHandle(t, items, "H2")
+	if bad.ResultID != xmlda.ErrFail {
+		t.Errorf("H2: ResultID = %v, want E_FAIL", bad.ResultID)
+	}
+	if bad.Value != nil {
+		t.Error("H2: a rejected item carries a value")
+	}
+	// The client must be able to tell WHICH field it got wrong: the
+	// deduplicated Errors entry carries the code but not the item.
+	if !strings.Contains(bad.DiagnosticInfo, "MaxAge") {
+		t.Errorf("H2: DiagnosticInfo does not name the field: %q", bad.DiagnosticInfo)
+	}
+	if len(out.Errors) != 1 || out.Errors[0].ID != xmlda.ErrFail {
+		t.Errorf("Errors = %+v, want a single E_FAIL entry", out.Errors)
+	}
+}
+
+// --- a failing item must not claim good quality ---
+
+// TestHandleRead_FailedItemOmitsQuality pins the wire shape. The zero
+// OPCQuality emits no attributes, and under the schema's own defaults
+// (QualityField="good") that reads as good quality — so an item reporting
+// E_UNKNOWNITEMNAME also reported good quality with no value, and for a
+// client bridging this onto OPC DA's wQuality the quality is the half
+// that reaches the process image.
+func TestHandleRead_FailedItemOmitsQuality(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "good"}, xmlda.NewInt32(1))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	resp := postSOAP(t, h, readRequestBody([]string{"good", "missing"}))
+	raw := readBody(t, resp)
+
+	// Structural check on the decoded form...
+	out := decodeResponseFrom[xmlda.ReadResponse](t, raw)
+	items := out.RItemList.Items
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	if items[0].Quality == nil {
+		t.Error("a healthy item lost its Quality element")
+	}
+	if items[1].ResultID != xmlda.ErrUnknownItemName {
+		t.Fatalf("items[1].ResultID = %v, want E_UNKNOWNITEMNAME", items[1].ResultID)
+	}
+	if items[1].Quality != nil {
+		t.Errorf("a failing item still carries a Quality (%v) that reads as good",
+			items[1].Quality.QualityField())
+	}
+
+	// ...and on the bytes, since the defect was invisible in the decoded
+	// form: Go's own decoder filled in the same zero value either way.
+	if n := strings.Count(raw, "<Quality"); n != 1 {
+		t.Errorf("the response carries %d Quality elements, want exactly 1 (only the healthy item):\n%s", n, raw)
+	}
+}
+
+// TestHandleRead_SuccessCodeKeepsValue pins the fix for haveSample having been
+// computed as resultID.IsZero(), which dropped the value for every
+// S_-prefixed code — the one class of result where the specification says
+// the value is useful and the client needs both it and the code.
+func TestHandleRead_SuccessCodeKeepsValue(t *testing.T) {
+	be, _, _ := newMinimalBackend()
+	be.Reader = successCodeReader{}
+	h := newTestHandler(t, be, Config{}, nil)
+
+	got := decodeResponse[xmlda.ReadResponse](t, postSOAP(t, h, readRequestBody([]string{"Item1"})))
+	if len(got.RItemList.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(got.RItemList.Items))
+	}
+	item := got.RItemList.Items[0]
+	if item.ResultID != xmlda.SuccessClamp {
+		t.Fatalf("got ResultID %+v, want S_CLAMP", item.ResultID)
+	}
+	if item.Value == nil {
+		t.Fatal("S_CLAMP item carries no Value; a non-critical exception's value is still useful (§2.6)")
+	}
+	v, err := item.Value.Int32()
+	if err != nil || v != 1000 {
+		t.Fatalf("got value %v (err %v), want 1000", v, err)
+	}
+}
+
+// --- ReqType's namespace is part of its identity ---
+
+// TestHandleRead_ReqTypeFromForeignNamespaceIsBadType pins the fix for
+// coerceToReqType having matched on the local name alone, which accepted
+// e.g. "vendor:int" from any namespace and coerced it as if it were
+// xsd:int — a type this server does not actually implement.
+func TestHandleRead_ReqTypeFromForeignNamespaceIsBadType(t *testing.T) {
+	be, _, reader := newMinimalBackend()
+	reader.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(5))
+	h := newTestHandler(t, be, Config{}, nil)
+
+	body := soapEnvelopeOpen +
+		`<Read xmlns="` + xmlda.Namespace + `" xmlns:vendor="http://example.com/vendor">` +
+		`<Options ClientRequestHandle="CRH1"/>` +
+		`<ItemList><Items ItemName="Item1" ReqType="vendor:int"/></ItemList></Read>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.ReadResponse](t, postSOAP(t, h, body))
+
+	if len(got.RItemList.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(got.RItemList.Items))
+	}
+	if id := got.RItemList.Items[0].ResultID; id != xmlda.ErrBadType {
+		t.Fatalf("got ResultID %+v, want E_BADTYPE for a ReqType outside the XSD namespace", id)
 	}
 }

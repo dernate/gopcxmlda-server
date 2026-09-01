@@ -108,6 +108,18 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		pingRate = m.cfg.DefaultSubscriptionPingRate
 	}
 
+	// The rate the server would promise for each item, before the backend
+	// gets a say: the client's own request, or the configured default when
+	// it asked for "fastest practical".
+	requestedRates := make([]time.Duration, len(req.Items))
+	for i, it := range req.Items {
+		requestedRates[i] = it.RequestedSamplingRate
+		if requestedRates[i] <= 0 {
+			requestedRates[i] = m.cfg.DefaultSamplingRate
+		}
+	}
+	revisedRates := m.reviseSamplingRates(ctx, req.Items, requestedRates)
+
 	var items []*itemState
 	out := CreateResult{Items: make([]CreateItemResult, len(req.Items))}
 	for i, it := range req.Items {
@@ -115,21 +127,31 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		if i < len(results) {
 			res = results[i]
 		}
-		rate := it.RequestedSamplingRate
-		if rate <= 0 {
-			rate = m.cfg.DefaultSamplingRate
+		rate := revisedRates[i]
+		// A success-with-caveat code from the initial read (S_CLAMP,
+		// S_DATAQUEUEOVERFLOW) still describes a readable item, so it is
+		// subscribed like any other; only a critical E_ code excludes it.
+		// Treating every non-zero code as "invalid" silently dropped items
+		// the backend had explicitly said were usable.
+		usable := res.ResultID.IsZero() || res.ResultID.IsSuccess()
+		resultID := res.ResultID
+		if usable && resultID.IsZero() && rate != requestedRates[i] {
+			// §3.5.2's own signal for "you asked for a rate I cannot do;
+			// here is the one you get". A success code, so the item stays
+			// subscribed and keeps delivering values.
+			resultID = xmlda.SuccessUnsupportedRate
 		}
 		itemResult := CreateItemResult{
 			ClientItemHandle:    it.ClientItemHandle,
 			RevisedSamplingRate: rate,
 			ReqType:             it.ReqType,
-			ResultID:            res.ResultID,
+			ResultID:            resultID,
 		}
-		if res.ResultID.IsZero() {
+		if usable {
 			items = append(items, &itemState{
 				ref:                   it.Ref,
 				clientItemHandle:      it.ClientItemHandle,
-				requestedSamplingRate: rate,
+				requestedSamplingRate: requestedRates[i],
 				revisedSamplingRate:   rate,
 				deadband:              it.Deadband,
 				enableBuffering:       it.EnableBuffering,
@@ -218,4 +240,45 @@ func (m *Manager) Cancel(handle Handle) bool {
 		m.metrics.SetActiveSubscriptions(m.count())
 	}
 	return found
+}
+
+// reviseSamplingRates asks the backend, if it implements
+// backend.SamplingRateReviser, which of the requested rates it can
+// actually achieve. It returns one rate per item, defaulting to the
+// requested one.
+//
+// Every failure mode here falls back to the requested rates rather than
+// failing the Subscribe: a backend that cannot answer the question, or
+// answers it with the wrong number of entries, is a reason to serve the
+// subscription at the rate the client named — not a reason to refuse it.
+func (m *Manager) reviseSamplingRates(ctx context.Context, reqItems []CreateItemRequest, requested []time.Duration) []time.Duration {
+	revised := append([]time.Duration(nil), requested...)
+	reviser, ok := m.backend.Reader.(backend.SamplingRateReviser)
+	if !ok {
+		return revised
+	}
+	rateReqs := make([]backend.RateRequest, len(reqItems))
+	for i, it := range reqItems {
+		rateReqs[i] = backend.RateRequest{Ref: it.Ref, RequestedSamplingRate: requested[i]}
+	}
+	rates, err := reviser.ReviseSamplingRates(ctx, rateReqs)
+	if err != nil {
+		m.log.Warn("subscription: ReviseSamplingRates failed, honoring the requested rates",
+			"error", err.Error())
+		return revised
+	}
+	if len(rates) != len(rateReqs) {
+		m.log.Warn("subscription: ReviseSamplingRates returned the wrong number of rates, honoring the requested rates",
+			"requested", len(rateReqs), "returned", len(rates))
+		return revised
+	}
+	for i, r := range rates {
+		// A zero or negative revision is "no opinion", not "sample
+		// instantly": a rate of zero would make this item due on every
+		// single tick of its subscription's shared timer.
+		if r > 0 {
+			revised[i] = r
+		}
+	}
+	return revised
 }

@@ -84,3 +84,44 @@ func TestBackendErrorFault_NeverLeaksInternalErrorText(t *testing.T) {
 func errWrap(err error) error {
 	return fmt.Errorf("wrapping: %w", err)
 }
+
+// --- error text is locale-aware and covers vendor codes ---
+
+// TestErrorText_HookIsUsed pins the fix for Errors text having been
+// hardwired to xmlda.StandardErrorText: the response reported
+// RevisedLocaleID for a locale the backend claimed to support and then
+// sent English text regardless, and a vendor result code got no <Text>
+// element at all (StandardErrorText returns "" for codes it does not
+// know, though §3.1.9 says every OPCError carries one).
+func TestErrorText_HookIsUsed(t *testing.T) {
+	be, status, _ := newMinimalBackend()
+	status.SetLocales([]string{"en-US", "de-DE"})
+	var gotLocale string
+	h := newTestHandler(t, be, Config{
+		ErrorText: func(code xmlda.ErrorCode, locale string) string {
+			gotLocale = locale
+			if code == xmlda.ErrUnknownItemName {
+				return "Der angeforderte Elementname ist dem Server nicht bekannt."
+			}
+			return xmlda.StandardErrorText(code)
+		},
+	}, nil)
+
+	body := soapEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `">` +
+		`<Options ClientRequestHandle="CRH1" LocaleID="de-DE"/>` +
+		`<ItemList><Items ItemName="NoSuchItem"/></ItemList></Read>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.ReadResponse](t, postSOAP(t, h, body))
+
+	if gotLocale != "de-DE" {
+		t.Errorf("ErrorText was called with locale %q, want the resolved de-DE", gotLocale)
+	}
+	if len(got.Errors) != 1 {
+		t.Fatalf("got %d Errors entries, want 1: %+v", len(got.Errors), got.Errors)
+	}
+	if got.Errors[0].Text != "Der angeforderte Elementname ist dem Server nicht bekannt." {
+		t.Errorf("got text %q, want the locale-specific text from Config.ErrorText", got.Errors[0].Text)
+	}
+	if got.Result.RevisedLocaleID != "de-DE" {
+		t.Errorf("got RevisedLocaleID %q, want de-DE", got.Result.RevisedLocaleID)
+	}
+}

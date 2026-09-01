@@ -20,7 +20,7 @@ func (m *Manager) scheduleReap() {
 	// armTimer (see manager.go) tracks this callback in m.wg from the
 	// moment it is armed, so a concurrent Manager.Wait cannot return
 	// while a sweep is pending or running.
-	t := m.armTimer(m.cfg.ReapInterval, func() {
+	t, armed := m.armTimer(m.cfg.ReapInterval, func() {
 		if m.rootCtx.Err() != nil {
 			return // shut down: stop the chain
 		}
@@ -29,6 +29,9 @@ func (m *Manager) scheduleReap() {
 			m.scheduleReap()
 		}
 	})
+	if !armed {
+		return // shut down: armTimer declined, nothing to record
+	}
 	// Hand the armed timer to the Manager so BeginShutdown can stop it;
 	// an unstopped one keeps firing-closure state reachable for up to a
 	// full ReapInterval after shutdown. If shutdown already happened while
@@ -135,5 +138,6 @@ func (m *Manager) terminateIfStillAbandoned(handle Handle, asOf time.Time) bool 
 	delete(m.subs, handle)
 	s.cancel()
 	s.stopPolling()
+	s.releaseBuffers(m.budget)
 	return true
 }

@@ -40,6 +40,85 @@ type Handler struct {
 	statusVal   backend.ServerStatus
 	statusFresh time.Time
 	statusOK    bool
+	// statusWarnOnce keeps a backend that reports an invalid ServerStatus
+	// from logging the same complaint on every single request.
+	statusWarnOnce sync.Once
+
+	// cpKey authenticates Browse continuation points. Generated per
+	// Handler and never persisted — see continuation.go.
+	cpKey []byte
+
+	// reqSem bounds in-flight requests (Config.MaxConcurrentRequests);
+	// nil when the limit is disabled.
+	reqSem chan struct{}
+}
+
+// normalizeStatus checks a backend-supplied ServerStatus for the
+// invariants the wire format depends on, logs once if any is violated,
+// and substitutes the one default that keeps the response schema-valid.
+//
+// backend.Backend.Validate only checks that the capabilities are non-nil;
+// nothing validated what GetStatus actually returned. An empty State is
+// the consequential one: ReplyBase omits the attribute when it is empty,
+// and ServerState is use="required" in the schema — so a single forgotten
+// field in a backend made EVERY response this server produced
+// schema-invalid, with nothing anywhere reporting it. StartTime and
+// SupportedLocaleIDs are reported but not substituted: no default this
+// layer could invent would be true (REQ-STATUS-003 wants the real process
+// start; REQ-STATUS-004 wants the locales the backend really supports).
+func (h *Handler) normalizeStatus(st backend.ServerStatus) backend.ServerStatus {
+	if problems := validateServerStatus(st); len(problems) > 0 {
+		h.statusWarnOnce.Do(func() {
+			h.log.Error("backend GetStatus returned an incomplete ServerStatus; "+
+				"see backend.ServerStatus's field documentation",
+				"problems", strings.Join(problems, "; "))
+		})
+	}
+	if st.State == "" {
+		st.State = xmlda.ServerStateRunning
+	}
+	return st
+}
+
+// validateServerStatus lists the ways st violates the invariants
+// backend.ServerStatus documents, or nil if it holds none.
+func validateServerStatus(st backend.ServerStatus) []string {
+	var problems []string
+	if st.State == "" {
+		problems = append(problems, "State is empty (ServerState is required on every reply; assuming \"running\")")
+	}
+	if st.StartTime.IsZero() {
+		problems = append(problems, "StartTime is the zero time (REQ-STATUS-003 requires the real process start time)")
+	}
+	if len(st.SupportedLocaleIDs) == 0 {
+		problems = append(problems, "SupportedLocaleIDs is empty (REQ-STATUS-004 requires at least one entry)")
+	}
+	return problems
+}
+
+// requiresFault applies Config.RequiresFault, or xmlda.RequiresFault when
+// the application supplied none.
+func (h *Handler) requiresFault(op string, state xmlda.ServerState) (bool, xmlda.ErrorCode) {
+	if h.cfg.RequiresFault != nil {
+		return h.cfg.RequiresFault(op, state)
+	}
+	return xmlda.RequiresFault(op, state)
+}
+
+// acquireRequestSlot takes one of Config.MaxConcurrentRequests in-flight
+// slots, reporting false if none is free. The returned release function is
+// a no-op when the limit is disabled, so callers can defer it
+// unconditionally.
+func (h *Handler) acquireRequestSlot() (release func(), ok bool) {
+	if h.reqSem == nil {
+		return func() {}, true
+	}
+	select {
+	case h.reqSem <- struct{}{}:
+		return func() { <-h.reqSem }, true
+	default:
+		return func() {}, false
+	}
 }
 
 // statusFor returns the server status ServeHTTP uses to evaluate
@@ -66,6 +145,7 @@ func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerS
 		if err != nil {
 			return backend.ServerStatus{}, err
 		}
+		st = h.normalizeStatus(st)
 		// A live read supersedes whatever the cache holds: a state change
 		// observed here must not be masked by an older entry.
 		h.storeStatus(st)
@@ -90,6 +170,7 @@ func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerS
 	if err != nil {
 		return backend.ServerStatus{}, err
 	}
+	st = h.normalizeStatus(st)
 	h.statusVal, h.statusFresh, h.statusOK = st, now, true
 	return st, nil
 }
@@ -99,6 +180,16 @@ func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerS
 // if ctx wins the race that goroutine still completes and immediately
 // releases, leaving no leak and no lock held by a caller that has gone.
 func lockContext(ctx context.Context, mu *sync.Mutex) error {
+	// Fast path: an uncontended mutex — which, for the status cache, is
+	// the overwhelmingly common case, since a cache HIT also comes through
+	// here. Without it every request paid for a goroutine, a channel
+	// allocation and a select just to discover the lock was free.
+	if mu.TryLock() {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	acquired := make(chan struct{})
 	go func() {
 		mu.Lock()
@@ -180,6 +271,16 @@ func New(deps Deps, cfg Config) (*Handler, error) {
 		metrics = telemetry.NoopMetrics()
 	}
 
+	cpKey, err := newContinuationKey()
+	if err != nil {
+		return nil, err
+	}
+
+	var reqSem chan struct{}
+	if cfg.MaxConcurrentRequests > 0 {
+		reqSem = make(chan struct{}, cfg.MaxConcurrentRequests)
+	}
+
 	subs := subscription.NewManager(deps.Backend, clk, log, metrics, cfg.subscriptionConfig())
 
 	return &Handler{
@@ -189,6 +290,8 @@ func New(deps Deps, cfg Config) (*Handler, error) {
 		log:     log,
 		metrics: metrics,
 		subs:    subs,
+		cpKey:   cpKey,
+		reqSem:  reqSem,
 	}, nil
 }
 
@@ -239,6 +342,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed: OPC XML-DA is POST-only", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Admission control before the body is even read: a request this
+	// server has no capacity for should not first be allowed to allocate
+	// MaxRequestBodyBytes. E_BUSY is the specification's own code for
+	// "already busy with something else"; a queued request would only
+	// convert exhaustion into unbounded latency.
+	release, ok := h.acquireRequestSlot()
+	if !ok {
+		h.metrics.IncRequestError(opName, "busy")
+		writeFault(w, fault(xmlda.ErrBusy, xmlda.StandardErrorText(xmlda.ErrBusy)))
+		return
+	}
+	defer release()
 
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -306,7 +422,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeFault(w, backendErrorFault(err))
 		return
 	}
-	if needsFault, code := xmlda.RequiresFault(opName, status.State); needsFault {
+	if needsFault, code := h.requiresFault(opName, status.State); needsFault {
 		h.metrics.IncRequestError(opName, "server_state")
 		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
 		return

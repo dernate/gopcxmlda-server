@@ -220,3 +220,101 @@ func TestReaper_OnlyAbandonedSubscriptionsAreReaped(t *testing.T) {
 		t.Fatalf("expected the actively-polled subscription to remain valid, got %v", err)
 	}
 }
+
+// Regression tests for the subscription-engine defects found in the
+// wire-format review.
+
+// --- H3: the reaper must not kill a subscription being polled ---
+
+// TestReaper_DoesNotReapDuringPolledRefresh pins the fix for the
+// abandonment sweep having looked only at lastPolledAt while ignoring the
+// busy flag a live PolledRefresh already sets.
+//
+// The failure was not exotic. lastPolledAt was stamped when the request
+// arrived, and PolledRefresh then blocked for the client's requested
+// Hold+Wait. Any subscription whose ping rate gave it a grace period
+// shorter than that hold — a SubscriptionPingRate of 3s, as in the real
+// captured traffic, gives 6s against a hold that may legitimately run to
+// MaxPolledRefreshWait — was destroyed mid-call. The call returned early
+// with an empty, formally successful response, and the handle was gone.
+func TestReaper_DoesNotReapDuringPolledRefresh(t *testing.T) {
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: fixReader{}}, nil, nil, nil,
+		Config{
+			ReapInterval:        10 * time.Millisecond,
+			ReapGraceMultiplier: 1.0,
+			DefaultSamplingRate: time.Hour, // never polls the backend
+		})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items:                []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}, ClientItemHandle: "h"}},
+		SubscriptionPingRate: 50 * time.Millisecond, // grace = 50ms
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Hold far longer than the 50ms grace period.
+	hold := time.Now().Add(400 * time.Millisecond)
+	start := time.Now()
+	rr, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, HoldTime: &hold, ReturnAllItems: true,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("PolledRefresh: %v", err)
+	}
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("PolledRefresh returned after %v, well before its %v hold — "+
+			"the reaper terminated the subscription mid-call", elapsed, 400*time.Millisecond)
+	}
+	if len(rr.InvalidHandles) != 0 {
+		t.Errorf("handle reported invalid during its own poll: %v", rr.InvalidHandles)
+	}
+	if len(rr.Subscriptions) != 1 {
+		t.Fatalf("got %d subscription results, want 1", len(rr.Subscriptions))
+	}
+
+	// And it is still usable afterwards.
+	if _, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, ReturnAllItems: true,
+	}); err != nil {
+		t.Fatalf("subscription unusable after the hold: %v", err)
+	}
+}
+
+// TestReaper_StillReapsAbandoned is the counterpart: the fix must not
+// disable abandonment cleanup, only exempt a subscription that is
+// genuinely being polled right now.
+func TestReaper_StillReapsAbandoned(t *testing.T) {
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: fixReader{}}, nil, nil, nil,
+		Config{
+			ReapInterval:        10 * time.Millisecond,
+			ReapGraceMultiplier: 1.0,
+			DefaultSamplingRate: time.Hour,
+		})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items:                []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+		SubscriptionPingRate: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for m.count() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("an abandoned subscription was never reaped")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	_, err = m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}})
+	if !errors.Is(err, ErrNoSubscription) {
+		t.Fatalf("got %v, want ErrNoSubscription after the reap", err)
+	}
+}

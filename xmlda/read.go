@@ -12,6 +12,12 @@ type ReadRequestItem struct {
 	Params           ItemParams
 	ItemName         string
 	ClientItemHandle string
+	// DecodeErr is non-nil when this item's own attributes could not be
+	// interpreted (see ItemDecodeError). The item is still present, with
+	// whatever was parseable, so the server layer can report the
+	// condition as this one item's ResultID instead of faulting the whole
+	// request. Always an *ItemDecodeError when non-nil.
+	DecodeErr error
 }
 
 // MarshalXML implements xml.Marshaler.
@@ -21,11 +27,11 @@ func (it ReadRequestItem) MarshalXML(e *xml.Encoder, start xml.StartElement) err
 
 // UnmarshalXML implements xml.Unmarshaler.
 func (it *ReadRequestItem) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
-	p, itemName, clientItemHandle, err := decodeRequestItem(d, start)
+	p, itemName, clientItemHandle, decodeErr, err := decodeRequestItem(d, start)
 	if err != nil {
 		return err
 	}
-	it.Params, it.ItemName, it.ClientItemHandle = p, itemName, clientItemHandle
+	it.Params, it.ItemName, it.ClientItemHandle, it.DecodeErr = p, itemName, clientItemHandle, decodeErr
 	return nil
 }
 

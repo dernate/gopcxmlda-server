@@ -26,7 +26,8 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
-	if code, bad := h.checkHoldTime(req.HoldTime, now); bad {
+	holdTime, code, bad := h.resolveHoldTime(req.HoldTime, now)
+	if bad {
 		h.metrics.IncRequestError("SubscriptionPolledRefresh", "invalid_hold_time")
 		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
 		return
@@ -50,14 +51,14 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	// their sum reach twice the cap, which then raced the request's own
 	// context deadline.
 	waitTime := min(msToDuration(req.WaitTime), h.cfg.MaxPolledRefreshWait)
-	if req.HoldTime != nil {
-		remaining := h.cfg.MaxPolledRefreshWait - max(req.HoldTime.Sub(now), 0)
+	if holdTime != nil {
+		remaining := h.cfg.MaxPolledRefreshWait - max(holdTime.Sub(now), 0)
 		waitTime = min(waitTime, max(remaining, 0))
 	}
 
 	res, err := h.subs.PolledRefresh(ctx, subscription.RefreshRequest{
 		Handles:        handles,
-		HoldTime:       req.HoldTime,
+		HoldTime:       holdTime,
 		WaitTime:       waitTime,
 		ReturnAllItems: req.ReturnAllItems,
 	})
@@ -117,24 +118,42 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	writeResponse(w, resp)
 }
 
-// checkHoldTime validates a requested HoldTime, reporting the fault code
-// to emit if it is unusable (§3.1.9's E_INVALIDHOLDTIME).
+// resolveHoldTime validates a requested HoldTime and returns the hold
+// this server will actually honor, or the fault code to emit if the
+// request is unusable (§3.1.9's E_INVALIDHOLDTIME).
 //
-// Two cases are rejected. The exact zero time.Time (year 1, month 1, day
-// 1) is not a value any client would legitimately request — it is the
+// The exact zero time.Time (year 1, month 1, day 1) is always rejected:
+// it is not a value any client would legitimately request, but the
 // unmistakable signature of an uninitialized dateTime from a naive client
-// library, which "hold until a time already past" would otherwise
-// silently accept as "do not hold at all". And a HoldTime further out
-// than Config.MaxPolledRefreshWait is more than this server will block
-// for: rejecting it says so, where letting it run would hit the request's
-// own context deadline and return E_TIMEDOUT after discarding the
-// subscription's buffered changes.
-func (h *Handler) checkHoldTime(holdTime *time.Time, now time.Time) (xmlda.ErrorCode, bool) {
+// library — which "hold until a time already past" would otherwise
+// silently accept as "do not hold at all".
+//
+// A HoldTime beyond Config.MaxPolledRefreshWait is CLAMPED to that
+// ceiling by default, not rejected. Rejecting it reads as the stricter,
+// more honest answer, and it is what this used to do — but the
+// specification's own guidance is a range ("generally no more than a
+// minute or two", §3.1.6) while the ceiling is an exact number, so a
+// client that picks two minutes against a shorter ceiling faults on every
+// single poll and never receives its subscription's data at all. Clamping
+// gives it a shorter hold and a valid reply; the request's own context
+// deadline (MaxPolledRefreshWait + polledRefreshGrace) then cannot be
+// raced, because the clamped hold is by construction inside it.
+// Config.StrictHoldTime restores the rejecting behavior.
+func (h *Handler) resolveHoldTime(holdTime *time.Time, now time.Time) (*time.Time, xmlda.ErrorCode, bool) {
 	if holdTime == nil {
-		return xmlda.ErrorCode{}, false
+		return nil, xmlda.ErrorCode{}, false
 	}
-	if holdTime.IsZero() || holdTime.Sub(now) > h.cfg.MaxPolledRefreshWait {
-		return xmlda.ErrInvalidHoldTime, true
+	if holdTime.IsZero() {
+		return nil, xmlda.ErrInvalidHoldTime, true
 	}
-	return xmlda.ErrorCode{}, false
+	ceiling := now.Add(h.cfg.MaxPolledRefreshWait)
+	if holdTime.After(ceiling) {
+		if h.cfg.StrictHoldTime {
+			return nil, xmlda.ErrInvalidHoldTime, true
+		}
+		h.log.Debug("SubscriptionPolledRefresh HoldTime clamped to MaxPolledRefreshWait",
+			"requested", holdTime.String(), "granted", ceiling.String())
+		return &ceiling, xmlda.ErrorCode{}, false
+	}
+	return holdTime, xmlda.ErrorCode{}, false
 }

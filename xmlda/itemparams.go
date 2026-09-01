@@ -68,23 +68,37 @@ func MergeItemParams(levels ...ItemParams) ItemParams {
 
 // decodeItemParamsAttrs extracts whichever hierarchical parameters are
 // present in attrs into an ItemParams, resolving ReqType's QName value
-// against d's namespace scope. Fields absent from attrs are left nil.
+// against the element's own declarations first and then d's
+// whole-document scope. Fields absent from attrs are left nil.
+//
+// The returned error is always an *ItemDecodeError, and the returned
+// ItemParams still carries whatever was parsed before the failure — so an
+// item-level caller can report the condition as that item's own ResultID
+// while still echoing its ItemPath back (see ItemDecodeError). A
+// list-level or request-level caller, where the same attribute applies to
+// every item at once, instead propagates it as a whole-operation fault.
 func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error) {
 	var p ItemParams
 	if v, ok := attrValue(attrs, xml.Name{Local: "ItemPath"}); ok {
 		p.ItemPath = &v
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "ReqType"}); ok {
-		qn, err := resolveQName(d, v)
+		qn, err := resolveQNameIn(d, attrs, v)
 		if err != nil {
-			return ItemParams{}, err
+			// E_BADTYPE, not E_FAIL: a ReqType this server cannot resolve
+			// to a type IS the specification's bad-type condition
+			// (§3.1.3), and it is what a client gets for an unsupported
+			// but resolvable type too — so the two spellings of "I cannot
+			// give you that type" report identically.
+			return p, &ItemDecodeError{Field: "ReqType", Code: ErrBadType, Err: err}
 		}
 		p.ReqType = &qn
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "MaxAge"}); ok {
 		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
-			return ItemParams{}, fmt.Errorf("xmlda: invalid MaxAge %q: %w", v, err)
+			return p, &ItemDecodeError{Field: "MaxAge", Code: ErrFail,
+				Err: fmt.Errorf("%q is not a valid xsd:int: %w", v, err)}
 		}
 		n32 := int32(n)
 		p.MaxAge = &n32
@@ -92,14 +106,16 @@ func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error)
 	if v, ok := attrValue(attrs, xml.Name{Local: "Deadband"}); ok {
 		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 		if err != nil {
-			return ItemParams{}, fmt.Errorf("xmlda: invalid Deadband %q: %w", v, err)
+			return p, &ItemDecodeError{Field: "Deadband", Code: ErrFail,
+				Err: fmt.Errorf("%q is not a valid xsd:float: %w", v, err)}
 		}
 		p.Deadband = &f
 	}
 	if v, ok := attrValue(attrs, xml.Name{Local: "RequestedSamplingRate"}); ok {
 		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32)
 		if err != nil {
-			return ItemParams{}, fmt.Errorf("xmlda: invalid RequestedSamplingRate %q: %w", v, err)
+			return p, &ItemDecodeError{Field: "RequestedSamplingRate", Code: ErrFail,
+				Err: fmt.Errorf("%q is not a valid xsd:int: %w", v, err)}
 		}
 		n32 := int32(n)
 		p.RequestedSamplingRate = &n32
@@ -107,7 +123,8 @@ func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error)
 	if v, ok := attrValue(attrs, xml.Name{Local: "EnableBuffering"}); ok {
 		b, err := strconv.ParseBool(strings.TrimSpace(v))
 		if err != nil {
-			return ItemParams{}, fmt.Errorf("xmlda: invalid EnableBuffering %q: %w", v, err)
+			return p, &ItemDecodeError{Field: "EnableBuffering", Code: ErrFail,
+				Err: fmt.Errorf("%q is not a valid xsd:boolean: %w", v, err)}
 		}
 		p.EnableBuffering = &b
 	}
@@ -159,14 +176,18 @@ func marshalRequestItem(e *xml.Encoder, start xml.StartElement, params ItemParam
 
 // decodeRequestItem is marshalRequestItem's decode counterpart, shared by
 // ReadRequestItem and SubscribeRequestItem.
-func decodeRequestItem(d *xml.Decoder, start xml.StartElement) (params ItemParams, itemName, clientItemHandle string, err error) {
-	params, err = decodeItemParamsAttrs(d, start.Attr)
-	if err != nil {
-		return ItemParams{}, "", "", err
-	}
+//
+// It returns two errors, and the distinction is the whole point:
+// decodeErr is a per-item condition the caller stores in the item's
+// DecodeErr field for the server layer to turn into a ResultID, while err
+// is a structural XML failure that genuinely cannot be attributed to one
+// item. This function always consumes start's element either way, so a
+// caller's own token loop stays in sync across a rejected item.
+func decodeRequestItem(d *xml.Decoder, start xml.StartElement) (params ItemParams, itemName, clientItemHandle string, decodeErr, err error) {
+	params, decodeErr = decodeItemParamsAttrs(d, start.Attr)
 	itemName, _ = attrValue(start.Attr, xml.Name{Local: "ItemName"})
 	clientItemHandle, _ = attrValue(start.Attr, xml.Name{Local: "ClientItemHandle"})
-	return params, itemName, clientItemHandle, d.Skip()
+	return params, itemName, clientItemHandle, decodeErr, d.Skip()
 }
 
 // xmlUnmarshalerPtr is implemented by *T for every item type used inside a

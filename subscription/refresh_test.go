@@ -3,6 +3,7 @@ package subscription
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -133,7 +134,7 @@ func TestPolledRefresh_EarlyReturnOnChangeDuringWait(t *testing.T) {
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	if changed := applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem); changed {
+	if changed := applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem, nil); changed {
 		s.notifyChanged()
 	}
 
@@ -177,7 +178,7 @@ func TestPolledRefresh_ChangeDuringHold_ReturnsFastAfterHoldElapses(t *testing.T
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem)
+	applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem, nil)
 
 	select {
 	case <-ch:
@@ -556,5 +557,158 @@ func TestPolledRefresh_RequestContextCancellation(t *testing.T) {
 	call := awaitRefresh(t, ch)
 	if call.err == nil {
 		t.Fatalf("expected an error after request context cancellation")
+	}
+}
+
+// --- fan-in must not cost a goroutine per handle in the common case ---
+
+// TestFanIn_SingleChannelSpawnsNoGoroutine pins the fast path. These
+// goroutines are per handle per in-flight call, which is the one place in
+// this server where a client's request size multiplies against its
+// request concurrency — and one handle is by far the most common shape of
+// a real SubscriptionPolledRefresh.
+func TestFanIn_SingleChannelSpawnsNoGoroutine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan struct{})
+	before := runtime.NumGoroutine()
+	out := fanIn(ctx, []<-chan struct{}{ch})
+	if got := runtime.NumGoroutine(); got > before {
+		t.Errorf("goroutines went from %d to %d for a single channel", before, got)
+	}
+	// It must still behave like a fan-in of one.
+	close(ch)
+	select {
+	case <-out:
+	case <-time.After(time.Second):
+		t.Error("the single-channel fan-in never fired")
+	}
+}
+
+// TestFanIn_MultipleChannelsStillFanIn pins that the fast path did not
+// break the general case: any of the channels firing must close the
+// output, and every spawned goroutine must exit with the call.
+func TestFanIn_MultipleChannelsStillFanIn(t *testing.T) {
+	for _, fireIdx := range []int{0, 1, 2} {
+		ctx, cancel := context.WithCancel(context.Background())
+		chans := make([]chan struct{}, 3)
+		in := make([]<-chan struct{}, 3)
+		for i := range chans {
+			chans[i] = make(chan struct{})
+			in[i] = chans[i]
+		}
+		out := fanIn(ctx, in)
+		close(chans[fireIdx])
+		select {
+		case <-out:
+		case <-time.After(time.Second):
+			t.Errorf("firing channel %d did not close the fan-in", fireIdx)
+		}
+		cancel()
+	}
+}
+
+// TestPolledRefresh_CancelledMidHoldReportsInvalidHandle pins the second
+// half of H3: a subscription cancelled while this very call was blocked
+// used to be dropped from the result entirely — neither in RItemList nor
+// in InvalidServerSubHandles — which a client reads as "no changes"
+// rather than "your subscription is gone".
+func TestPolledRefresh_CancelledMidHoldReportsInvalidHandle(t *testing.T) {
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: fixReader{}}, nil, nil, nil,
+		Config{ReapInterval: time.Hour, DefaultSamplingRate: time.Hour})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		m.Cancel(res.Handle)
+	}()
+
+	hold := time.Now().Add(2 * time.Second)
+	rr, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, HoldTime: &hold, ReturnAllItems: true,
+	})
+	if err != nil {
+		t.Fatalf("PolledRefresh: %v", err)
+	}
+	if len(rr.InvalidHandles) != 1 || rr.InvalidHandles[0] != res.Handle {
+		t.Fatalf("got InvalidHandles %v, want the cancelled handle reported there", rr.InvalidHandles)
+	}
+}
+
+// --- ReturnAllItems includes buffered values ---
+
+// TestPolledRefresh_ReturnAllItemsIncludesBufferedValues pins the fix for
+// the ReturnAllItems branch having discarded the buffer instead of
+// sending it. §3.6.1 is explicit: "the server will wait the HoldTime but
+// then return with all current values (and any buffered values if
+// EnableBuffering)". Before the fix a single ReturnAllItems poll silently
+// threw away everything EnableBuffering had collected.
+func TestPolledRefresh_ReturnAllItemsIncludesBufferedValues(t *testing.T) {
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: fixReader{}}, nil, nil, nil,
+		Config{ReapInterval: time.Hour, DefaultSamplingRate: time.Hour})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{
+			Ref: backend.ItemRef{ItemName: "A"}, ClientItemHandle: "h", EnableBuffering: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Record three distinct changes into the item's buffer.
+	m.mu.RLock()
+	s := m.subs[res.Handle]
+	m.mu.RUnlock()
+	it := s.items[0]
+	for _, v := range []int32{10, 20, 30} {
+		applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
+			xmlda.ErrorCode{}, 100, nil)
+	}
+
+	rr, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, ReturnAllItems: true,
+	})
+	if err != nil {
+		t.Fatalf("PolledRefresh: %v", err)
+	}
+	if len(rr.Subscriptions) != 1 {
+		t.Fatalf("got %d subscription results, want 1", len(rr.Subscriptions))
+	}
+	items := rr.Subscriptions[0].Items
+	// Three buffered entries plus the current value.
+	if len(items) != 4 {
+		t.Fatalf("got %d entries, want 3 buffered values plus the current one: %+v", len(items), items)
+	}
+	want := []int32{10, 20, 30, 30}
+	for i, w := range want {
+		if !items[i].HaveSample {
+			t.Fatalf("entry %d carries no sample", i)
+		}
+		got, err := items[i].Sample.Value.Int32()
+		if err != nil || got != w {
+			t.Fatalf("entry %d: got %v (err %v), want %d", i, got, err, w)
+		}
+	}
+	// The buffer is drained afterwards, so a second poll does not repeat.
+	rr2, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, ReturnAllItems: true,
+	})
+	if err != nil {
+		t.Fatalf("second PolledRefresh: %v", err)
+	}
+	if n := len(rr2.Subscriptions[0].Items); n != 1 {
+		t.Fatalf("second poll returned %d entries, want only the current value", n)
 	}
 }

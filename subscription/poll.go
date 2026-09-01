@@ -59,7 +59,7 @@ func (m *Manager) schedulePoll(s *subState, in time.Duration) {
 	// while a poll is pending or in flight. See armTimer's doc comment
 	// for why counting from inside the callback was not enough.
 	due := m.clock.Now().Add(in)
-	t := m.armTimer(in, func() {
+	t, armed := m.armTimer(in, func() {
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -83,6 +83,11 @@ func (m *Manager) schedulePoll(s *subState, in time.Duration) {
 			m.schedulePoll(s, next)
 		}
 	})
+	if !armed {
+		// The Manager is already shutting down; armTimer declined to take a
+		// WaitGroup slot, so there is nothing to stop or record.
+		return
+	}
 	if !s.setTimer(t) {
 		// Cancelled while this timer was being armed: nothing else holds a
 		// reference to it, so stop it here.
@@ -192,7 +197,7 @@ func (m *Manager) pollOnce(s *subState) {
 		it.mu.Lock()
 		it.lastPolledAt = now
 		it.mu.Unlock()
-		if applyUpdate(it, res.Value, res.ResultID, m.cfg.MaxBufferedSamplesPerItem) {
+		if applyUpdate(it, res.Value, res.ResultID, m.cfg.MaxBufferedSamplesPerItem, m.budget) {
 			changed = true
 		}
 	}
@@ -222,7 +227,7 @@ func (m *Manager) pollOnce(s *subState) {
 // value instead of the item's EU range. Documented as an accepted
 // simplification (deadband/buffering are explicitly "soft negotiated
 // behaviors" per docs/architecture/subscription-model.md), not a bug.
-func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, maxBuffer int) bool {
+func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, maxBuffer int, budget *sampleBudget) bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
@@ -258,16 +263,34 @@ func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorC
 	if !changed {
 		return false
 	}
-	if it.enableBuffering {
+	switch {
+	case !it.enableBuffering:
+		it.buffer = []update{u} // only the latest value; outside the budget
+	case budget.acquire():
 		it.buffer = append(it.buffer, u)
-		if len(it.buffer) > maxBuffer {
+		if over := len(it.buffer) - maxBuffer; over > 0 {
 			// Oldest purged first; the Latest Changed Value (the most
 			// recent entry) is always retained (REQ-SUBSCRIPTION-007).
-			it.buffer = it.buffer[len(it.buffer)-maxBuffer:]
+			it.buffer = it.buffer[over:]
+			budget.release(int64(over))
 			it.overflowed = true
 		}
-	} else {
-		it.buffer = []update{u} // only the latest value
+	default:
+		// The server-wide buffered-sample budget is exhausted
+		// (Config.MaxTotalBufferedSamples). Collapse to the Latest Changed
+		// Value — the one entry REQ-SUBSCRIPTION-007 retains regardless of
+		// any limit — and flag the loss so the next reply carries
+		// DataBufferOverflow. Degrading this item rather than refusing the
+		// update keeps change delivery working under memory pressure; the
+		// alternative is a subscription that silently goes stale.
+		switch n := int64(len(it.buffer)); {
+		case n > 1:
+			budget.release(n - 1)
+		case n == 0:
+			budget.add(1)
+		}
+		it.buffer = []update{u}
+		it.overflowed = true
 	}
 	return true
 }

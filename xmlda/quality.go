@@ -132,7 +132,15 @@ func (q OPCQuality) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 }
 
 // UnmarshalXML implements xml.Unmarshaler.
+//
+// The element is consumed first, before any attribute is validated, so
+// that a rejected VendorField still leaves the decoder positioned after
+// this element's end tag. ItemValue.UnmarshalXML's own token loop depends
+// on that: it records a bad Quality as one item's condition and carries
+// on with the next item, which it can only do if the stream is where it
+// expects.
 func (q *OPCQuality) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	skipErr := d.Skip()
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "QualityField"}); ok {
 		qf := QualityField(v)
 		q.qualityField = &qf
@@ -148,5 +156,5 @@ func (q *OPCQuality) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 		}
 		q.vendorField = uint8(u)
 	}
-	return d.Skip()
+	return skipErr
 }

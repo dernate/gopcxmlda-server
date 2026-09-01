@@ -91,20 +91,33 @@ Browse(ctx context.Context, req BrowseRequest) (BrowseResult, error)
 ```
 
 `BrowseRequest.ContinuationPoint`/`BrowseResult.ContinuationPoint` are **your own private, opaque cursor** —
-never re-implement continuation-point *filter-consistency* validation yourself. The server wraps your cursor
-with a SHA-256 hash of the request's filter fields (`ItemName`/`ItemPath`/`Filter`/`ElementNameFilter`/
-`VendorFilter`/`MaxElementsReturned`/`ReturnAllProperties`/`ReturnPropertyValues`) before it ever reaches the
-wire, and rejects a continued call whose filters changed with `E_INVALIDCONTINUATIONPOINT` before your
+never re-implement continuation-point *filter-consistency* validation yourself. Before your cursor reaches
+the wire the server wraps it as
+
+```
+<hex HMAC-SHA256>:<expiry unix seconds>:<your cursor>
+```
+
+where the MAC is keyed with a 32-byte random key generated per `server.Handler` and covers the expiry, the
+cursor, and a SHA-256 digest of the request's filter fields (`ItemName`/`ItemPath`/`Filter`/
+`ElementNameFilter`/`VendorFilter`/`ReturnAllProperties`/`ReturnPropertyValues`/`PropertyNames`). A continued
+call whose filters changed, whose token this process did not issue, or whose token has outlived
+`Config.ContinuationPointTTL` (default 10 minutes) is rejected with `E_INVALIDCONTINUATIONPOINT` before your
 `Browse` is even called (see `server/continuation.go`). You only ever see your own cursor half, exactly as
-you issued it — **but that cursor half itself is not authenticated.** The filter hash is unkeyed (there is
-no server secret in it) and only checks that the *filters* match the current request; it says nothing about
-whether the cursor text was ever actually issued by your `Browse` implementation. A client can construct its
-own filter hash (trivial, since it controls every field that goes into it) and pair it with an arbitrary
-cursor string of its choosing, and the server will pass that cursor straight through to your `Browse` call
-as `ContinuationPoint`, looking exactly like a token you issued yourself. If your own cursor format could
-misbehave on unexpected input (e.g. it's an index/offset you'd blindly trust, or a value you'd use to index
-into a slice), validate it defensively on your side — do not assume "the server validated this continuation
-point" covers anything beyond filter consistency.
+you issued it.
+
+`MaxElementsReturned` is deliberately **not** part of the digest: a continuation point denotes a position in
+the result set, not a page size, so a client may legitimately change its page size between calls.
+
+**The MAC is an authenticity guarantee, not a validity one — keep validating the cursor.** It tells you the
+cursor is one *this* server process handed out, for *these* filters, recently. It does not tell you the
+cursor still makes sense: a token can be replayed any number of times inside its TTL, and your address space
+may have changed underneath it in the meantime. So if your cursor format could misbehave on unexpected input
+(an index or offset you would otherwise trust, a slice index, a key, a path), range-check and
+existence-check it on your side and return an error or an empty page rather than dereferencing it blindly.
+Because the key is per-process and never persisted, tokens also stop working across a restart or between
+instances — which is correct, since a cursor is only meaningful to the live backend that issued it, and
+clients must already handle `E_INVALIDCONTINUATIONPOINT` by restarting the browse.
 
 A `BrowseElement` with `Ref == nil` is a non-actionable "hint" node (`IsItem` true but no addressable
 identity) — set it only if your address space genuinely has such nodes; most backends never need to.

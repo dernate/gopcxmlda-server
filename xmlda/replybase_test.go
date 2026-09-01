@@ -1,6 +1,7 @@
 package xmlda
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,5 +58,42 @@ func TestRequiresFault(t *testing.T) {
 		if fault && code != ErrServerState {
 			t.Fatalf("RequiresFault(%q, %q): got code %v, want ErrServerState", tc.op, tc.state, code)
 		}
+	}
+}
+
+// --- wire timestamps are UTC with millisecond precision ---
+
+// TestWireTime_IsUTCMilliseconds pins the fix for timestamps having gone
+// out via time.RFC3339Nano, which emits the server process's local offset
+// and a variable-length fractional part. Both are legal xsd:dateTime, but
+// the real captured traffic is UTC with milliseconds, and a client that
+// subtracts timestamps without applying the offset reads a server in a
+// non-UTC zone as hours off.
+func TestWireTime_IsUTCMilliseconds(t *testing.T) {
+	berlin := time.FixedZone("CEST", 2*60*60)
+	ts := time.Date(2026, 3, 4, 11, 30, 0, 123456789, berlin)
+
+	if got, want := formatWireTime(ts), "2026-03-04T09:30:00.123Z"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+
+	// The same form reaches the wire through ReplyBase and ItemValue.
+	out, err := xmlMarshalNamed(t, "Result", ReplyBase{
+		RcvTime: ts, ReplyTime: ts, ServerState: ServerStateRunning,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `RcvTime="2026-03-04T09:30:00.123Z"`) {
+		t.Fatalf("ReplyBase did not emit a UTC millisecond timestamp: %s", out)
+	}
+
+	iv := ItemValue{ItemName: "A", Timestamp: &ts, Quality: qualityPtr(NewGoodQuality())}
+	out, err = xmlMarshalNamed(t, "Items", iv)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `Timestamp="2026-03-04T09:30:00.123Z"`) {
+		t.Fatalf("ItemValue did not emit a UTC millisecond timestamp: %s", out)
 	}
 }

@@ -260,3 +260,169 @@ func TestCancel_Idempotent(t *testing.T) {
 		t.Fatalf("expected 0 active subscriptions after cancel, got %d", m.count())
 	}
 }
+
+// TestCreate_BackendRevisesSamplingRate pins the fix for
+// RevisedSamplingRate always echoing the requested rate. A backend with a
+// fixed scan cycle can now say so, and the item reports
+// S_UNSUPPORTEDRATE — the specification's own signal for "you asked for a
+// rate I cannot do; here is the one you get" (§3.5.2) — while staying
+// subscribed, since it is a success code.
+func TestCreate_BackendRevisesSamplingRate(t *testing.T) {
+	r := &rateReviser{fakeReader: newFakeReader(), fixedRate: time.Second}
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	fake := clocktest.New(testEpoch)
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{
+			Ref:                   backend.ItemRef{ItemName: "A"},
+			RequestedSamplingRate: 50 * time.Millisecond,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if r.Calls() != 1 {
+		t.Errorf("ReviseSamplingRates was called %d times, want exactly 1 (one batch call)", r.Calls())
+	}
+	if len(res.Items) != 1 {
+		t.Fatalf("got %d item results, want 1", len(res.Items))
+	}
+	it := res.Items[0]
+	if it.RevisedSamplingRate != time.Second {
+		t.Errorf("RevisedSamplingRate = %v, want 1s — the backend's answer was ignored", it.RevisedSamplingRate)
+	}
+	if it.ResultID != xmlda.SuccessUnsupportedRate {
+		t.Errorf("ResultID = %v, want S_UNSUPPORTEDRATE", it.ResultID)
+	}
+	if res.Handle == "" {
+		t.Error("no subscription was created; S_UNSUPPORTEDRATE is a success code and must not exclude the item")
+	}
+	// The engine must actually poll at the revised rate, not the requested
+	// one — otherwise the code is a label with no behavior behind it.
+	m.mu.RLock()
+	s := m.subs[res.Handle]
+	m.mu.RUnlock()
+	if got := s.items[0].revisedSamplingRate; got != time.Second {
+		t.Errorf("the item is scheduled at %v, not the revised 1s", got)
+	}
+}
+
+// TestCreate_RateUnchangedReportsNoCondition pins that a backend agreeing
+// with the requested rate produces no result code at all — S_UNSUPPORTED
+// RATE on every item would make the code meaningless.
+func TestCreate_RateUnchangedReportsNoCondition(t *testing.T) {
+	r := &rateReviser{fakeReader: newFakeReader(), fixedRate: 250 * time.Millisecond}
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	fake := clocktest.New(testEpoch)
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{
+			Ref:                   backend.ItemRef{ItemName: "A"},
+			RequestedSamplingRate: 250 * time.Millisecond,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := res.Items[0].ResultID; !got.IsZero() {
+		t.Errorf("ResultID = %v, want none: the backend granted exactly what was asked", got)
+	}
+}
+
+// TestCreate_RateRevisionFailureHonorsRequest pins the fallbacks: a
+// reviser that errors, or that answers with the wrong number of rates, is
+// a reason to serve the subscription at the rate the client named — not a
+// reason to refuse it.
+func TestCreate_RateRevisionFailureHonorsRequest(t *testing.T) {
+	for name, r := range map[string]*rateReviser{
+		"error":       {fakeReader: newFakeReader(), err: errors.New("device offline")},
+		"wrong count": {fakeReader: newFakeReader(), fixedRate: time.Second, shortBy: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+			fake := clocktest.New(testEpoch)
+			m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+			defer shutdownManager(t, m)
+
+			res, err := m.Create(context.Background(), CreateRequest{
+				Items: []CreateItemRequest{{
+					Ref:                   backend.ItemRef{ItemName: "A"},
+					RequestedSamplingRate: 300 * time.Millisecond,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Create failed instead of falling back: %v", err)
+			}
+			if res.Handle == "" {
+				t.Fatal("no subscription was created")
+			}
+			it := res.Items[0]
+			if it.RevisedSamplingRate != 300*time.Millisecond {
+				t.Errorf("RevisedSamplingRate = %v, want the requested 300ms", it.RevisedSamplingRate)
+			}
+			if !it.ResultID.IsZero() {
+				t.Errorf("ResultID = %v, want none", it.ResultID)
+			}
+		})
+	}
+}
+
+// TestCreate_SuccessCodeItemIsStillSubscribed pins a smaller correctness
+// fix in the same area: an initial read that came back with a
+// success-with-caveat code (S_CLAMP) describes a readable item, so it must
+// be subscribed. The old `res.ResultID.IsZero()` gate silently dropped
+// items the backend had explicitly called usable.
+func TestCreate_SuccessCodeItemIsStillSubscribed(t *testing.T) {
+	r := &clampReader{fakeReader: newFakeReader()}
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	fake := clocktest.New(testEpoch)
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items:               []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+		ReturnValuesOnReply: true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Handle == "" {
+		t.Fatal("an S_CLAMP item was not subscribed")
+	}
+	if got := res.Items[0].ResultID; got != xmlda.SuccessClamp {
+		t.Errorf("ResultID = %v, want S_CLAMP preserved", got)
+	}
+	if !res.Items[0].HaveSample {
+		t.Error("the item's value was dropped despite a success code")
+	}
+}
+
+// --- the server-wide item budget ---
+
+func TestCreate_TotalItemBudget(t *testing.T) {
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: fixReader{}}, nil, nil, nil,
+		Config{ReapInterval: time.Hour, DefaultSamplingRate: time.Hour, MaxTotalSubscribedItems: 3})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	two := []CreateItemRequest{
+		{Ref: backend.ItemRef{ItemName: "A"}},
+		{Ref: backend.ItemRef{ItemName: "B"}},
+	}
+	if _, err := m.Create(context.Background(), CreateRequest{Items: two}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	if _, err := m.Create(context.Background(), CreateRequest{Items: two}); !errors.Is(err, ErrTooManyItems) {
+		t.Fatalf("got %v, want ErrTooManyItems once the budget would be exceeded", err)
+	}
+	// A subscription that still fits is accepted.
+	if _, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "C"}}},
+	}); err != nil {
+		t.Fatalf("a subscription within the remaining budget was rejected: %v", err)
+	}
+}

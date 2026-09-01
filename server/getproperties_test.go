@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"testing"
 
@@ -196,5 +197,91 @@ func TestHandleGetProperties_NotSupportedWithoutPropertyReader(t *testing.T) {
 	f := decodeFault(t, resp)
 	if f == nil || f.Code.Local != "E_NOTSUPPORTED" {
 		t.Fatalf("got %+v, want E_NOTSUPPORTED", f)
+	}
+}
+
+// TestHandleGetProperties_ValuelessPropertyDoesNotFailWholeResponse pins the
+// fix for the defect where a single property without a value turned the
+// entire GetProperties response into an E_FAIL SOAP fault: toItemProperty
+// attached the zero Value unconditionally whenever ReturnPropertyValues
+// was set, and a zero Value has no declared type, so the encode failed
+// and writeResponse fell back to a blanket fault — discarding every other
+// item's data over one missing property value.
+func TestHandleGetProperties_ValuelessPropertyDoesNotFailWholeResponse(t *testing.T) {
+	be, _, _ := newMinimalBackend()
+	be.Properties = valuelessProperties{}
+	h := newTestHandler(t, be, Config{}, nil)
+
+	resp := postSOAP(t, h, soapEnvelopeOpen+
+		`<GetProperties xmlns="`+xmlda.Namespace+`" ReturnAllProperties="true" ReturnPropertyValues="true">`+
+		`<ItemIDs ItemName="Item1"/></GetProperties>`+soapEnvelopeClose)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got HTTP %d, want 200 — a valueless property must not fault the whole operation.\n%s",
+			resp.StatusCode, body)
+	}
+	got := decodeResponse[xmlda.GetPropertiesResponse](t, resp)
+	if len(got.PropertyLists) != 1 {
+		t.Fatalf("got %d property lists, want 1", len(got.PropertyLists))
+	}
+	props := got.PropertyLists[0].Properties
+	if len(props) != 2 {
+		t.Fatalf("got %d properties, want both the readable one and the failing one: %+v", len(props), props)
+	}
+	// The readable property keeps its value; the failing one reports its
+	// condition and simply carries no Value element.
+	var readable, failing *xmlda.ItemProperty
+	for i := range props {
+		switch props[i].Name.Local {
+		case "description":
+			readable = &props[i]
+		case "highEU":
+			failing = &props[i]
+		}
+	}
+	if readable == nil || readable.Value == nil {
+		t.Fatalf("the readable property lost its value: %+v", props)
+	}
+	if failing == nil {
+		t.Fatalf("the failing property vanished from the response: %+v", props)
+	}
+	if failing.Value != nil {
+		t.Errorf("the failing property carries a Value element: %+v", failing.Value)
+	}
+	if failing.ResultID != xmlda.ErrInvalidPID {
+		t.Errorf("got ResultID %+v, want E_INVALIDPID", failing.ResultID)
+	}
+}
+
+// --- the request-level ItemPath is echoed back ---
+
+// TestHandleGetProperties_EchoesRequestLevelItemPath pins the fix for
+// PropertyReplyList having echoed only a per-item ItemPath. A client that
+// set the path once for the whole request (§3.1.1's hierarchical
+// parameters, which the server already honored when resolving the item)
+// got its items back unqualified.
+func TestHandleGetProperties_EchoesRequestLevelItemPath(t *testing.T) {
+	be, _, _ := newMinimalBackend()
+	be.Properties = &testProperties{props: map[backend.ItemRef][]backend.Property{
+		{ItemPath: "Plant/Line1", ItemName: "Item1"}: {
+			{ID: xmlda.PropDescription, Value: xmlda.NewString("d")},
+		},
+	}}
+	h := newTestHandler(t, be, Config{}, nil)
+
+	got := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, soapEnvelopeOpen+
+		`<GetProperties xmlns="`+xmlda.Namespace+`" ItemPath="Plant/Line1" ReturnAllProperties="true">`+
+		`<ItemIDs ItemName="Item1"/></GetProperties>`+soapEnvelopeClose))
+
+	if len(got.PropertyLists) != 1 {
+		t.Fatalf("got %d property lists, want 1", len(got.PropertyLists))
+	}
+	l := got.PropertyLists[0]
+	if !l.ResultID.IsZero() {
+		t.Fatalf("item not resolved: %+v — the request-level ItemPath was not applied", l.ResultID)
+	}
+	if l.ItemPath == nil || *l.ItemPath != "Plant/Line1" {
+		t.Fatalf("got ItemPath %v, want the request-level Plant/Line1 echoed back", l.ItemPath)
 	}
 }

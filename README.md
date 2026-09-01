@@ -13,9 +13,10 @@ your own process data by implementing a handful of small interfaces (see
 
 This library implements the 8 OPC XML-DA 1.0 operations (`GetStatus`, `Read`, `Write`, `Subscribe`,
 `SubscriptionPolledRefresh`, `SubscriptionCancel`, `Browse`, `GetProperties`) against the specification in
-`docs/OPCDataAccessXMLSpecification.pdf`, backed by 68 tracked requirements and ~150 tests (unit, golden-file,
-round-trip, HTTP-handler, subscription-lifecycle, and two real-concurrency stress tests), all clean under
-`go test -race ./...`. It has **not** been run against an official OPC Foundation conformance test suite,
+`docs/OPCDataAccessXMLSpecification.pdf`, backed by 68 tracked requirements and 450+ tests (unit, golden-file,
+round-trip, HTTP-handler, subscription-lifecycle, and real-concurrency stress tests), all clean under
+`go test -race ./...`, plus two separate integration modules that drive the server over real HTTP — one
+in-process, one against a real Docker container. It has **not** been run against an official OPC Foundation conformance test suite,
 and does not claim full conformance — see [`docs/protocol-support.md`](docs/protocol-support.md) for the
 precise, per-operation status and [`docs/limitations.md`](docs/limitations.md) for remaining known gaps.
 
@@ -107,8 +108,19 @@ See [`docs/interoperability.md`](docs/interoperability.md) for what this surface
 this server (an `xsi:type` attribute-ordering issue, safe to fix since XML attribute order carries no
 semantic meaning) and two client-side-only quirks that aren't fixable from this server's side.
 
-**This module is intentionally excluded from `go test ./...` and from this repository's own CI/verification
-run** (that's the whole point of it being a separate `go.mod`), so it will *not* catch a future wire-format
-regression on its own — someone has to actually run it. Run it manually whenever changing anything in
-`xmlda`/`soap` (encoding, namespace handling, fault shape) and before cutting a release; it has already
-caught one real bug that no fixture-based test in the main module would have (see above).
+[`test/dockerintegration/`](test/dockerintegration/) goes one step further: it builds the server into a real
+Docker image from a four-level nested address space and drives the same client against a running container,
+which is the only place the **shipped `server.Config{}` defaults** are exercised end to end. It also carries
+a soak test that keeps the container under concurrent load for a sustained window (`DOCKERINTEGRATION_SOAK`,
+default 30s; skipped by `-short`).
+
+```sh
+cd test/dockerintegration
+go test ./...           # requires a working Docker daemon; skipped if none is reachable
+```
+
+**Both modules are excluded from the root `go test ./...`** (that's the whole point of the separate
+`go.mod` files — the Docker-daemon and client dependencies stay out of the base library), but both **do**
+run in CI as their own jobs. Run them locally whenever changing anything in `xmlda`/`soap` (encoding,
+namespace handling, fault shape) and before cutting a release; the client module has already caught one
+real bug that no fixture-based test in the main module would have (see above).

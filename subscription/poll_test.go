@@ -216,3 +216,125 @@ func TestPollOnce_SingleRate_Unaffected(t *testing.T) {
 		t.Fatalf("got %d reads over 5s at a 1s rate, want close to 5", c1)
 	}
 }
+
+// --- the deadband reference point is the last REPORTED value ---
+
+// TestApplyUpdate_DeadbandReferenceIsLastReportedValue pins the fix for
+// it.last having been advanced even when the change was suppressed.
+//
+// That turned the deadband into a rate-of-change filter: each reading was
+// compared against the immediately preceding one rather than against the
+// last value the client was actually told about, so a value drifting by
+// just under the band on every poll could travel arbitrarily far without
+// ever producing a notification.
+func TestApplyUpdate_DeadbandReferenceIsLastReportedValue(t *testing.T) {
+	it := &itemState{
+		deadband: 10, // 10%
+		haveLast: true,
+		last:     backend.ItemSample{Value: xmlda.NewFloat64(100), Quality: xmlda.NewGoodQuality()},
+	}
+
+	// Each step is under 10% of the previous reading, so no single step
+	// crosses the band on its own — but the value walks away from 100.
+	steps := []float64{105, 110, 115, 120}
+	reported := 0
+	for _, v := range steps {
+		if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(v), Quality: xmlda.NewGoodQuality()},
+			xmlda.ErrorCode{}, 100, nil) {
+			reported++
+		}
+	}
+	if reported == 0 {
+		t.Fatalf("a drift from 100 to %v with a 10%% deadband produced no notification at all — "+
+			"the reference point is walking with the readings", steps[len(steps)-1])
+	}
+
+	// And the reference point that did get adopted is a value actually
+	// reported, not the latest reading.
+	last, _ := it.last.Value.Float64()
+	if last != 110 {
+		t.Errorf("last reported reference is %v, want 110 (the first reading that crossed the band from 100)", last)
+	}
+}
+
+// TestApplyUpdate_DeadbandStillSuppressesSmallChanges confirms the fix
+// did not simply disable the deadband.
+func TestApplyUpdate_DeadbandStillSuppressesSmallChanges(t *testing.T) {
+	it := &itemState{
+		deadband: 10,
+		haveLast: true,
+		last:     backend.ItemSample{Value: xmlda.NewFloat64(100), Quality: xmlda.NewGoodQuality()},
+	}
+	for _, v := range []float64{101, 102, 103} {
+		if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(v), Quality: xmlda.NewGoodQuality()},
+			xmlda.ErrorCode{}, 100, nil) {
+			t.Fatalf("%v is within 10%% of the reported 100 but was notified", v)
+		}
+	}
+}
+
+// TestApplyUpdate_NoDeadbandUnchanged confirms the change is behaviorally
+// neutral when no deadband is configured — the common case.
+func TestApplyUpdate_NoDeadbandUnchanged(t *testing.T) {
+	it := &itemState{
+		haveLast: true,
+		last:     backend.ItemSample{Value: xmlda.NewFloat64(1), Quality: xmlda.NewGoodQuality()},
+	}
+	if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(1), Quality: xmlda.NewGoodQuality()},
+		xmlda.ErrorCode{}, 100, nil) {
+		t.Error("an identical value was reported as a change")
+	}
+	if !applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(2), Quality: xmlda.NewGoodQuality()},
+		xmlda.ErrorCode{}, 100, nil) {
+		t.Error("a different value was not reported as a change")
+	}
+	v, _ := it.last.Value.Float64()
+	if v != 2 {
+		t.Errorf("last is %v, want the newly reported 2", v)
+	}
+}
+
+// --- the poll chain does not drift ---
+
+// TestSchedulePoll_DoesNotDriftWithSlowBackend pins the fix for the poll
+// chain having rescheduled "one full interval from now" *after* the poll
+// completed. The effective period was then rate + backend duration +
+// semaphore wait, so every item was sampled slower than the
+// RevisedSamplingRate the client had been promised — and a backend slower
+// than the interval drifted without bound.
+//
+// The clock is driven with Set to ABSOLUTE points on the ideal sampling
+// grid, not with relative Advance steps. That distinction is the whole
+// test: the slow backend moves the fake clock forward itself, so relative
+// steps ride along with the drift and count five ticks either way. On a
+// fixed grid the drifting scheduler visibly misses every second one.
+func TestSchedulePoll_DoesNotDriftWithSlowBackend(t *testing.T) {
+	const rate = 100 * time.Millisecond
+	clk := clocktest.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	slow := &slowReader{clk: clk, cost: 60 * time.Millisecond}
+
+	m := NewManager(
+		backend.Backend{Status: fixStatus{}, Reader: slow}, clk, nil, nil,
+		Config{ReapInterval: time.Hour, DefaultSamplingRate: rate})
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+
+	if _, err := m.Create(context.Background(), CreateRequest{
+		Items:                []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+		SubscriptionPingRate: time.Hour,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Create's own validity read already moved the clock; the poll chain
+	// was armed relative to where it left off.
+	base := clk.Now()
+	slow.reset()
+
+	const ticks = 5
+	for i := 1; i <= ticks; i++ {
+		clk.Set(base.Add(time.Duration(i) * rate))
+	}
+	if got := slow.count(); got != ticks {
+		t.Fatalf("got %d polls across %d sampling intervals, want %d — "+
+			"the chain is drifting by the backend's own duration", got, ticks, ticks)
+	}
+}

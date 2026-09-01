@@ -13,7 +13,7 @@ func TestWriteRequest_RoundTrip(t *testing.T) {
 		ItemList: WriteItemList{
 			Items: []ItemValue{
 				{ItemName: "Item1", ClientItemHandle: "CIH1", Value: &v1},
-				{ItemName: "Item2", ClientItemHandle: "CIH2", Value: &v2, Quality: NewGoodQuality()},
+				{ItemName: "Item2", ClientItemHandle: "CIH2", Value: &v2, Quality: qualityPtr(NewGoodQuality())},
 			},
 		},
 	}
@@ -95,7 +95,7 @@ func TestWriteRequest_AtomicQualityAndTimestamp(t *testing.T) {
 	item := ItemValue{
 		ItemName: "x",
 		Value:    &v,
-		Quality:  NewQuality(QualityGood, LimitNone, 0),
+		Quality:  qualityPtr(NewQuality(QualityGood, LimitNone, 0)),
 	}
 	req := WriteRequest{ItemList: WriteItemList{Items: []ItemValue{item}}}
 	out, err := xmlMarshalNamed(t, "Write", req)
@@ -115,5 +115,52 @@ func TestWriteRequest_AtomicQualityAndTimestamp(t *testing.T) {
 	}
 	if !got.ItemList.Items[0].Quality.IsGood() {
 		t.Fatalf("expected good quality to survive round-trip")
+	}
+}
+
+// TestWriteRequest_MalformedValueIsPerItem pins the content half: a
+// <Value> whose literal contradicts its declared xsi:type, or that
+// declares none, is E_BADTYPE for that item — with the items after it
+// still decoded. This is the case that needed Value.UnmarshalXML to
+// consume its element on every path.
+func TestWriteRequest_MalformedValueIsPerItem(t *testing.T) {
+	doc := `<Write xmlns="` + Namespace + `" xmlns:xsi="` + XSINamespace + `" xmlns:xsd="` + XSDNamespace + `">` +
+		`<Options/><ItemList>` +
+		`<Items ItemName="ok1"><Value xsi:type="xsd:int">1</Value></Items>` +
+		`<Items ItemName="notanint"><Value xsi:type="xsd:int">not-an-int</Value></Items>` +
+		`<Items ItemName="notype"><Value>7</Value></Items>` +
+		`<Items ItemName="badarray"><Value xsi:type="opc:ArrayOfInt" xmlns:opc="` + Namespace + `"><int>1</int><int>x</int></Value></Items>` +
+		`<Items ItemName="ok2"><Value xsi:type="xsd:int">2</Value></Items>` +
+		`</ItemList></Write>`
+	var req WriteRequest
+	if err := Decode([]byte(doc), &req); err != nil {
+		t.Fatalf("one malformed <Value> still fails the whole Write: %v", err)
+	}
+	items := req.ItemList.Items
+	if len(items) != 5 {
+		t.Fatalf("got %d items, want 5 — every item must keep its slot", len(items))
+	}
+	for _, i := range []int{0, 4} {
+		if items[i].DecodeErr != nil {
+			t.Errorf("item %d (%q) was wrongly rejected: %v", i, items[i].ItemName, items[i].DecodeErr)
+		}
+		if items[i].Value == nil {
+			t.Errorf("item %d (%q) lost its Value", i, items[i].ItemName)
+		}
+	}
+	for _, i := range []int{1, 2, 3} {
+		if items[i].DecodeErr == nil {
+			t.Errorf("item %d (%q) should carry a DecodeErr", i, items[i].ItemName)
+			continue
+		}
+		if got := ItemResultIDFor(items[i].DecodeErr); got != ErrBadType {
+			t.Errorf("item %d: ItemResultIDFor = %v, want E_BADTYPE", i, got)
+		}
+	}
+	// The last item's name proves the stream stayed in sync all the way
+	// past a failing array, which is the hardest case: decodeScalarArray
+	// stops mid-element list.
+	if items[4].ItemName != "ok2" {
+		t.Errorf("items[4].ItemName = %q, want ok2 — the token stream desynchronized", items[4].ItemName)
 	}
 }

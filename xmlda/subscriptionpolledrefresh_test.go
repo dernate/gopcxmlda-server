@@ -267,3 +267,39 @@ func TestSubscriptionPolledRefreshResponse_RealFixture(t *testing.T) {
 		}
 	}
 }
+
+// TestSubscriptionPolledRefresh_HoldTimeWithoutOffset is the one that
+// mattered most: HoldTime is how long-polling is expressed, so a client
+// that omits the (optional) offset could not poll its subscription at all
+// — the whole request faulted before any handle was even looked at.
+func TestSubscriptionPolledRefresh_HoldTimeWithoutOffset(t *testing.T) {
+	doc := `<Envelope><Body>` +
+		`<SubscriptionPolledRefresh xmlns="` + Namespace + `" HoldTime="2026-08-30T12:00:00" WaitTime="500" ReturnAllItems="false">` +
+		`<Options ClientRequestHandle="CRH"/><ServerSubHandles>H1</ServerSubHandles>` +
+		`</SubscriptionPolledRefresh></Body></Envelope>`
+
+	var env struct {
+		Body struct {
+			Req SubscriptionPolledRefreshRequest `xml:"SubscriptionPolledRefresh"`
+		} `xml:"Body"`
+	}
+	if err := Decode([]byte(doc), &env); err != nil {
+		t.Fatalf("an offsetless HoldTime still fails the whole request: %v", err)
+	}
+	req := env.Body.Req
+	if req.HoldTime == nil {
+		t.Fatal("HoldTime was dropped")
+	}
+	if want := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC); !req.HoldTime.Equal(want) {
+		t.Errorf("HoldTime = %v, want %v", req.HoldTime, want)
+	}
+	if req.WaitTime != 500 {
+		t.Errorf("WaitTime = %d, want 500", req.WaitTime)
+	}
+	if len(req.ServerSubHandles) != 1 || req.ServerSubHandles[0] != "H1" {
+		t.Errorf("ServerSubHandles = %v", req.ServerSubHandles)
+	}
+	if req.Options.ClientRequestHandle != "CRH" {
+		t.Errorf("Options were dropped: %+v", req.Options)
+	}
+}

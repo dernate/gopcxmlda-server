@@ -522,11 +522,11 @@ func TestNoDuplicateAttributes(t *testing.T) {
 	}{
 		// xsi:type (opc) + ResultID (opc): the shape that shipped broken.
 		{"itemvalue_with_resultid", xmlda.ItemValue{
-			ItemName: "A", ResultID: xmlda.ErrUnknownItemName, Quality: xmlda.NewGoodQuality(),
+			ItemName: "A", ResultID: xmlda.ErrUnknownItemName, Quality: ptr(xmlda.NewGoodQuality()),
 		}},
 		{"itemvalue_full", xmlda.ItemValue{
 			ItemName: "A", ItemPath: strPtr("Path"), ClientItemHandle: "H",
-			Value: &arr, Quality: xmlda.NewQuality(xmlda.QualityUncertain, xmlda.LimitHigh, 3),
+			Value: &arr, Quality: ptr(xmlda.NewQuality(xmlda.QualityUncertain, xmlda.LimitHigh, 3)),
 			Timestamp: &ts, ResultID: xmlda.SuccessClamp, DiagnosticInfo: "diag",
 		}},
 		// Name (opc) + ResultID (opc).
@@ -561,7 +561,7 @@ func TestNoDuplicateAttributes(t *testing.T) {
 		// vendor code: two namespaces, two distinct conventional prefixes,
 		// so no renaming should occur.
 		{"itemvalue_vendor_resultid", xmlda.ItemValue{
-			ItemName: "A", Quality: xmlda.NewGoodQuality(),
+			ItemName: "A", Quality: ptr(xmlda.NewGoodQuality()),
 			ResultID: xmlda.ErrorCode{QName: xmlda.QName{Space: "http://vendor-a.example/codes", Local: "E_VENDOR"}},
 		}},
 		{"itemproperty_with_value", xmlda.ItemProperty{
@@ -585,7 +585,7 @@ func TestNoDuplicateAttributes(t *testing.T) {
 		{"subscribe_item_value", xmlda.SubscribeItemValue{
 			RevisedSamplingRate: 1000,
 			ItemValue: xmlda.ItemValue{
-				ItemName: "A", ResultID: xmlda.SuccessUnsupportedRate, Quality: xmlda.NewGoodQuality(),
+				ItemName: "A", ResultID: xmlda.SuccessUnsupportedRate, Quality: ptr(xmlda.NewGoodQuality()),
 			},
 		}},
 		{"property_reply_list", xmlda.PropertyReplyList{

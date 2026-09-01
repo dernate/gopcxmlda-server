@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/clock"
@@ -259,5 +261,115 @@ func TestServeHTTP_ServerStateSuspended_AllowsBrowse(t *testing.T) {
 		if f != nil && f.Code.Local == "E_SERVERSTATE" {
 			t.Fatalf("Browse must not be rejected by ServerState=suspended")
 		}
+	}
+}
+
+// --- in-flight requests are bounded ---
+
+// TestServeHTTP_MaxConcurrentRequests_ExcessIsBusyFault pins the admission control. Every other limit
+// is per request or per subscription; none bounded concurrency, and a
+// SubscriptionPolledRefresh legitimately holds its handler goroutine, its
+// connection and its response buffer for up to MaxPolledRefreshWait.
+func TestServeHTTP_MaxConcurrentRequests_ExcessIsBusyFault(t *testing.T) {
+	st := newTestStatus()
+	r := newTestReader()
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+
+	release := make(chan struct{})
+	blocking := &blockingStatus{testStatus: st, gate: release}
+
+	h := newTestHandler(t, backend.Backend{Status: blocking, Reader: r},
+		Config{MaxConcurrentRequests: 1, StatusCacheTTL: -1}, clock.Real{})
+
+	// Occupy the single slot with a request parked inside the backend.
+	inFlight := make(chan *http.Response, 1)
+	go func() { inFlight <- doPostSOAP(h, readRequestBody([]string{"A"})) }()
+
+	if !blocking.WaitEntered(2 * time.Second) {
+		t.Fatal("the first request never reached the backend")
+	}
+
+	// The second must be refused rather than queued.
+	resp := doPostSOAP(h, readRequestBody([]string{"A"}))
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("got status %d, want 500 with an E_BUSY fault", resp.StatusCode)
+	}
+	if f := decodeFault(t, resp); f == nil || f.Code.Local != "E_BUSY" {
+		t.Errorf("got %+v, want E_BUSY", f)
+	}
+
+	close(release)
+	select {
+	case first := <-inFlight:
+		if first.StatusCode != http.StatusOK {
+			t.Errorf("the admitted request failed with status %d", first.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the admitted request never completed")
+	}
+
+	// The slot is returned, so the next request is admitted again.
+	if got := doPostSOAP(h, readRequestBody([]string{"A"})).StatusCode; got != http.StatusOK {
+		t.Errorf("got status %d after the slot was released, want 200", got)
+	}
+}
+
+// --- the server-state fault matrix is a policy, not a constant ---
+
+// TestServeHTTP_RequiresFaultHook pins the policy hook. xmlda.RequiresFault encodes a
+// defensible but not obligatory reading of §2.6 — it lets
+// SubscriptionPolledRefresh through under "suspended" and treats
+// "commFault" as fully operational — and an operator who wants writes
+// blocked while the data source is unreachable had no way to say so
+// without forking the library.
+func TestServeHTTP_RequiresFaultHook(t *testing.T) {
+	be, st, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+
+	var mu sync.Mutex
+	var seen []string
+	cfg := Config{
+		StatusCacheTTL: -1,
+		RequiresFault: func(op string, state xmlda.ServerState) (bool, xmlda.ErrorCode) {
+			mu.Lock()
+			seen = append(seen, op+"/"+string(state))
+			mu.Unlock()
+			// The policy the default declines to impose: no writes while
+			// the data source is unreachable.
+			if state == xmlda.ServerStateCommFault && op == "Write" {
+				return true, xmlda.ErrServerState
+			}
+			return false, xmlda.ErrorCode{}
+		},
+	}
+	h := newTestHandler(t, be, cfg, clock.Real{})
+
+	st.SetState(xmlda.ServerStateCommFault)
+
+	// Read still passes, per the custom policy.
+	if got := postSOAP(t, h, readRequestBody([]string{"A"})).StatusCode; got != http.StatusOK {
+		t.Errorf("Read got status %d, want 200 under the custom policy", got)
+	}
+	// Write is refused, which the default would have allowed.
+	resp := postSOAP(t, h, writeRequestBody("A", "int", "5", false))
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("Write got status %d, want 500", resp.StatusCode)
+	}
+	if f := decodeFault(t, resp); f == nil || f.Code.Local != "E_SERVERSTATE" {
+		t.Fatalf("got %+v, want E_SERVERSTATE", f)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), seen...)
+	mu.Unlock()
+	if len(got) < 2 {
+		t.Errorf("the hook was consulted %d times, want once per request: %v", len(got), got)
+	}
+
+	// And the default is still the library's own reading when no hook is
+	// supplied: commFault does NOT block a Write.
+	plain := newTestHandler(t, be, Config{StatusCacheTTL: -1}, clock.Real{})
+	if got := postSOAP(t, plain, writeRequestBody("A", "int", "5", false)).StatusCode; got != http.StatusOK {
+		t.Errorf("without a hook, Write under commFault got status %d, want 200 (the documented default)", got)
 	}
 }

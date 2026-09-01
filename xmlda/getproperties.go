@@ -179,7 +179,7 @@ func (l *PropertyReplyList) UnmarshalXML(d *xml.Decoder, start xml.StartElement)
 	l.Properties = shadow.Properties
 
 	if hasResult {
-		rid, err := resolveQName(d, resultRaw)
+		rid, err := resolveQNameIn(d, start.Attr, resultRaw)
 		if err != nil {
 			return err
 		}

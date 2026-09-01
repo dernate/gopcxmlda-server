@@ -157,7 +157,7 @@ func (m *Manager) handlePushEvent(s *subState, ev backend.ChangeEvent, byRef map
 	}
 	changed := false
 	for _, it := range its {
-		if applyUpdate(it, ev.Sample, resultID, m.cfg.MaxBufferedSamplesPerItem) {
+		if applyUpdate(it, ev.Sample, resultID, m.cfg.MaxBufferedSamplesPerItem, m.budget) {
 			changed = true
 		}
 	}

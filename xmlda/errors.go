@@ -2,6 +2,7 @@ package xmlda
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -156,11 +157,78 @@ func (e *OPCError) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	if err := d.DecodeElement(&shadow, &start); err != nil {
 		return fmt.Errorf("xmlda: decoding <Errors ID=%q>: %w", idRaw, err)
 	}
-	id, err := resolveQName(d, idRaw)
+	id, err := resolveQNameIn(d, start.Attr, idRaw)
 	if err != nil {
 		return err
 	}
 	e.ID = ErrorCode{id}
 	e.Text = shadow.Text
 	return nil
+}
+
+// ItemDecodeError reports that one request item could not be interpreted:
+// a malformed attribute value (MaxAge, Deadband, RequestedSamplingRate,
+// EnableBuffering, Timestamp), an unresolvable ReqType prefix, or a
+// <Value> whose content does not match its declared xsi:type.
+//
+// It is deliberately NOT returned from UnmarshalXML. OPC XML-DA models an
+// item-level problem as that item's own ResultID, with the rest of the
+// request still processed — the whole Errors list (§2.6, §3.1.9) exists
+// for exactly that. Failing the decode instead turns one malformed
+// attribute in a 1000-item batch into a whole-operation fault that
+// reports nothing about any of the other 999 items, and names the bad
+// value without saying which item carried it. So the per-item request
+// types carry one of these in a DecodeErr field and the server layer maps
+// it to Code.
+//
+// Structural XML failures (not well-formed, no SOAP Body, an unknown
+// operation, a malformed list-level attribute that applies to every item
+// at once) remain whole-operation faults: none of them is a condition a
+// single item's ResultID could truthfully describe.
+type ItemDecodeError struct {
+	// Field names the attribute or child element that could not be read,
+	// e.g. "MaxAge" or "Value".
+	Field string
+	// Code is the per-item ResultID this condition maps to.
+	Code ErrorCode
+	// Err is the underlying parse failure.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ItemDecodeError) Error() string {
+	return fmt.Sprintf("xmlda: item %s: %v", e.Field, e.Err)
+}
+
+// Unwrap supports errors.Is/errors.As against the underlying failure.
+func (e *ItemDecodeError) Unwrap() error { return e.Err }
+
+// ItemResultIDFor maps a request item's DecodeErr to the per-item ResultID
+// to report for it. An *ItemDecodeError carrying a code is honored
+// precisely; anything else — including a nil error, which callers should
+// not pass — falls back to E_FAIL.
+func ItemResultIDFor(err error) ErrorCode {
+	var ide *ItemDecodeError
+	if errors.As(err, &ide) && !ide.Code.IsZero() {
+		return ide.Code
+	}
+	return ErrFail
+}
+
+// ItemDiagnosticFor returns per-item DiagnosticInfo text for a decode
+// failure: which field could not be read, and why.
+//
+// This text describes the client's own malformed input, never a server
+// internal, so returning it verbatim is safe and is the only way the
+// client learns WHICH of its items was rejected — the deduplicated Errors
+// entry carries the code but not the item (docs/specification/error-mapping.md).
+func ItemDiagnosticFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ide *ItemDecodeError
+	if errors.As(err, &ide) {
+		return "could not read " + ide.Field + ": " + ide.Err.Error()
+	}
+	return err.Error()
 }

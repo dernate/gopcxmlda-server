@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,17 +134,19 @@ func TestHandlePolledRefresh_ZeroHoldTime_InvalidHoldTimeFault(t *testing.T) {
 	}
 }
 
-// TestHandlePolledRefresh_HoldTimeBeyondMaxWait_InvalidHoldTimeFault
-// reproduces the second checkHoldTime rejection case: a HoldTime further
-// out than Config.MaxPolledRefreshWait is more than this server will ever
-// block for. Rejecting it up front with E_INVALIDHOLDTIME is the honest
-// response — letting it through would only hit the request's own context
-// deadline later and discard the subscription's buffered changes as
-// E_TIMEDOUT instead.
-func TestHandlePolledRefresh_HoldTimeBeyondMaxWait_InvalidHoldTimeFault(t *testing.T) {
+// TestHandlePolledRefresh_HoldTimeBeyondMaxWait_StrictRejects pins the
+// Config.StrictHoldTime opt-in: a HoldTime further out than
+// Config.MaxPolledRefreshWait is more than this server will ever block
+// for, and an operator who would rather say so than silently grant a
+// shorter hold gets E_INVALIDHOLDTIME.
+//
+// This is no longer the DEFAULT — see
+// TestHandlePolledRefresh_HoldTimeBeyondMaxWait_ClampsByDefault below for
+// why clamping is, and what it does instead.
+func TestHandlePolledRefresh_HoldTimeBeyondMaxWait_StrictRejects(t *testing.T) {
 	be, _, reader := newMinimalBackend()
 	reader.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(1))
-	h := newTestHandler(t, be, Config{MaxPolledRefreshWait: time.Minute}, clock.Real{})
+	h := newTestHandler(t, be, Config{MaxPolledRefreshWait: time.Minute, StrictHoldTime: true}, clock.Real{})
 
 	subResp := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, subscribeRequestBody("Item1", "CIH1", false)))
 	handle := subResp.ServerSubHandle
@@ -440,5 +443,261 @@ func TestServer_ShutdownDuringLongPoll(t *testing.T) {
 
 	if err := <-shutdownDone; err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// TestHandleSubscribe_MalformedItemIsPerItemCondition pins the Subscribe
+// path, where the rejected item must also be kept out of the subscription
+// engine while still occupying its reply slot — the reply's item ORDER is
+// how a client without ClientItemHandles matches items up at all.
+func TestHandleSubscribe_MalformedItemIsPerItemCondition(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "ok1"}, xmlda.NewInt32(1))
+	r.Set(backend.ItemRef{ItemName: "ok2"}, xmlda.NewInt32(2))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Subscribe xmlns="` + xmlda.Namespace + `" ReturnValuesOnReply="true">` +
+		`<Options ReturnItemName="true"/><ItemList>` +
+		`<Items ItemName="ok1" ClientItemHandle="H1"/>` +
+		`<Items ItemName="bad" ClientItemHandle="HB" Deadband="not-a-float"/>` +
+		`<Items ItemName="ok2" ClientItemHandle="H2"/>` +
+		`</ItemList></Subscribe>` + soapEnvelopeClose
+
+	resp := postSOAP(t, h, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	out := decodeResponse[xmlda.SubscribeResponse](t, resp)
+	if out.ServerSubHandle == "" {
+		t.Fatal("no subscription was created despite two valid items")
+	}
+	if len(out.RItemList.Items) != 3 {
+		t.Fatalf("got %d reply items, want 3 in request order", len(out.RItemList.Items))
+	}
+	got := []string{
+		out.RItemList.Items[0].ItemValue.ClientItemHandle,
+		out.RItemList.Items[1].ItemValue.ClientItemHandle,
+		out.RItemList.Items[2].ItemValue.ClientItemHandle,
+	}
+	want := []string{"H1", "HB", "H2"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("reply item %d has handle %q, want %q — request order was not preserved", i, got[i], want[i])
+		}
+	}
+	if code := out.RItemList.Items[1].ItemValue.ResultID; code != xmlda.ErrFail {
+		t.Errorf("the rejected item's ResultID = %v, want E_FAIL", code)
+	}
+	for _, i := range []int{0, 2} {
+		iv := out.RItemList.Items[i].ItemValue
+		if !iv.ResultID.IsZero() {
+			t.Errorf("item %d: ResultID = %v, want none", i, iv.ResultID)
+		}
+		if iv.Value == nil {
+			t.Errorf("item %d: ReturnValuesOnReply produced no value", i)
+		}
+	}
+}
+
+// TestHandleSubscribe_AllItemsMalformed_EmptyHandle pins the degenerate
+// case: if every item is rejected at decode time there is nothing to
+// subscribe, so no subscription is created and ServerSubHandle stays
+// empty — the same outcome REQ-SUBSCRIPTION-002 defines for a request
+// whose every item the backend rejected.
+func TestHandleSubscribe_AllItemsMalformed_EmptyHandle(t *testing.T) {
+	be, _, _ := newRWBackend(t)
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Subscribe xmlns="` + xmlda.Namespace + `">` +
+		`<Options/><ItemList>` +
+		`<Items ItemName="a" Deadband="x"/><Items ItemName="b" MaxAge="y"/>` +
+		`</ItemList></Subscribe>` + soapEnvelopeClose
+
+	out := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, body))
+	if out.ServerSubHandle != "" {
+		t.Errorf("ServerSubHandle = %q, want empty", out.ServerSubHandle)
+	}
+	if len(out.RItemList.Items) != 2 {
+		t.Errorf("got %d reply items, want 2", len(out.RItemList.Items))
+	}
+}
+
+// --- an offsetless HoldTime must not fault the request ---
+
+// TestHandlePolledRefresh_OffsetlessHoldTime pins the widening end to end. The
+// timezone offset is optional in xsd:dateTime and mandatory in RFC 3339,
+// which time.Time.UnmarshalText enforces — so a conforming client could
+// not poll its subscription at all.
+func TestHandlePolledRefresh_OffsetlessHoldTime(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(1))
+	h := newTestHandler(t, be, Config{MaxPolledRefreshWait: 2 * time.Second}, clock.Real{})
+
+	sub := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, subscribeRequestBody("Item1", "CIH1", false)))
+
+	// Deliberately no offset, and a short hold so the test stays fast.
+	holdTime := time.Now().Add(80 * time.Millisecond).UTC().Format("2006-01-02T15:04:05.000")
+	resp := postSOAP(t, h, polledRefreshRequestBody(sub.ServerSubHandle, holdTime, 0, true))
+	if resp.StatusCode != http.StatusOK {
+		f := decodeFault(t, resp)
+		t.Fatalf("an offsetless HoldTime faulted the request: %+v", f)
+	}
+	out := decodeResponse[xmlda.SubscriptionPolledRefreshResponse](t, resp)
+	if len(out.RItemList) != 1 {
+		t.Errorf("got %d subscription result lists, want 1", len(out.RItemList))
+	}
+}
+
+// --- an over-long HoldTime is clamped, not rejected ---
+
+// TestHandlePolledRefresh_HoldTimeBeyondMaxWait_ClampsByDefault pins the clamping.
+// The specification's guidance for HoldTime is a range ("generally no more
+// than a minute or two", §3.1.6) while the ceiling is an exact number, so
+// a client that reads that sentence and picks two minutes against a
+// shorter ceiling used to fault on every single poll and never receive its
+// subscription's data at all.
+func TestHandlePolledRefresh_HoldTimeBeyondMaxWait_ClampsByDefault(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(1))
+	h := newTestHandler(t, be, Config{MaxPolledRefreshWait: 150 * time.Millisecond}, clock.Real{})
+
+	sub := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, subscribeRequestBody("Item1", "CIH1", false)))
+
+	holdTime := time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	start := time.Now()
+	resp := postSOAP(t, h, polledRefreshRequestBody(sub.ServerSubHandle, holdTime, 0, true))
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("an over-long HoldTime still faults by default: %+v", decodeFault(t, resp))
+	}
+	out := decodeResponse[xmlda.SubscriptionPolledRefreshResponse](t, resp)
+	if len(out.RItemList) != 1 {
+		t.Errorf("got %d subscription result lists, want 1", len(out.RItemList))
+	}
+	// It held for about the ceiling, not for the requested hour, and not
+	// for no time at all.
+	if elapsed > 5*time.Second {
+		t.Errorf("the hold was not clamped: took %v", elapsed)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("the hold was skipped entirely: took %v, want about the 150ms ceiling", elapsed)
+	}
+}
+
+// --- Subscribe honors ReqType ---
+
+// TestHandleSubscribe_HonorsReqType pins the fix for Subscribe having merged
+// the hierarchical ReqType and then discarded it: a client subscribing an
+// int item as xsd:double used to get int back, with neither the requested
+// conversion nor the E_BADTYPE that would have said no.
+func TestHandleSubscribe_HonorsReqType(t *testing.T) {
+	be, _, reader := newMinimalBackend()
+	reader.Set(backend.ItemRef{ItemName: "IntItem"}, xmlda.NewInt32(7))
+	h := newTestHandler(t, be, Config{}, nil)
+
+	body := soapEnvelopeOpen +
+		`<Subscribe xmlns="` + xmlda.Namespace + `" xmlns:xsd="` + xmlda.XSDNamespace + `" ` +
+		`ReturnValuesOnReply="true"><Options ClientRequestHandle="CRH1"/>` +
+		`<ItemList ReqType="xsd:double"><Items ItemName="IntItem" ClientItemHandle="CIH1"/></ItemList>` +
+		`</Subscribe>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, body))
+
+	if len(got.RItemList.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(got.RItemList.Items))
+	}
+	v := got.RItemList.Items[0].ItemValue.Value
+	if v == nil {
+		t.Fatal("subscribed item carries no value")
+	}
+	if v.Type() != xmlda.TypeDouble {
+		t.Fatalf("got type %q, want the requested xsd:double — ReqType was ignored", v.Type())
+	}
+	f, err := v.Float64()
+	if err != nil || f != 7 {
+		t.Fatalf("got %v (err %v), want 7", f, err)
+	}
+}
+
+// TestHandleSubscribe_UnconvertibleReqTypeIsBadType is the other half: a type
+// this server cannot convert to must be reported, not silently ignored.
+func TestHandleSubscribe_UnconvertibleReqTypeIsBadType(t *testing.T) {
+	be, _, reader := newMinimalBackend()
+	reader.Set(backend.ItemRef{ItemName: "StrItem"}, xmlda.NewString("not a number"))
+	h := newTestHandler(t, be, Config{}, nil)
+
+	body := soapEnvelopeOpen +
+		`<Subscribe xmlns="` + xmlda.Namespace + `" xmlns:xsd="` + xmlda.XSDNamespace + `" ` +
+		`ReturnValuesOnReply="true"><Options ClientRequestHandle="CRH1"/>` +
+		`<ItemList><Items ItemName="StrItem" ClientItemHandle="CIH1" ReqType="xsd:int"/></ItemList>` +
+		`</Subscribe>` + soapEnvelopeClose
+	got := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, body))
+
+	if len(got.RItemList.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(got.RItemList.Items))
+	}
+	if id := got.RItemList.Items[0].ItemValue.ResultID; id != xmlda.ErrBadType {
+		t.Fatalf("got ResultID %+v, want E_BADTYPE", id)
+	}
+}
+
+// --- the server-wide subscribed-item budget ---
+
+// TestHandleSubscribe_TotalItemBudget pins the fix for the per-axis limits
+// multiplying: MaxConcurrentSubscriptions and MaxItemsPerSubscription
+// together permitted a live item count neither limit alone suggests, with
+// every item holding its own last sample.
+func TestHandleSubscribe_TotalItemBudget(t *testing.T) {
+	be, _, reader := newMinimalBackend()
+	for _, n := range []string{"A", "B", "C"} {
+		reader.Set(backend.ItemRef{ItemName: n}, xmlda.NewInt32(1))
+	}
+	h := newTestHandler(t, be, Config{MaxTotalSubscribedItems: 4}, nil)
+
+	body := func(handle string) string {
+		return soapEnvelopeOpen + `<Subscribe xmlns="` + xmlda.Namespace + `" ReturnValuesOnReply="false">` +
+			`<Options ClientRequestHandle="` + handle + `"/><ItemList>` +
+			`<Items ItemName="A"/><Items ItemName="B"/><Items ItemName="C"/>` +
+			`</ItemList></Subscribe>` + soapEnvelopeClose
+	}
+
+	// First subscription: 3 items, within the budget of 4.
+	first := decodeResponse[xmlda.SubscribeResponse](t, postSOAP(t, h, body("CRH1")))
+	if first.ServerSubHandle == "" {
+		t.Fatal("first Subscribe was rejected but should fit the budget")
+	}
+
+	// Second: 3 more would make 6, over the budget — rejected as a
+	// whole-operation fault, not silently accepted.
+	resp := postSOAP(t, h, body("CRH2"))
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got HTTP %d, want a fault once the total item budget is exceeded", resp.StatusCode)
+	}
+	body2, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body2), "E_OUTOFMEMORY") {
+		t.Fatalf("want an E_OUTOFMEMORY fault, got:\n%s", body2)
+	}
+}
+
+// TestHandlePolledRefresh_NegativeWaitTime is the same for WaitTime, which
+// needs a live subscription to reach.
+func TestHandlePolledRefresh_NegativeWaitTime(t *testing.T) {
+	be, _, reader := newMinimalBackend()
+	reader.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(1))
+	h := newTestHandler(t, be, Config{}, nil)
+
+	sub := decodeResponse[xmlda.SubscribeResponse](t,
+		postSOAP(t, h, subscribeRequestBody("Item1", "CIH1", false)))
+	if sub.ServerSubHandle == "" {
+		t.Fatal("setup: no subscription handle")
+	}
+	resp := postSOAP(t, h, soapEnvelopeOpen+
+		`<SubscriptionPolledRefresh xmlns="`+xmlda.Namespace+`" WaitTime="-1">`+
+		`<Options ClientRequestHandle="CRH1"/>`+
+		`<ServerSubHandles>`+sub.ServerSubHandle+`</ServerSubHandles>`+
+		`</SubscriptionPolledRefresh>`+soapEnvelopeClose)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got HTTP %d, want 200 for a negative but schema-valid WaitTime:\n%s", resp.StatusCode, body)
 	}
 }

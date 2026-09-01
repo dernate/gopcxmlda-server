@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -906,5 +907,345 @@ func TestNewNil_ArrayTypedValue_ReportsArrayKind(t *testing.T) {
 	vendorNil := NewNil(QName{"http://example.com/vendor", "WeirdThing"})
 	if vendorNil.Kind() != KindUnknown {
 		t.Fatalf("unrecognized-type nil: Kind() = %s, want %s", vendorNil.Kind(), KindUnknown)
+	}
+}
+
+// // --- xsd:dateTime's lexical space is wider than RFC 3339 ---
+
+// TestParseXSDDateTime_AcceptsFullLexicalSpace pins the forms
+// encoding/xml's own time.Time handling rejects. xsd:dateTime (XSD Part 2
+// §3.2.7) makes the timezone offset OPTIONAL and admits the end-of-day
+// form T24:00:00; time.Time.UnmarshalText accepts only RFC 3339, so every
+// dateTime that reached a plain time.Time field used to fault the whole
+// request.
+func TestParseXSDDateTime_AcceptsFullLexicalSpace(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Time
+	}{
+		{"2026-08-30T12:00:00Z", time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)},
+		{"2026-08-30T12:00:00.500Z", time.Date(2026, 8, 30, 12, 0, 0, 500000000, time.UTC)},
+		// No offset at all: legal xsd:dateTime, rejected by RFC 3339.
+		{"2026-08-30T12:00:00", time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)},
+		{"2026-08-30T12:00:00.250", time.Date(2026, 8, 30, 12, 0, 0, 250000000, time.UTC)},
+		// Surrounding whitespace: XSD collapses it for a dateTime.
+		{"  2026-08-30T12:00:00Z  ", time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)},
+		// End-of-day: a synonym for midnight the next day.
+		{"2026-08-30T24:00:00Z", time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)},
+		{"2026-08-30T24:00:00.000Z", time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)},
+		{"2026-08-30T24:00:00", time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)},
+		// A date alone, and a date with an offset.
+		{"2026-08-30", time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		got, err := parseXSDDateTime(c.in)
+		if err != nil {
+			t.Errorf("parseXSDDateTime(%q): %v", c.in, err)
+			continue
+		}
+		if !got.Equal(c.want) {
+			t.Errorf("parseXSDDateTime(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+
+	// An offset is still honored where present, rather than silently
+	// treated as UTC.
+	got, err := parseXSDDateTime("2026-08-30T12:00:00+02:00")
+	if err != nil {
+		t.Fatalf("offset form: %v", err)
+	}
+	if !got.Equal(time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("offset was not applied: %v", got)
+	}
+
+	for _, bad := range []string{"", "junk", "2026-13-01T00:00:00Z", "2026-08-30T25:00:00Z", "2026-08-30T24:30:00Z"} {
+		if _, err := parseXSDDateTime(bad); err == nil {
+			t.Errorf("parseXSDDateTime(%q) unexpectedly succeeded", bad)
+		}
+	}
+}
+
+// TestValue_UnmarshalAlwaysConsumesItsElement pins the invariant the
+// per-item recovery rests on directly: whatever Value.UnmarshalXML
+// returns, the decoder is left just past the element's end tag, so the
+// caller's own loop can continue.
+func TestValue_UnmarshalAlwaysConsumesItsElement(t *testing.T) {
+	bodies := []string{
+		`<Value xsi:type="xsd:int">nope</Value>`,                                // bad literal (element already consumed)
+		`<Value>7</Value>`,                                                      // no xsi:type (nothing consumed)
+		`<Value xsi:type="unbound:thing">7</Value>`,                             // unbound prefix (nothing consumed)
+		`<Value xsi:type="opc:ArrayOfInt"><int>1</int><int>x</int></Value>`,     // fails mid-array
+		`<Value xsi:type="opc:ArrayOfInt"><int>1</int><wrong>2</wrong></Value>`, // unexpected child mid-array
+		`<Value xsi:type="xsd:dateTime">not-a-date</Value>`,                     // bad dateTime literal
+		`<Value xsi:type="xsd:QName">unbound:name</Value>`,                      // unresolvable QName content
+	}
+	for _, body := range bodies {
+		doc := `<Wrap xmlns:xsi="` + XSINamespace + `" xmlns:xsd="` + XSDNamespace + `" xmlns:opc="` + Namespace + `">` +
+			body + `<After/></Wrap>`
+		// Decoding through a struct-tag shadow would abort on the field
+		// error, leaving the stream mid-element — which is exactly the
+		// failure mode this invariant exists to prevent. So the check is
+		// direct: decode <Value>, then assert the very next element is the
+		// <After> sibling.
+		if err := checkConsumesElement(t, doc); err != nil {
+			t.Errorf("%s: %v", body, err)
+		}
+	}
+}
+
+// checkConsumesElement decodes doc's first <Value> child via
+// Value.UnmarshalXML and verifies the following token is the <After>
+// sibling — i.e. that the failing decode consumed exactly its own
+// element and no more.
+func checkConsumesElement(t *testing.T, doc string) error {
+	t.Helper()
+	d, cleanup, err := newScopedDecoder([]byte(doc))
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Advance to <Value>.
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return err
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "Value" {
+			continue
+		}
+		var v Value
+		if err := v.UnmarshalXML(d, se); err == nil {
+			return errors.New("expected a decode error for this input")
+		}
+		break
+	}
+	// The next start element must be <After>: not a leftover child of
+	// <Value>, and not nothing at all.
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return errors.New("nothing left after <Value>: the decode over-consumed")
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			if se.Name.Local != "After" {
+				return errors.New("next element is <" + se.Name.Local + ">, want <After>: the decode under-consumed")
+			}
+			return nil
+		case xml.EndElement:
+			if se.Name.Local == "Wrap" {
+				return errors.New("reached </Wrap> without seeing <After>: the decode over-consumed")
+			}
+		}
+	}
+}
+
+// newScopedDecoder builds a decoder over raw with raw's own prefix table
+// registered, the way xmlda's entry points do.
+func newScopedDecoder(raw []byte) (*xml.Decoder, func(), error) {
+	table, err := buildPrefixTable(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	d := xml.NewDecoder(strings.NewReader(string(raw)))
+	return d, withScope(d, table), nil
+}
+
+// Regression tests for the xmlda-layer defects found in the wire-format
+// review.
+
+// --- K3: an array can be turned into a Value ---
+
+// TestNewArrayValue_RoundTrip pins the fix for there having been no way
+// at all to construct an array-typed Value through the public API. The
+// NewXArray constructors return an Array, backend.ItemSample.Value takes
+// a Value, and Value's fields are unexported — so a backend simply could
+// not report an ArrayOf<X> item, even though the decode path had
+// supported them from the start and the repository's own captured
+// fixtures contain one.
+func TestNewArrayValue_RoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		value    Value
+		typeName QName
+		wantXML  string
+	}{
+		{"double", NewArrayValue(NewFloat64Array([]float64{1.5, -2})),
+			QName{Namespace, "ArrayOfDouble"}, "<double>1.5</double><double>-2</double>"},
+		{"int", NewArrayValue(NewInt32Array([]int32{7})),
+			QName{Namespace, "ArrayOfInt"}, "<int>7</int>"},
+		{"string", NewArrayValue(NewStringArray([]string{"a", "b"})),
+			QName{Namespace, "ArrayOfString"}, "<string>a</string><string>b</string>"},
+		{"boolean", NewArrayValue(NewBoolArray([]bool{true, false})),
+			QName{Namespace, "ArrayOfBoolean"}, "<boolean>true</boolean><boolean>false</boolean>"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.value.Kind() != KindArray {
+				t.Fatalf("got Kind %v, want KindArray", tc.value.Kind())
+			}
+			if tc.value.TypeName() != tc.typeName {
+				t.Fatalf("got TypeName %v, want %v", tc.value.TypeName(), tc.typeName)
+			}
+			if !tc.value.IsValid() {
+				t.Fatal("a constructed array Value reports IsValid() == false")
+			}
+
+			out, err := xmlMarshalNamed(t, "Value", tc.value)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !strings.Contains(string(out), tc.wantXML) {
+				t.Fatalf("got %s,\nwant it to contain %s", out, tc.wantXML)
+			}
+
+			// And it decodes back to an equal Value.
+			wrapped := `<Wrap xmlns:opc="` + Namespace + `" xmlns:xsi="` + XSINamespace + `">` +
+				string(out) + `</Wrap>`
+			var outer struct {
+				XMLName xml.Name `xml:"Wrap"`
+				V       Value    `xml:"Value"`
+			}
+			if err := Decode([]byte(wrapped), &outer); err != nil {
+				t.Fatalf("decode: %v\ndoc: %s", err, wrapped)
+			}
+			if !outer.V.Equal(tc.value) {
+				t.Fatalf("round trip changed the value:\ngot  %+v\nwant %+v", outer.V, tc.value)
+			}
+		})
+	}
+}
+
+// TestValue_IsValid distinguishes a constructed Value from the zero one,
+// which is the check the server layer uses before putting a
+// backend-supplied Value on the wire.
+func TestValue_IsValid(t *testing.T) {
+	if (Value{}).IsValid() {
+		t.Error("the zero Value reports IsValid() == true")
+	}
+	if !NewInt32(1).IsValid() {
+		t.Error("a constructed scalar reports IsValid() == false")
+	}
+	if !NewNil(QName{XSDNamespace, "int"}).IsValid() {
+		t.Error("an xsi:nil Value of a declared type reports IsValid() == false")
+	}
+}
+
+// --- an unknown value's inner XML is content-only on the way back ---
+
+// TestUnknownValue_DropsNonContentTokens pins the fix for
+// writeRawInnerXML having relayed every token it found, including
+// directives and processing instructions. That inner XML arrives verbatim
+// from a peer (ADR-003 preserves an unrecognized xsi:type's bytes), and a
+// Write with ReturnValuesOnReply echoes it straight back into a response —
+// so a directive in the request became a directive in the middle of the
+// response document, making it invalid with no error to signal it, since
+// the encode itself succeeds.
+func TestUnknownValue_DropsNonContentTokens(t *testing.T) {
+	body := `<Value xmlns:v="http://example.com/vendor" xmlns:xsi="` + XSINamespace + `" ` +
+		`xsi:type="v:WeirdType">text<!-- a comment --><?pi target?><child>kept</child></Value>`
+
+	var v Value
+	doc, err := NewDocument([]byte(body))
+	if err != nil {
+		t.Fatalf("NewDocument: %v", err)
+	}
+	if err := doc.Decode(&v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !v.IsUnknown() {
+		t.Fatalf("got Kind %v, want KindUnknown for an unrecognized xsi:type", v.Kind())
+	}
+
+	out, err := xmlMarshalNamed(t, "Value", v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(out)
+	if strings.Contains(got, "<!--") || strings.Contains(got, "<?") {
+		t.Errorf("a comment or processing instruction was relayed from peer input into the response: %s", got)
+	}
+	// The actual content still round-trips.
+	if !strings.Contains(got, "text") || !strings.Contains(got, "kept") {
+		t.Errorf("content was lost along with the non-content tokens: %s", got)
+	}
+}
+
+// --- xsd:duration is validated on both paths ---
+
+// TestDuration_Validated pins the fix for xsd:duration having been the
+// one scalar type accepted without any lexical check — any string at all
+// decoded as a duration and was echoed straight back onto the wire, while
+// xsd:decimal right beside it had been validated all along.
+func TestDuration_Validated(t *testing.T) {
+	valid := []string{"P1D", "PT1H30M", "-P1Y2M3DT4H5M6.7S", "P1Y", "PT0.5S", "P10675199DT2H48M5.4775807S"}
+	invalid := []string{"", "P", "PT", "1D", "P1X", "hello", "P1DT", "-P", "1 day"}
+
+	for _, s := range valid {
+		if !ValidDuration(s) {
+			t.Errorf("ValidDuration(%q) = false, want true", s)
+		}
+	}
+	for _, s := range invalid {
+		if ValidDuration(s) {
+			t.Errorf("ValidDuration(%q) = true, want false", s)
+		}
+	}
+
+	// Decode rejects a malformed literal instead of storing it.
+	body := `<Value xmlns:xsd="` + XSDNamespace + `" xmlns:xsi="` + XSINamespace + `" xsi:type="xsd:duration">not a duration</Value>`
+	var v Value
+	doc, err := NewDocument([]byte(body))
+	if err != nil {
+		t.Fatalf("NewDocument: %v", err)
+	}
+	if err := doc.Decode(&v); err == nil {
+		t.Error("decoding a malformed xsd:duration succeeded; want an error")
+	}
+
+	// And a caller-constructed one is caught on the way out, since
+	// NewDuration has no error to return.
+	if _, err := xmlMarshalNamed(t, "Value", NewDuration("nonsense")); err == nil {
+		t.Error("marshaling a malformed xsd:duration succeeded; want an error")
+	}
+	if _, err := xmlMarshalNamed(t, "Value", NewDuration("P1D")); err != nil {
+		t.Errorf("marshaling a valid duration failed: %v", err)
+	}
+}
+
+// --- a mistyped Value reports an error rather than panicking ---
+
+// TestFormatScalar_MistypedValueErrors pins the fix for formatScalar's
+// eighteen unchecked type assertions. A Value whose declared ScalarType
+// and stored payload disagree is an internal inconsistency no constructor
+// produces — but a panic is the wrong way to say so: it unwinds through
+// the encoder into ServeHTTP's recover and reaches the client as a bare
+// E_FAIL, with the actual cause visible only in a stack trace.
+func TestFormatScalar_MistypedValueErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  ScalarType
+		val  any
+	}{
+		{"int declared, string stored", TypeInt, "not an int"},
+		{"double declared, int stored", TypeDouble, int32(1)},
+		{"dateTime declared, string stored", TypeDateTime, "2026-01-01"},
+		{"base64Binary declared, string stored", TypeBase64Binary, "abc"},
+		{"boolean declared, nil stored", TypeBoolean, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("formatScalar panicked instead of returning an error: %v", r)
+				}
+			}()
+			if _, err := formatScalar(tc.typ, tc.val); err == nil {
+				t.Error("got nil error, want an internal-inconsistency error")
+			}
+		})
 	}
 }

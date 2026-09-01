@@ -209,3 +209,64 @@ func TestHandleWrite_EmptyItemList_Faults(t *testing.T) {
 		t.Fatalf("got status %d, want 500", resp.StatusCode)
 	}
 }
+
+// TestHandleWrite_MalformedValueIsPerItemCondition pins the same for Write,
+// where the malformed part is the item's <Value> content rather than an
+// attribute — and asserts the healthy item was really written, i.e. that
+// the rejected one was excluded from the backend call rather than sent
+// with a zero value.
+func TestHandleWrite_MalformedValueIsPerItemCondition(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "ok"}, xmlda.NewInt32(0))
+	r.Set(backend.ItemRef{ItemName: "bad"}, xmlda.NewInt32(0))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `"` +
+		` xmlns:xsi="` + xmlda.XSINamespace + `" xmlns:xsd="` + xmlda.XSDNamespace + `">` +
+		`<Options ReturnItemName="true"/><ItemList>` +
+		`<Items ItemName="bad" ClientItemHandle="HB"><Value xsi:type="xsd:int">not-an-int</Value></Items>` +
+		`<Items ItemName="ok" ClientItemHandle="HO"><Value xsi:type="xsd:int">42</Value></Items>` +
+		`</ItemList></Write>` + soapEnvelopeClose
+
+	resp := postSOAP(t, h, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	out := decodeResponse[xmlda.WriteResponse](t, resp)
+	if got := itemByHandle(t, out.RItemList.Items, "HB").ResultID; got != xmlda.ErrBadType {
+		t.Errorf("HB: ResultID = %v, want E_BADTYPE", got)
+	}
+	if got := itemByHandle(t, out.RItemList.Items, "HO").ResultID; !got.IsZero() {
+		t.Errorf("HO: ResultID = %v, want none", got)
+	}
+
+	// The healthy write really landed.
+	readResp := postSOAP(t, h, readRequestBody([]string{"ok"}))
+	read := decodeResponse[xmlda.ReadResponse](t, readResp)
+	v, err := read.RItemList.Items[0].Value.Int32()
+	if err != nil || v != 42 {
+		t.Errorf("the healthy item was not written: got %v (err %v), want 42", v, err)
+	}
+}
+
+// TestHandleWrite_OffsetlessItemTimestamp pins the same widening on
+// the Write path, where the offsetless dateTime is an item Timestamp.
+func TestHandleWrite_OffsetlessItemTimestamp(t *testing.T) {
+	be, _, r := newRWBackend(t)
+	r.Set(backend.ItemRef{ItemName: "Tag"}, xmlda.NewFloat64(0))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `"` +
+		` xmlns:xsi="` + xmlda.XSINamespace + `" xmlns:xsd="` + xmlda.XSDNamespace + `">` +
+		`<Options/><ItemList><Items ItemName="Tag" Timestamp="2026-08-30T12:00:00">` +
+		`<Value xsi:type="xsd:double">3.5</Value></Items></ItemList></Write>` + soapEnvelopeClose
+
+	resp := postSOAP(t, h, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("an offsetless item Timestamp faulted the Write: %+v", decodeFault(t, resp))
+	}
+	out := decodeResponse[xmlda.WriteResponse](t, resp)
+	if got := out.RItemList.Items[0].ResultID; !got.IsZero() {
+		t.Errorf("ResultID = %v, want none", got)
+	}
+}

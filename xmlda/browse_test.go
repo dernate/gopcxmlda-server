@@ -389,3 +389,36 @@ func TestBrowseResponse_RealFixture_Deep(t *testing.T) {
 		}
 	}
 }
+
+// --- BrowseFilter is an enumeration with a schema default ---
+
+// TestBrowseFilter_DefaultAndValidation pins both halves: an absent
+// attribute becomes the schema's own default of "all" rather than being
+// handed to the backend as "", and an unrecognized value survives decode
+// so the server layer can answer E_INVALIDFILTER instead of forwarding
+// nonsense.
+func TestBrowseFilter_DefaultAndValidation(t *testing.T) {
+	var absent BrowseRequest
+	if err := Decode([]byte(`<Browse xmlns="`+Namespace+`"/>`), &absent); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if absent.BrowseFilter != BrowseFilterAll {
+		t.Errorf("BrowseFilter = %q, want the schema default %q", absent.BrowseFilter, BrowseFilterAll)
+	}
+
+	var bad BrowseRequest
+	if err := Decode([]byte(`<Browse xmlns="`+Namespace+`" BrowseFilter="junk"/>`), &bad); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if bad.BrowseFilter != "junk" {
+		t.Errorf("an unrecognized filter was rewritten to %q; the server can no longer report it", bad.BrowseFilter)
+	}
+	if bad.BrowseFilter.IsValid() {
+		t.Error(`BrowseFilter("junk").IsValid() = true`)
+	}
+	for _, f := range []BrowseFilter{"", BrowseFilterAll, BrowseFilterBranch, BrowseFilterItem} {
+		if !f.IsValid() {
+			t.Errorf("BrowseFilter(%q).IsValid() = false", f)
+		}
+	}
+}

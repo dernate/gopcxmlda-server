@@ -44,9 +44,19 @@ func buildItemValue(ref backend.ItemRef, clientItemHandle string, sample backend
 		iv.DiagnosticInfo = diagnosticInfo
 	}
 	if !haveSample {
+		// Quality is deliberately left nil, not set to the zero
+		// OPCQuality: <Quality> is minOccurs="0" in the schema, and an
+		// attribute-less <Quality/> element reads as QualityField="good"
+		// under the schema's own defaults. Emitting one for an item that
+		// has no sample at all reported e.g. an unknown item name as
+		// good-quality-with-no-value — a direct contradiction of the
+		// ResultID on the same element, and the half of it that reaches
+		// the process image of any client mapping this onto OPC DA's
+		// wQuality. See xmlda.ItemValue.Quality.
 		return iv
 	}
-	iv.Quality = sample.Quality
+	q := sample.Quality
+	iv.Quality = &q
 	haveLastKnown := !sample.Value.IsNil()
 	if xmlda.ResolveValuePresence(sample.Quality, haveLastKnown) {
 		v := sample.Value
@@ -57,6 +67,21 @@ func buildItemValue(ref backend.ItemRef, clientItemHandle string, sample backend
 		}
 	}
 	return iv
+}
+
+// buildItemDecodeFailure builds the wire ItemValue for a request item this
+// server could not interpret: no value, no quality, the per-item ResultID
+// the condition maps to, and — when the client asked for diagnostics —
+// which of the item's own fields was unreadable.
+//
+// It exists so Read, Write and Subscribe all report a malformed item the
+// same way, and so that one malformed item costs the client that item
+// rather than the whole request (xmlda.ItemDecodeError).
+func buildItemDecodeFailure(ref backend.ItemRef, clientItemHandle string, decodeErr error, opts xmlda.RequestOptions) (xmlda.ItemValue, xmlda.ErrorCode) {
+	code := xmlda.ItemResultIDFor(decodeErr)
+	iv := buildItemValue(ref, clientItemHandle, backend.ItemSample{}, false, code,
+		xmlda.ItemDiagnosticFor(decodeErr), opts)
+	return iv, code
 }
 
 // errorTextFunc returns the textOf function xmlda.DedupeErrors should use,

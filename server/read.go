@@ -35,7 +35,14 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 		return
 	}
 
-	readItems := make([]backend.ReadRequestItem, len(req.ItemList.Items))
+	// An item whose own attributes could not be interpreted is never sent
+	// to the backend: it resolves to a per-item ResultID directly
+	// (xmlda.ItemDecodeError), so one malformed MaxAge or unresolvable
+	// ReqType costs the client that item instead of the entire response.
+	// readIdx maps each backend request slot back to its position in
+	// req.ItemList.Items.
+	readItems := make([]backend.ReadRequestItem, 0, len(req.ItemList.Items))
+	readIdx := make([]int, 0, len(req.ItemList.Items))
 	merged := make([]xmlda.ItemParams, len(req.ItemList.Items))
 	refs := make([]backend.ItemRef, len(req.ItemList.Items))
 	for i, it := range req.ItemList.Items {
@@ -46,6 +53,9 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 			ref.ItemPath = *p.ItemPath
 		}
 		refs[i] = ref
+		if it.DecodeErr != nil {
+			continue
+		}
 		// A negative MaxAge is legal xsd:int with no meaning for
 		// "maximum acceptable age"; 0 ("most accurate / force a device
 		// read", REQ-READ-004) is the conservative reading.
@@ -53,29 +63,48 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 		if p.MaxAge != nil && *p.MaxAge > 0 {
 			maxAge = time.Duration(*p.MaxAge) * time.Millisecond
 		}
-		readItems[i] = backend.ReadRequestItem{Ref: ref, MaxAge: maxAge}
+		readItems = append(readItems, backend.ReadRequestItem{Ref: ref, MaxAge: maxAge})
+		readIdx = append(readIdx, i)
 	}
 
-	results, err := observeBackend(h.metrics, h.clk, "Read", func() ([]backend.Result[backend.ItemSample], error) {
-		return h.backend.Reader.Read(ctx, readItems)
-	})
-	if err != nil {
-		h.metrics.IncRequestError("Read", "backend_error")
-		writeFault(w, backendErrorFault(err))
-		return
+	results := make([]backend.Result[backend.ItemSample], len(req.ItemList.Items))
+	for i := range results {
+		// The default for a slot no backend result will fill: an item
+		// rejected at decode time overwrites this below with its own
+		// condition, and a conforming backend fills every other slot.
+		results[i] = backend.Result[backend.ItemSample]{ResultID: xmlda.ErrFail}
+	}
+	if len(readItems) > 0 {
+		backendResults, err := observeBackend(h.metrics, h.clk, "Read", func() ([]backend.Result[backend.ItemSample], error) {
+			return h.backend.Reader.Read(ctx, readItems)
+		})
+		if err != nil {
+			h.metrics.IncRequestError("Read", "backend_error")
+			writeFault(w, backendErrorFault(err))
+			return
+		}
+		// A conforming backend returns exactly one Result per requested
+		// item, in the same order (docs/backend-implementation.md). A
+		// backend that returns fewer leaves the missing tail at the
+		// E_FAIL default above rather than panicking on an out-of-range
+		// index.
+		for j, i := range readIdx {
+			if j < len(backendResults) {
+				results[i] = backendResults[j]
+			}
+		}
 	}
 
 	items := make([]xmlda.ItemValue, len(req.ItemList.Items))
 	var codes []xmlda.ErrorCode
 	for i, it := range req.ItemList.Items {
-		// A conforming backend returns exactly one Result per requested
-		// item, in the same order (docs/backend-implementation.md). A
-		// backend that returns fewer resolves the missing tail to E_FAIL
-		// rather than panicking on an out-of-range index.
-		res := backend.Result[backend.ItemSample]{ResultID: xmlda.ErrFail}
-		if i < len(results) {
-			res = results[i]
+		if it.DecodeErr != nil {
+			iv, code := buildItemDecodeFailure(refs[i], it.ClientItemHandle, it.DecodeErr, req.Options)
+			items[i] = iv
+			codes = append(codes, code)
+			continue
 		}
+		res := results[i]
 		resultID := res.ResultID
 		sample := res.Value
 		// A success-with-caveat code still carries a usable value: §2.6

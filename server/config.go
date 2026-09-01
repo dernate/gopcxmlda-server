@@ -75,6 +75,73 @@ type Config struct {
 	// Zero applies the built-in default (200000); a negative value
 	// explicitly requests no limit.
 	MaxTotalSubscribedItems int
+	// MaxTotalBufferedSamples bounds how many buffered (undelivered)
+	// samples may be held across every subscribed item at once — the third
+	// axis of the same multiplication MaxTotalSubscribedItems addresses.
+	//
+	// MaxTotalSubscribedItems (200000) and MaxBufferedSamplesPerItem (100)
+	// together permit twenty million buffered entries, each holding a full
+	// xmlda.Value; the per-item cap says nothing about the total. When the
+	// budget is exhausted, a buffering item falls back to retaining only
+	// its Latest Changed Value (which REQ-SUBSCRIPTION-007 preserves
+	// regardless) and the next reply sets DataBufferOverflow, so the loss
+	// is reported rather than silent. Zero applies the built-in default
+	// (1000000); a negative value explicitly requests no limit.
+	MaxTotalBufferedSamples int
+
+	// MaxConcurrentRequests bounds how many requests may be in flight at
+	// once across the whole server; a request arriving when the limit is
+	// reached is rejected with an E_BUSY fault rather than queued.
+	//
+	// Every other limit here is per request or per subscription, and none
+	// of them bounds concurrency. A SubscriptionPolledRefresh legitimately
+	// holds its handler goroutine, its TCP connection and its response
+	// buffer for up to MaxPolledRefreshWait, so without this a client can
+	// pin an unbounded number of them at once — the cheapest way to
+	// exhaust a server that is otherwise carefully bounded everywhere
+	// else. Zero applies the built-in default (1024); a negative value
+	// explicitly requests no limit.
+	//
+	// Size it above the number of concurrent long-polls the deployment
+	// expects, not to its request rate: short operations pass through in
+	// milliseconds and barely occupy a slot.
+	MaxConcurrentRequests int
+
+	// ContinuationPointTTL is how long a Browse continuation point this
+	// server issued remains usable. Zero applies the built-in default
+	// (10 minutes); a negative value means the token never expires on its
+	// own (it still stops working when the process restarts, since the key
+	// that authenticates it is generated per Handler — see
+	// continuation.go).
+	ContinuationPointTTL time.Duration
+
+	// StrictHoldTime rejects a SubscriptionPolledRefresh whose HoldTime is
+	// further out than MaxPolledRefreshWait with an E_INVALIDHOLDTIME
+	// fault, instead of the default behavior of clamping the hold to that
+	// ceiling and answering normally.
+	//
+	// Clamping is the default because the specification's own guidance for
+	// HoldTime is loose ("generally no more than a minute or two", §3.1.6)
+	// while this ceiling is an exact number: a client that reads that
+	// sentence and picks 120s against a lower ceiling would otherwise
+	// fault on every single poll and never receive its subscription's data
+	// at all. Set this only when a client silently getting a shorter hold
+	// than it asked for is the worse failure.
+	StrictHoldTime bool
+
+	// RequiresFault decides whether an operation must be rejected with a
+	// whole-operation fault given the server's current state, before any
+	// backend call is made (REQ-SERVER-002). nil applies
+	// xmlda.RequiresFault, this library's own reading of §2.6.
+	//
+	// It is a hook because the reading is a policy, not a protocol
+	// constant, and the specification's serverState descriptions leave
+	// room: xmlda.RequiresFault lets SubscriptionPolledRefresh through
+	// under "suspended", and treats "commFault" and "test" as fully
+	// operational — all defensible, none obligatory. An operator who
+	// wants writes blocked while the data source is unreachable, say,
+	// needs to be able to say so without forking the library.
+	RequiresFault func(op string, state xmlda.ServerState) (bool, xmlda.ErrorCode)
 
 	// ReadOnly, if true, globally disables Write regardless of whether
 	// the backend supplies a Writer — the specification's own
@@ -175,6 +242,15 @@ func (c Config) WithDefaults() Config {
 	if c.MaxTotalSubscribedItems == 0 {
 		c.MaxTotalSubscribedItems = 200000
 	}
+	if c.MaxTotalBufferedSamples == 0 {
+		c.MaxTotalBufferedSamples = 1000000
+	}
+	if c.MaxConcurrentRequests == 0 {
+		c.MaxConcurrentRequests = 1024
+	}
+	if c.ContinuationPointTTL == 0 {
+		c.ContinuationPointTTL = 10 * time.Minute
+	}
 	if c.StatusCacheTTL == 0 {
 		c.StatusCacheTTL = 250 * time.Millisecond
 	}
@@ -185,7 +261,12 @@ func (c Config) WithDefaults() Config {
 		c.RequestTimeout = 30 * time.Second
 	}
 	if c.MaxPolledRefreshWait <= 0 {
-		c.MaxPolledRefreshWait = 90 * time.Second
+		// 120s, not 90s: the specification's own guidance is "generally no
+		// more than a minute or two" (§3.1.6), and a client that reads it
+		// literally picks two minutes. A ceiling below the number clients
+		// actually choose turns every poll into a clamp (or, with
+		// StrictHoldTime, a fault).
+		c.MaxPolledRefreshWait = 120 * time.Second
 	}
 	if c.ReadHeaderTimeout <= 0 {
 		c.ReadHeaderTimeout = 10 * time.Second
@@ -213,5 +294,6 @@ func (c Config) subscriptionConfig() subscription.Config {
 		MaxBufferedSamplesPerItem:   c.MaxBufferedSamplesPerItem,
 		PollTimeout:                 c.PollTimeout,
 		MaxTotalSubscribedItems:     c.MaxTotalSubscribedItems,
+		MaxTotalBufferedSamples:     c.MaxTotalBufferedSamples,
 	}
 }

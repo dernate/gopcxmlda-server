@@ -63,14 +63,30 @@ func (q QName) String() string {
 	return "{" + q.Space + "}" + q.Local
 }
 
-// decoderScopes associates a *xml.Decoder instance with the flattened
-// prefix table built for the document it is decoding. encoding/xml passes
-// the same *Decoder pointer through every nested UnmarshalXML call within
-// one Decode invocation, and each top-level Decode uses a fresh *Decoder, so
-// entries never bleed between unrelated decodes. Entries are removed via the
-// cleanup function returned by withScope immediately after the top-level
-// decode returns.
-var decoderScopes sync.Map // map[*xml.Decoder]map[string]string
+// prefixScope is one decoded document's namespace-prefix context: the
+// flattened whole-document table, used as the fallback when a QName's
+// prefix is not declared on the element the value itself came from (see
+// resolveQNameIn).
+type prefixScope struct {
+	table map[string]string
+}
+
+// decoderScopes associates a *xml.Decoder instance with the prefixScope
+// built for the document it is decoding.
+//
+// Keying on the decoder pointer is forced by xml.Unmarshaler's signature:
+// UnmarshalXML receives only (*xml.Decoder, xml.StartElement), with no
+// room for caller-supplied context, and a nested value's xsi:type or
+// ResultID cannot be resolved without the document's declarations. Two
+// facts make it safe: encoding/xml passes the same *Decoder pointer
+// through every nested UnmarshalXML call within one Decode invocation,
+// and each top-level Decode uses a fresh *Decoder — so entries never
+// bleed between unrelated or concurrent decodes. The entry is removed by
+// the cleanup function withScope returns, which every entry point defers
+// (so it runs on a panicking decode too, and no stale entry can outlive
+// its decoder and be inherited by a later one allocated at the same
+// address).
+var decoderScopes sync.Map // map[*xml.Decoder]*prefixScope
 
 // buildPrefixTable scans raw for every namespace declaration
 // (xmlns="uri", the default namespace, keyed by "", and xmlns:prefix="uri")
@@ -114,8 +130,64 @@ func buildPrefixTable(raw []byte) (map[string]string, error) {
 // has returned, to prevent the map from growing unboundedly across many
 // decodes.
 func withScope(d *xml.Decoder, table map[string]string) func() {
-	decoderScopes.Store(d, table)
+	decoderScopes.Store(d, &prefixScope{table: table})
 	return func() { decoderScopes.Delete(d) }
+}
+
+// localPrefixBinding reports the URI attrs binds prefix to, if any.
+// prefix "" asks about the default namespace (xmlns="…"), which may
+// legitimately be bound to the empty URI as an explicit reset — hence the
+// second return value rather than an empty-string sentinel.
+func localPrefixBinding(attrs []xml.Attr, prefix string) (string, bool) {
+	for _, a := range attrs {
+		switch {
+		case prefix != "" && a.Name.Space == "xmlns" && a.Name.Local == prefix:
+			return a.Value, true
+		case prefix == "" && a.Name.Space == "" && a.Name.Local == "xmlns":
+			return a.Value, true
+		}
+	}
+	return "", false
+}
+
+// resolveQNameIn resolves raw ("prefix:local", or a bare local name)
+// against, in order: the namespace declarations carried on elemAttrs —
+// the attribute list of the very element the value came from — and then
+// the document's flattened prefix table.
+//
+// Element-local declarations win because that is what XML namespace
+// scoping specifies, and because it is the shape both the specification's
+// own worked example (§2.6 p.21: xmlns:q0 declared directly on the
+// element) and this library's own encoder produce: typeAttrs, qnameAttr
+// and marshalQNameScalar each declare the prefix they use locally. Before
+// this, a prefix rebound on the element itself was resolved against the
+// whole-document "last declaration wins" table instead, so two elements
+// legitimately binding the same prefix to different vendor namespaces —
+// which §3.1.9 and §3.1.10 positively invite, since a vendor result code
+// and a vendor property need not come from the same vendor — both
+// resolved to whichever declaration appeared last in the document.
+//
+// The flat table remains the fallback for a prefix declared on an
+// ancestor; see docs/specification/open-questions.md OQ-6 for the
+// residual limitation there.
+func resolveQNameIn(d *xml.Decoder, elemAttrs []xml.Attr, raw string) (QName, error) {
+	prefix, local, hasPrefix := strings.Cut(strings.TrimSpace(raw), ":")
+	if !hasPrefix {
+		local, prefix = prefix, ""
+	}
+	if uri, ok := localPrefixBinding(elemAttrs, prefix); ok {
+		switch {
+		case uri != "":
+			return QName{Space: uri, Local: local}, nil
+		case prefix == "":
+			// xmlns="" — an explicit "no default namespace" reset, which
+			// this library's own encoder emits for an unqualified QName.
+			return QName{Local: local}, nil
+		default:
+			return QName{}, fmt.Errorf("xmlda: unresolvable QName %q: prefix %q is locally bound to the empty namespace", raw, prefix)
+		}
+	}
+	return resolveQName(d, raw)
 }
 
 // resolveQName is the single place any "prefix:local" wire text is ever
@@ -124,7 +196,7 @@ func withScope(d *xml.Decoder, table map[string]string) func() {
 // withScope. Everywhere else in this package, QName equality is by
 // (Space, Local) only — never by comparing prefixed strings.
 func resolveQName(d *xml.Decoder, raw string) (QName, error) {
-	prefix, local, hasPrefix := strings.Cut(raw, ":")
+	prefix, local, hasPrefix := strings.Cut(strings.TrimSpace(raw), ":")
 	if !hasPrefix {
 		// No colon: local name only, resolved against the default namespace
 		// in scope (which may itself be "" if no default namespace applies).
@@ -141,11 +213,12 @@ func resolveQName(d *xml.Decoder, raw string) (QName, error) {
 			"xmlda.Decode or (*xmlda.Document).Decode, not encoding/xml's Unmarshal/Decode, "+
 			"which cannot supply the document's namespace-prefix scope", raw)
 	}
-	table, ok := scope.(map[string]string)
+	ps, ok := scope.(*prefixScope)
 	if !ok {
-		return QName{}, fmt.Errorf("xmlda: prefix scope for this decoder holds %T, not a prefix table "+
+		return QName{}, fmt.Errorf("xmlda: prefix scope for this decoder holds %T, not a *prefixScope "+
 			"(internal inconsistency)", scope)
 	}
+	table := ps.table
 	uri, ok := table[prefix]
 	if !ok {
 		if prefix == "" {
@@ -326,6 +399,19 @@ func encodePropertyNames(e *xml.Encoder, names []QName) error {
 	return nil
 }
 
+// elementText decodes start's character-data content, consuming through
+// its end tag. Shared by every place this package needs a plain text
+// element rather than a typed one.
+func elementText(d *xml.Decoder, start xml.StartElement) (string, error) {
+	var holder struct {
+		Text string `xml:",chardata"`
+	}
+	if err := d.DecodeElement(&holder, &start); err != nil {
+		return "", fmt.Errorf("xmlda: decoding <%s>: %w", start.Name.Local, err)
+	}
+	return holder.Text, nil
+}
+
 // decodePropertyNameElement decodes one <PropertyNames> element's text
 // content into a QName, resolving any namespace prefix against d's scope.
 // Shared by BrowseRequest.UnmarshalXML and GetPropertiesRequest.UnmarshalXML,
@@ -337,7 +423,7 @@ func decodePropertyNameElement(d *xml.Decoder, start xml.StartElement) (QName, e
 	if err := d.DecodeElement(&holder, &start); err != nil {
 		return QName{}, err
 	}
-	return resolveQName(d, strings.TrimSpace(holder.Text))
+	return resolveQNameIn(d, start.Attr, holder.Text)
 }
 
 // decodeReturnFlags reads the ReturnAllProperties/ReturnPropertyValues/

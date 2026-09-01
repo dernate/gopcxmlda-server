@@ -50,7 +50,8 @@ func (l *ItemValueList) UnmarshalXML(d *xml.Decoder, start xml.StartElement) err
 }
 
 // ItemValue is the wire shape for a data-bearing item, used by
-// Read/Write/Subscribe/SubscriptionPolledRefresh results (§3.1.5, pp.30-33).
+// Read/Write/Subscribe/SubscriptionPolledRefresh results (§3.1.5, pp.30-33)
+// and, for Write, by the request as well.
 type ItemValue struct {
 	// ItemName identifies the item.
 	ItemName string
@@ -65,8 +66,29 @@ type ItemValue struct {
 	// explicit xsi:nil="true" element (a known type with no value); these
 	// are two distinct "no value" representations — see REQ-TYPE-008.
 	Value *Value
-	// Quality is this item's quality. The zero OPCQuality is Good/None/0.
-	Quality OPCQuality
+	// Quality is this item's quality, or nil if it carries none.
+	//
+	// A pointer, not a value, for two independent reasons.
+	//
+	// On encode: an item that carries no sample at all (an unknown item
+	// name, a write-only item read back) must not assert a quality.
+	// <Quality> is minOccurs="0" in the schema, and the zero OPCQuality
+	// emits no attributes at all — which, under the schema's OWN
+	// attribute defaults, a conforming client reads as
+	// QualityField="good". A failing item was therefore reported as
+	// good-quality-with-no-value, contradicting its own
+	// ResultID="opc:E_UNKNOWNITEMNAME"; for a client that maps this field
+	// onto OPC DA's wQuality — the usual shape of a DA/XML-DA bridge —
+	// the quality is the half that reaches the process image.
+	//
+	// On decode: nil distinguishes "no <Quality> element" from "<Quality/>
+	// carrying no attributes", which is a legitimate way for a client to
+	// write good/none/0 explicitly. Comparing a value-typed OPCQuality
+	// against its zero could not tell those apart (its fields are
+	// pointers, so the comparison is pointer identity), so an explicit
+	// empty <Quality/> in a Write request was silently dropped instead of
+	// being applied.
+	Quality *OPCQuality
 	// Timestamp is nil if not present (gated by quality and by
 	// RequestOptions.ReturnItemTime — see ResolveValuePresence and
 	// docs/architecture/data-flow.md).
@@ -77,6 +99,24 @@ type ItemValue struct {
 	// DiagnosticInfo is verbose, non-deduplicated per-item diagnostic
 	// text, populated only if RequestOptions.ReturnDiagnosticInfo is true.
 	DiagnosticInfo string
+	// DecodeErr is non-nil when this item was structurally readable but
+	// one of its own attributes or its <Value> could not be interpreted
+	// (see ItemDecodeError). Used on the request side (Write): the server
+	// layer turns it into this one item's ResultID rather than failing the
+	// whole operation. Always an *ItemDecodeError when non-nil.
+	DecodeErr error
+}
+
+// QualityOrDefault returns iv's quality, or the specification's wire
+// default (good/none/0) when the item carried no <Quality> element —
+// which is what a conforming client must assume for an absent one
+// (REQ-QUALITY-002). Use this rather than dereferencing Quality, which is
+// nil for an item that reports a condition instead of a value.
+func (iv ItemValue) QualityOrDefault() OPCQuality {
+	if iv.Quality == nil {
+		return OPCQuality{}
+	}
+	return *iv.Quality
 }
 
 // MarshalXML implements xml.Marshaler. It always adds an xsi:type
@@ -125,63 +165,129 @@ func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 			return err
 		}
 	}
-	if err := e.EncodeElement(iv.Quality, xml.StartElement{Name: xml.Name{Local: "Quality"}}); err != nil {
-		return err
+	// Omitted entirely when nil: see Quality's doc comment on why an item
+	// with no sample must not emit one.
+	if iv.Quality != nil {
+		if err := e.EncodeElement(*iv.Quality, xml.StartElement{Name: xml.Name{Local: "Quality"}}); err != nil {
+			return err
+		}
 	}
 	return e.EncodeToken(start.End())
 }
 
-// UnmarshalXML implements xml.Unmarshaler. It additionally tolerates a
-// peer that encodes time/date/duration as dateTime/string plus a
-// ValueTypeQualifier attribute (an interop accommodation some toolchains
-// use, per §2.7.1) rather than this library's own direct xsi:type
-// encoding — see docs/specification/open-questions.md OQ-12.
+// UnmarshalXML implements xml.Unmarshaler.
+//
+// It reads the children with its own token loop rather than through a
+// struct-tag shadow, for two reasons that both come back to keeping one
+// bad item from destroying a whole request. First, it lets a rejected
+// <Value> or attribute be recorded in DecodeErr while decoding continues:
+// encoding/xml's own field decoding aborts the enclosing element on the
+// first field error, leaving the token stream mid-element so the
+// surrounding <Items> loop cannot recover. Second, the loop consumes
+// through this element's end tag on every path, which is the invariant
+// the surrounding loop depends on (Value.UnmarshalXML and
+// OPCQuality.UnmarshalXML guarantee the same for themselves).
+//
+// It additionally tolerates a peer that encodes time/date/duration as
+// dateTime/string plus a ValueTypeQualifier attribute (an interop
+// accommodation some toolchains use, per §2.7.1) rather than this
+// library's own direct xsi:type encoding — see
+// docs/specification/open-questions.md OQ-12.
 func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
-	resultRaw, hasResult := attrValue(start.Attr, xml.Name{Local: "ResultID"})
+	// --- attributes: all read from start.Attr, so nothing here can leave
+	// the decoder in an unexpected position. ---
+	iv.ItemName, _ = attrValue(start.Attr, xml.Name{Local: "ItemName"})
+	if v, ok := attrValue(start.Attr, xml.Name{Local: "ItemPath"}); ok {
+		iv.ItemPath = &v
+	}
+	iv.ClientItemHandle, _ = attrValue(start.Attr, xml.Name{Local: "ClientItemHandle"})
+	// The attribute spelling of DiagnosticInfo is tolerated because this
+	// library itself emitted that form until the encoder was corrected to
+	// the schema's element, so a peer (or a stored fixture) may still
+	// carry it. An element, if present, wins.
+	iv.DiagnosticInfo, _ = attrValue(start.Attr, xml.Name{Local: "DiagnosticInfo"})
+
+	var decodeErr error
+	record := func(field string, code ErrorCode, err error) {
+		if decodeErr == nil {
+			decodeErr = &ItemDecodeError{Field: field, Code: code, Err: err}
+		}
+	}
+
+	if raw, ok := attrValue(start.Attr, xml.Name{Local: "Timestamp"}); ok {
+		// parseXSDDateTime, not a time.Time struct field: xsd:dateTime's
+		// timezone offset is optional and time.Time.UnmarshalText's is
+		// not, so a conforming Write carrying
+		// Timestamp="2026-08-30T12:00:00" used to fault the entire
+		// request. See wireTime (replybase.go).
+		t, err := parseXSDDateTime(raw)
+		if err != nil {
+			record("Timestamp", ErrFail, err)
+		} else {
+			iv.Timestamp = &t
+		}
+	}
+	if raw, ok := attrValue(start.Attr, xml.Name{Local: "ResultID"}); ok {
+		rid, err := resolveQNameIn(d, start.Attr, raw)
+		if err != nil {
+			record("ResultID", ErrFail, err)
+		} else {
+			iv.ResultID = ErrorCode{rid}
+		}
+	}
 	qualifierRaw, hasQualifier := attrValue(start.Attr, xml.Name{Local: "ValueTypeQualifier"})
 
-	var shadow struct {
-		ItemName         string     `xml:"ItemName,attr"`
-		ItemPath         *string    `xml:"ItemPath,attr"`
-		ClientItemHandle string     `xml:"ClientItemHandle,attr"`
-		Timestamp        *time.Time `xml:"Timestamp,attr"`
-		// Both spellings of DiagnosticInfo are accepted on decode. The
-		// element is the schema's own form and the one this library
-		// emits; the attribute is tolerated because this library itself
-		// emitted that form until the encoder was corrected, so a peer
-		// (or a stored fixture) may still carry it.
-		DiagnosticInfoElem string     `xml:"DiagnosticInfo"`
-		DiagnosticInfoAttr string     `xml:"DiagnosticInfo,attr"`
-		Quality            OPCQuality `xml:"Quality"`
-		Value              *Value     `xml:"Value"`
-	}
-	if err := d.DecodeElement(&shadow, &start); err != nil {
-		return fmt.Errorf("xmlda: decoding ItemValue: %w", err)
-	}
-
-	iv.ItemName = shadow.ItemName
-	iv.ItemPath = shadow.ItemPath
-	iv.ClientItemHandle = shadow.ClientItemHandle
-	iv.DiagnosticInfo = shadow.DiagnosticInfoElem
-	if iv.DiagnosticInfo == "" {
-		iv.DiagnosticInfo = shadow.DiagnosticInfoAttr
-	}
-	iv.Timestamp = shadow.Timestamp
-	iv.Quality = shadow.Quality
-	iv.Value = shadow.Value
-
-	if hasResult {
-		rid, err := resolveQName(d, resultRaw)
+	// --- children ---
+	for done := false; !done; {
+		tok, err := d.Token()
 		if err != nil {
-			return err
+			return fmt.Errorf("xmlda: decoding ItemValue: %w", err)
 		}
-		iv.ResultID = ErrorCode{rid}
+		switch t := tok.(type) {
+		case xml.EndElement:
+			done = true
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "DiagnosticInfo":
+				text, err := elementText(d, t)
+				if err != nil {
+					return err
+				}
+				if text != "" {
+					iv.DiagnosticInfo = text
+				}
+			case "Value":
+				var v Value
+				if err := v.UnmarshalXML(d, t); err != nil {
+					// E_BADTYPE: a <Value> whose content does not match
+					// its declared xsi:type, or that declares none at
+					// all, is exactly the specification's bad-type
+					// condition for that one item.
+					record("Value", ErrBadType, err)
+					continue
+				}
+				iv.Value = &v
+			case "Quality":
+				var q OPCQuality
+				if err := q.UnmarshalXML(d, t); err != nil {
+					record("Quality", ErrFail, err)
+					continue
+				}
+				iv.Quality = &q
+			default:
+				if err := d.Skip(); err != nil {
+					return err
+				}
+			}
+		}
 	}
+
 	if hasQualifier && iv.Value != nil {
-		if err := applyValueTypeQualifier(iv.Value, qualifierRaw, d); err != nil {
-			return err
+		if err := applyValueTypeQualifier(iv.Value, qualifierRaw, d, start.Attr); err != nil {
+			record("ValueTypeQualifier", ErrBadType, err)
 		}
 	}
+	iv.DecodeErr = decodeErr
 	return nil
 }
 
@@ -192,8 +298,8 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 // doesn't match the expected wire-base type for that qualifier, is left
 // unchanged — this is a tolerant best-effort reinterpretation, not a
 // strict validation.
-func applyValueTypeQualifier(v *Value, qualifierRaw string, d *xml.Decoder) error {
-	qn, err := resolveQName(d, qualifierRaw)
+func applyValueTypeQualifier(v *Value, qualifierRaw string, d *xml.Decoder, elemAttrs []xml.Attr) error {
+	qn, err := resolveQNameIn(d, elemAttrs, qualifierRaw)
 	if err != nil {
 		return err
 	}

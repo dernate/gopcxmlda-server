@@ -140,3 +140,104 @@ func shutdownManager(t *testing.T, m *Manager) {
 		t.Errorf("Manager.Shutdown: %v", err)
 	}
 }
+
+// --- the backend can revise a sampling rate ---
+
+// rateReviser is a fakeReader that also implements
+// backend.SamplingRateReviser, pinning every rate to fixedRate.
+type rateReviser struct {
+	*fakeReader
+	fixedRate time.Duration
+	err       error
+	shortBy   int // return this many fewer rates than asked for
+	mu        sync.Mutex
+	calls     int
+}
+
+func (r *rateReviser) ReviseSamplingRates(_ context.Context, reqs []backend.RateRequest) ([]time.Duration, error) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
+	out := make([]time.Duration, max(len(reqs)-r.shortBy, 0))
+	for i := range out {
+		out[i] = r.fixedRate
+	}
+	return out, nil
+}
+
+func (r *rateReviser) Calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// clampReader reports every read with S_CLAMP plus a usable value.
+type clampReader struct{ *fakeReader }
+
+func (c *clampReader) Read(ctx context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
+	out, err := c.fakeReader.Read(ctx, items)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i].ResultID.IsZero() {
+			out[i].ResultID = xmlda.SuccessClamp
+		}
+	}
+	return out, nil
+}
+
+// --- shared minimal backend ---
+
+type fixStatus struct{}
+
+func (fixStatus) GetStatus(context.Context, string) (backend.ServerStatus, error) {
+	return backend.ServerStatus{
+		State:              xmlda.ServerStateRunning,
+		SupportedLocaleIDs: []string{"en-US"},
+	}, nil
+}
+
+type fixReader struct{}
+
+func (fixReader) Read(_ context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
+	out := make([]backend.Result[backend.ItemSample], len(items))
+	for i := range items {
+		out[i] = backend.Result[backend.ItemSample]{Value: backend.ItemSample{
+			Value:   xmlda.NewInt32(1),
+			Quality: xmlda.NewGoodQuality(),
+		}}
+	}
+	return out, nil
+}
+
+// slowReader consumes a fixed amount of fake-clock time per Read, so a
+// test can make the backend "slow" without any real waiting.
+type slowReader struct {
+	clk  *clocktest.Fake
+	cost time.Duration
+	mu   sync.Mutex
+	n    int
+}
+
+func (r *slowReader) Read(_ context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
+	r.mu.Lock()
+	r.n++
+	r.mu.Unlock()
+	// Advancing from inside the callback is safe: Fake fires callbacks
+	// with its own lock released (see clocktest.Fake's doc comment).
+	r.clk.Advance(r.cost)
+	out := make([]backend.Result[backend.ItemSample], len(items))
+	for i := range items {
+		out[i] = backend.Result[backend.ItemSample]{Value: backend.ItemSample{
+			Value: xmlda.NewInt32(1), Quality: xmlda.NewGoodQuality()}}
+	}
+	return out, nil
+}
+
+func (r *slowReader) count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.n }
+
+func (r *slowReader) reset() { r.mu.Lock(); defer r.mu.Unlock(); r.n = 0 }

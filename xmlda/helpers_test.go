@@ -120,3 +120,7 @@ func decodeItemParamsFromDoc(t *testing.T, doc []byte) ItemParams {
 	}
 	return p
 }
+
+// qualityPtr returns a pointer to q, for ItemValue.Quality (a *OPCQuality,
+// so an item with no sample can omit the element entirely).
+func qualityPtr(q OPCQuality) *OPCQuality { return &q }

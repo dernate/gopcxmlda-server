@@ -59,6 +59,17 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 	results := make([]backend.Result[backend.WriteOutcome], len(req.ItemList.Items))
 	if readOnly {
 		for i := range results {
+			// A malformed item is reported as malformed even on a
+			// read-only server: E_ACCESS_DENIED would tell the client its
+			// item was fine and only the permission was missing, sending
+			// it to fix the wrong thing.
+			if err := req.ItemList.Items[i].DecodeErr; err != nil {
+				results[i] = backend.Result[backend.WriteOutcome]{
+					ResultID:       xmlda.ItemResultIDFor(err),
+					DiagnosticInfo: xmlda.ItemDiagnosticFor(err),
+				}
+				continue
+			}
 			results[i] = backend.Result[backend.WriteOutcome]{ResultID: xmlda.ErrAccessDenied}
 		}
 	} else {
@@ -70,21 +81,36 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 		writeItems := make([]backend.WriteRequestItem, 0, len(req.ItemList.Items))
 		origIdx := make([]int, 0, len(req.ItemList.Items))
 		for i, it := range req.ItemList.Items {
+			// An item this server could not interpret at all (a malformed
+			// Timestamp, a <Value> whose content contradicts its declared
+			// xsi:type) never reaches the backend: it resolves to its own
+			// per-item ResultID, so one bad item costs the client that
+			// item rather than the whole Write.
+			if it.DecodeErr != nil {
+				results[i] = backend.Result[backend.WriteOutcome]{
+					ResultID:       xmlda.ItemResultIDFor(it.DecodeErr),
+					DiagnosticInfo: xmlda.ItemDiagnosticFor(it.DecodeErr),
+				}
+				continue
+			}
 			if it.Value == nil {
 				results[i] = backend.Result[backend.WriteOutcome]{ResultID: xmlda.ErrBadType}
 				continue
 			}
 			wi := backend.WriteRequestItem{Ref: refs[i], Value: *it.Value, Timestamp: it.Timestamp}
-			// Comparing against the zero OPCQuality distinguishes "no
-			// <Quality> element in the request" (zero value, nil internal
-			// pointers) from "a <Quality> element was present" (non-nil
-			// pointers, even if it explicitly specified the defaults) —
-			// see xmlda.OPCQuality's decode behavior. Quality and
-			// Timestamp are tracked independently here so a client
-			// writing only one of the two doesn't spuriously synthesize
-			// the other.
-			if it.Quality != (xmlda.OPCQuality{}) {
-				q := it.Quality
+			// A nil Quality means "no <Quality> element in the request";
+			// a non-nil one means the element was present, even when it
+			// carried no attributes and so specified the wire defaults
+			// explicitly. That distinction is why ItemValue.Quality is a
+			// pointer: the previous comparison against the zero
+			// OPCQuality could not draw it (OPCQuality's fields are
+			// themselves pointers, making the comparison pointer
+			// identity), so an explicit <Quality/> was silently dropped
+			// instead of being written. Quality and Timestamp are tracked
+			// independently so a client writing only one of the two
+			// doesn't spuriously synthesize the other.
+			if it.Quality != nil {
+				q := *it.Quality
 				wi.Quality = &q
 			}
 			writeItems = append(writeItems, wi)

@@ -14,7 +14,9 @@ package plantbackend
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
@@ -275,7 +277,34 @@ func (b *Backend) Browse(ctx context.Context, req backend.BrowseRequest) (backen
 		candidates = append(candidates, el)
 	}
 
-	return backend.BrowseResult{Elements: candidates}, nil
+	// Pagination, so this fixture exercises the framework's
+	// continuation-point handling (REQ-BROWSE-002) rather than leaving it
+	// untested at the container level. The cursor is this backend's own
+	// private format — the server wraps it behind a keyed MAC before it
+	// reaches the wire — but it is still validated here rather than
+	// trusted: a token the server issued can be replayed within its
+	// lifetime, and the address space may have changed underneath it in
+	// the meantime, so an offset that no longer fits is an error rather
+	// than a slice index. See backend.BrowseRequest.ContinuationPoint.
+	offset := 0
+	if req.ContinuationPoint != "" {
+		n, err := strconv.Atoi(req.ContinuationPoint)
+		if err != nil || n < 0 || n > len(candidates) {
+			return backend.BrowseResult{}, fmt.Errorf("plantbackend: unusable continuation point %q", req.ContinuationPoint)
+		}
+		offset = n
+	}
+	page := candidates[offset:]
+	next := ""
+	if req.MaxElementsReturned > 0 && len(page) > req.MaxElementsReturned {
+		page = page[:req.MaxElementsReturned]
+		next = strconv.Itoa(offset + len(page))
+	}
+	return backend.BrowseResult{
+		Elements:          page,
+		ContinuationPoint: next,
+		MoreElements:      next != "",
+	}, nil
 }
 
 func propertiesFor(itm *item, includeValue bool) []backend.Property {

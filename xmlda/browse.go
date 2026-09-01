@@ -10,12 +10,31 @@ import (
 // BrowseFilter filters Browse results by element kind (§3.8.1, p.70).
 type BrowseFilter string
 
-// Standard BrowseFilter values.
+// Standard BrowseFilter values. "all" is the schema's own default for an
+// absent BrowseFilter attribute.
 const (
 	BrowseFilterAll    BrowseFilter = "all"
 	BrowseFilterBranch BrowseFilter = "branch"
 	BrowseFilterItem   BrowseFilter = "item"
 )
+
+// IsValid reports whether f is one of the three values the schema's
+// browseFilter enumeration admits.
+//
+// The empty BrowseFilter is valid and means "all": UnmarshalXML
+// substitutes the schema's own default for an absent attribute, so a
+// backend never has to guess what "" means, and a decoded-then-encoded
+// request keeps the same meaning. Anything else is E_INVALIDFILTER,
+// which the server layer rejects rather than forwarding to a backend
+// that has no way to make sense of it.
+func (f BrowseFilter) IsValid() bool {
+	switch f {
+	case "", BrowseFilterAll, BrowseFilterBranch, BrowseFilterItem:
+		return true
+	default:
+		return false
+	}
+}
 
 // BrowseRequest is the request for the Browse operation (§3.8.1,
 // pp.69-71). A blank ItemName/ItemPath means "browse the address space
@@ -111,8 +130,14 @@ func (r *BrowseRequest) UnmarshalXML(d *xml.Decoder, start xml.StartElement) err
 		}
 		r.MaxElementsReturned = int32(n)
 	}
+	// The schema declares BrowseFilter with default="all", so an absent
+	// attribute means "all" — substituted here rather than left as "" for
+	// every backend to rediscover. An unrecognized value is kept verbatim
+	// so the server layer can reject it with E_INVALIDFILTER instead of
+	// silently passing nonsense down to the backend; see IsValid.
+	r.BrowseFilter = BrowseFilterAll
 	if v, ok := attrValue(start.Attr, xml.Name{Local: "BrowseFilter"}); ok {
-		r.BrowseFilter = BrowseFilter(v)
+		r.BrowseFilter = BrowseFilter(strings.TrimSpace(v))
 	}
 	r.ElementNameFilter, _ = attrValue(start.Attr, xml.Name{Local: "ElementNameFilter"})
 	r.VendorFilter, _ = attrValue(start.Attr, xml.Name{Local: "VendorFilter"})

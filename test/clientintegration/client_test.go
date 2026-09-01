@@ -8,13 +8,13 @@ package clientintegration
 
 import (
 	"context"
+	"github.com/dernate/gopcxmlda"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/dernate/gopcxmlda"
 
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/examples/basic-server/memorybackend"
@@ -481,5 +481,141 @@ func TestRealClient_SubscriptionCancel(t *testing.T) {
 	}
 	if !strings.Contains(refreshed.Fault.FaultCode, "E_NOSUBSCRIPTION") {
 		t.Fatalf("got Fault %+v, want E_NOSUBSCRIPTION — SubscriptionCancel did not actually remove the subscription", refreshed.Fault)
+	}
+}
+
+// --- what a failing item's quality looks like to the client ---
+
+// TestIntegration_FailedItemQualityAsSeenByRealClient pins the quality question from the
+// client's side. The reference client maps the reply's Quality straight
+// into its own TQuality, so a server claiming good quality for an item it
+// could not read puts "good, no value" into the client's process image —
+// the exact contradiction the item's own ResultID denies.
+func TestIntegration_FailedItemQualityAsSeenByRealClient(t *testing.T) {
+	client, _ := newTestServer(t)
+	crh, cih := newHandles(t, 2)
+
+	items := []gopcxmlda.TItem{
+		{ItemName: "Demo/Temperature"},
+		{ItemName: "No/Such/Tag"},
+	}
+	// The reference client reports a non-nil error whenever the reply
+	// carries ANY Errors entry, even a per-item one on an otherwise
+	// successful response — so an error naming E_UNKNOWNITEMNAME here is
+	// the expected outcome, not a server failure. The response is still
+	// fully populated, which is what this test is about.
+	got, err := client.Read(context.Background(), items, &crh, &cih, "", clientOptions())
+	if err != nil && !strings.Contains(err.Error(), "E_UNKNOWNITEMNAME") {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Response.ItemList.Items) != 2 {
+		t.Fatalf("got %d items, want 2", len(got.Response.ItemList.Items))
+	}
+
+	var checked bool
+	for _, item := range got.Response.ItemList.Items {
+		if !strings.Contains(item.Error, "E_UNKNOWNITEMNAME") {
+			continue
+		}
+		checked = true
+		if item.Quality.QualityField == "good" {
+			t.Errorf("the client reads QualityField=%q for an item the server could not resolve",
+				item.Quality.QualityField)
+		}
+	}
+	if !checked {
+		t.Fatalf("no item reported E_UNKNOWNITEMNAME: %+v", got.Response.ItemList.Items)
+	}
+
+	// The raw bytes are the authoritative check: Go's own decoder fills in
+	// the same zero value whether <Quality> was present or absent, which is
+	// why the defect survived every round-trip test for so long.
+	url := newRawTestServer(t, server.Config{})
+	body := rawEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `"><Options ReturnItemName="true"/><ItemList>` +
+		`<Items ItemName="No/Such/Tag"/></ItemList></Read>` + rawEnvelopeClose
+	status, data := rawPost(t, url, body)
+	if status != http.StatusOK {
+		t.Fatalf("got status %d: %s", status, data)
+	}
+	if strings.Contains(string(data), "<Quality") {
+		t.Errorf("the response still carries a Quality element for a failed item:\n%s", data)
+	}
+}
+
+// --- the happy path must still work ---
+
+// TestIntegration_RealClientStillWorksEndToEnd is the guard against this
+// whole batch of changes having broken ordinary traffic: the reference
+// client must still complete a full Read → Write → Subscribe → Poll →
+// Cancel cycle. It overlaps with the per-operation tests in client_test.go
+// on purpose — this one exists to fail loudly if any fix regressed the
+// happy path.
+func TestIntegration_RealClientStillWorksEndToEnd(t *testing.T) {
+	client, _ := newTestServer(t)
+	ctx := context.Background()
+
+	crh, cih := newHandles(t, 1)
+	read, err := client.Read(ctx, []gopcxmlda.TItem{{ItemName: "Demo/Temperature"}}, &crh, &cih, "", clientOptions())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(read.Response.ItemList.Items) != 1 {
+		t.Fatalf("Read returned %d items, want 1", len(read.Response.ItemList.Items))
+	}
+	if e := read.Response.ItemList.Items[0].Error; e != "" {
+		t.Errorf("Read item reports %q", e)
+	}
+	if read.Response.ItemList.Items[0].Timestamp.IsZero() {
+		t.Error("Read item carries no Timestamp despite ReturnItemTime")
+	}
+
+	crh2, cih2 := newHandles(t, 1)
+	if _, err := client.Write(ctx,
+		[]gopcxmlda.TItem{{ItemName: "Demo/Message", Value: gopcxmlda.TValue{Value: "hi"}}},
+		&crh2, &cih2, "", clientOptions()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	crh3, cih3 := newHandles(t, 1)
+	sub, err := client.Subscribe(ctx, []gopcxmlda.TItem{{ItemName: "Demo/Counter"}},
+		&crh3, &cih3, "", true, 0, clientOptions())
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	handle := sub.Response.ServerSubHandle
+	if handle == "" {
+		t.Fatal("Subscribe returned no handle")
+	}
+	if len(sub.Response.ItemList.Items) != 1 {
+		t.Fatalf("Subscribe returned %d items, want 1", len(sub.Response.ItemList.Items))
+	}
+	// The reference client surfaces the per-item RevisedSamplingRate, so
+	// this is a real assertion rather than a structural one: the server
+	// must name a rate it will actually honor. The engine substitutes
+	// Config.DefaultSamplingRate for the client's "fastest practical" (0),
+	// so a zero here would mean the server promised nothing at all.
+	if rate := sub.Response.ItemList.Items[0].RevisedSamplingRate; rate <= 0 {
+		t.Errorf("RevisedSamplingRate = %d, want the rate the server actually scheduled", rate)
+	}
+
+	// A real backend tick, then poll.
+	time.Sleep(1200 * time.Millisecond)
+
+	crh4, _ := newHandles(t, 0)
+	refreshed, err := client.SubscriptionPolledRefresh(
+		ctx, handle, 0, "", &crh4, clientOptions(), gopcxmlda.TServerTime{UseClientTime: true})
+	if err != nil {
+		t.Fatalf("SubscriptionPolledRefresh: %v", err)
+	}
+	if len(refreshed.Response.InvalidServerSubHandles) != 0 {
+		t.Errorf("got InvalidServerSubHandles %v, want none", refreshed.Response.InvalidServerSubHandles)
+	}
+	if len(refreshed.Response.ItemList.Items) == 0 {
+		t.Error("expected at least one changed item after a 1.2s wait on a 1s-ticking counter")
+	}
+
+	crh5, _ := newHandles(t, 0)
+	if _, err := client.SubscriptionCancel(ctx, handle, "", &crh5); err != nil {
+		t.Fatalf("SubscriptionCancel: %v", err)
 	}
 }

@@ -230,7 +230,18 @@ func changedChans(subs []*subState) []<-chan struct{} {
 // exits via callCtx.Done(), so the caller cancelling callCtx (typically
 // via defer, immediately before returning) is what keeps these
 // goroutines bounded to one call's lifetime, however that call returns.
+//
+// One handle — by far the most common shape of a real
+// SubscriptionPolledRefresh — spawns no goroutine at all: the single
+// channel already IS the "any of these fired" signal, since every channel
+// fanned in here is close-only. That matters because these goroutines are
+// per handle per in-flight call, which is the one place in this server
+// where a client's request size multiplies against its request
+// concurrency.
 func fanIn(callCtx context.Context, chans []<-chan struct{}) <-chan struct{} {
+	if len(chans) == 1 {
+		return chans[0]
+	}
 	out := make(chan struct{})
 	var once sync.Once
 	for _, ch := range chans {
@@ -315,7 +326,7 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 						HaveSample:       true,
 					})
 				}
-				it.buffer = nil
+				m.releaseItemBuffer(it)
 			case len(it.buffer) > 0:
 				for _, u := range it.buffer {
 					itemResults = append(itemResults, RefreshItemResult{
@@ -327,7 +338,7 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 						ResultID:         u.resultID,
 					})
 				}
-				it.buffer = nil
+				m.releaseItemBuffer(it)
 			}
 			if it.overflowed {
 				overflow = true
@@ -346,4 +357,18 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 		}
 	}
 	return result
+}
+
+// releaseItemBuffer empties it's delivered buffer and returns its slots to
+// the server-wide budget. it.mu must be held.
+//
+// Only a buffering item's entries were ever counted (see sampleBudget), so
+// only those are returned; miscounting here is how a budget starts
+// refusing buffering to live items on behalf of samples that were
+// delivered long ago.
+func (m *Manager) releaseItemBuffer(it *itemState) {
+	if it.enableBuffering {
+		m.budget.release(int64(len(it.buffer)))
+	}
+	it.buffer = nil
 }
