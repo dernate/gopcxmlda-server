@@ -53,17 +53,29 @@ func (m *Manager) startPush(ctx context.Context, s *subState, cn backend.ChangeN
 		err error
 	}
 	resCh := make(chan watchResult, 1)
-	// m.wg.Go (not a bare "go func"): a backend slower than PollTimeout
-	// leaves this goroutine running past the select below, which falls
-	// back to poll-mode without it. Manager.Wait/Shutdown must still know
-	// about it and wait for it to actually return — otherwise shutdown
-	// could complete while a call into third-party backend code is still
-	// in flight, silently violating Wait's documented "every background
-	// goroutine has exited" guarantee.
-	m.wg.Go(func() {
+	// m.goTracked, not a bare "go func" and not m.wg.Go: a backend slower
+	// than PollTimeout leaves this goroutine running past the select
+	// below, which falls back to poll-mode without it. Manager.Wait/
+	// Shutdown must still know about it and wait for it to actually
+	// return — otherwise shutdown could complete while a call into
+	// third-party backend code is still in flight, silently violating
+	// Wait's documented "every background goroutine has exited"
+	// guarantee. goTracked (rather than wg.Go) takes the WaitGroup slot
+	// under m.mu together with the shutdown check, which is what keeps
+	// the Add from racing a concurrent Wait — see its doc comment.
+	if !m.goTracked(func() {
+		// WatchItems is third-party backend code on a bare goroutine —
+		// no net/http per-request recover exists here, so an unrecovered
+		// panic would take the whole process down.
+		defer m.recoverBackgroundPanic("WatchItems")
 		ch, err := cn.WatchItems(s.ctx, watchItems)
 		resCh <- watchResult{ch, err}
-	})
+	}) {
+		// Shutdown has already begun; s.ctx is cancelled and there is
+		// nothing left to watch. Starting a poll chain instead would only
+		// create a timer for stopPolling to tear down again.
+		return
+	}
 
 	// NewTimer + Stop rather than clock.After: the losing branch's timer
 	// would otherwise stay armed for the rest of PollTimeout with nothing
@@ -78,7 +90,8 @@ func (m *Manager) startPush(ctx context.Context, s *subState, cn backend.ChangeN
 			m.schedulePoll(s, s.minSamplingRate())
 			return
 		}
-		m.wg.Go(func() {
+		m.goTracked(func() {
+			defer m.recoverBackgroundPanic("drainPush")
 			m.drainPush(s, res.ch, byRef)
 		})
 	case <-timeout.C():
@@ -157,7 +170,7 @@ func (m *Manager) handlePushEvent(s *subState, ev backend.ChangeEvent, byRef map
 	}
 	changed := false
 	for _, it := range its {
-		if applyUpdate(it, ev.Sample, resultID, m.cfg.MaxBufferedSamplesPerItem, m.budget) {
+		if applyUpdateMetered(it, ev.Sample, resultID, ev.DiagnosticInfo, m.cfg.MaxBufferedSamplesPerItem, m.budget, m.metrics) {
 			changed = true
 		}
 	}

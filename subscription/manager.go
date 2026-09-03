@@ -124,6 +124,12 @@ func (b *sampleBudget) count() int64 {
 	return b.n.Load()
 }
 
+// WithDefaults returns a copy of c with every unset field replaced by its
+// built-in default. Exported so server.Config — which forwards these
+// fields — can resolve them from the one place their real values live,
+// rather than restating the numbers and letting the two copies drift.
+func (c Config) WithDefaults() Config { return c.withDefaults() }
+
 func (c Config) withDefaults() Config {
 	if c.MaxConcurrentPolls <= 0 {
 		c.MaxConcurrentPolls = 32
@@ -155,6 +161,10 @@ func (c Config) withDefaults() Config {
 type Manager struct {
 	mu   sync.RWMutex
 	subs map[Handle]*subState
+	// totalItems is the number of subscribed items across every entry in
+	// subs, maintained by Create and terminate so the server-wide item
+	// budget needs no map scan under the lock. Guarded by mu.
+	totalItems int
 
 	cfg     Config
 	clock   clock.Clock
@@ -211,10 +221,11 @@ func NewManager(be backend.Backend, clk clock.Clock, log telemetry.Logger, metri
 }
 
 // update is one recorded change to a subscribed item: either a new
-// sample (ResultID zero, HaveSample true) or an abnormal per-item
-// condition reported by the backend while the subscription was live
-// (ResultID non-zero, HaveSample false — e.g. the item vanished from the
-// address space, or its watch broke).
+// sample (haveSample true, resultID zero or a non-critical S_ code that
+// accompanies it) or a critical per-item condition reported by the
+// backend while the subscription was live (resultID an E_ code,
+// haveSample false — e.g. the item vanished from the address space, or
+// its watch broke).
 //
 // Carrying the condition alongside the sample is what keeps a failing
 // item from being reported to the client as a Good-quality change: a
@@ -225,6 +236,10 @@ type update struct {
 	sample     backend.ItemSample
 	resultID   xmlda.ErrorCode
 	haveSample bool
+	// diagnosticInfo is the backend's per-item diagnostic text for this
+	// outcome, kept so RequestOptions.ReturnDiagnosticInfo can be honored
+	// on SubscriptionPolledRefresh exactly as it is on Read and Write.
+	diagnosticInfo string
 }
 
 // itemState is one subscribed item's mutable state, private to the
@@ -248,13 +263,26 @@ type itemState struct {
 	// client actually saw rather than against a synthetic blank.
 	haveLast bool
 	last     backend.ItemSample
+	// lastDiagnosticInfo accompanies lastResultID, so a ReturnAllItems
+	// reply can report the condition with the same detail a change reply
+	// carries.
+	lastDiagnosticInfo string
 	// lastResultID is the item's currently-reported condition, the zero
 	// ErrorCode while it is healthy. Compared against each new poll/push
-	// outcome so a persistent failure is reported once rather than on
-	// every tick.
+	// outcome so a persistent critical failure is reported once rather
+	// than on every tick; a non-critical S_ code does not suppress the
+	// value it accompanies (see applyUpdate).
 	lastResultID xmlda.ErrorCode
 	buffer       []update // pending, undelivered changes; oldest first
 	overflowed   bool
+	// released reports that this item's subscription has been terminated
+	// and its buffered samples already returned to the server-wide budget
+	// (releaseBuffers). An applyUpdate whose s.ctx check passed just
+	// before the cancellation would otherwise acquire budget slots
+	// afterwards and write them into a buffer nobody will ever drain —
+	// leaking those slots permanently, until the budget refuses buffering
+	// to live subscriptions on behalf of dead ones.
+	released bool
 	// lastPolledAt is the last time THIS item was actually read from the
 	// backend in poll mode — distinct from subState.lastPolledAt (which
 	// tracks client PolledRefresh calls for the reaper). Zero until the
@@ -346,6 +374,13 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 // BeginShutdown cancels every subscription's context without waiting for
 // background goroutines to exit. Idempotent.
 //
+// Cancellation is explicit per subscription rather than by propagation
+// from m.rootCtx: a subscription's context carries the values of the
+// Subscribe request that created it (context.WithoutCancel — see Create),
+// so it has no cancellable ancestor here. m.rootCtx still gates whether
+// NEW subscriptions and timers may be created at all, which is what the
+// check under this same mutex is for.
+//
 // rootCancel is called while holding m.mu — the same mutex Create's
 // atomic shutdown-check-and-insert holds (see create.go) — so a Create
 // call and a BeginShutdown call can never interleave: whichever
@@ -370,6 +405,11 @@ func (m *Manager) BeginShutdown() {
 			m.reapTimer = nil
 		}
 		for _, s := range m.subs {
+			// Cancelled explicitly rather than by propagation: a
+			// subscription's context is derived from the Subscribe
+			// request's values (see Create), so m.rootCtx is no longer
+			// its ancestor and cancelling the root no longer reaches it.
+			s.cancel()
 			s.stopPolling()
 		}
 	})
@@ -391,6 +431,12 @@ func (m *Manager) Wait(ctx context.Context) error {
 	}
 }
 
+// Count returns the current number of active subscriptions. Exported
+// because it is the one number an embedding application needs for a
+// health or diagnostics endpoint, and because a test outside this package
+// otherwise has no way to assert that a subscription was cleaned up.
+func (m *Manager) Count() int { return m.count() }
+
 // count returns the current number of active subscriptions.
 func (m *Manager) count() int {
 	m.mu.RLock()
@@ -401,16 +447,17 @@ func (m *Manager) count() int {
 // totalItemsLocked returns the number of subscribed items across every
 // live subscription. m.mu must be held.
 //
-// Each subscription's item slice is fixed at Create time and never
-// changes afterwards (OPC XML-DA has no "add item to existing
-// subscription" operation), so this needs no per-subscription lock.
-func (m *Manager) totalItemsLocked() int {
-	n := 0
-	for _, s := range m.subs {
-		n += len(s.items)
-	}
-	return n
-}
+// It reads a counter maintained by the two places that change the set of
+// live subscriptions (Create's insert and terminate's delete) rather than
+// summing the map. Each subscription's item slice is fixed at Create time
+// and never changes afterwards (OPC XML-DA has no "add item to existing
+// subscription" operation), so a counter cannot drift from the map.
+//
+// Summing the map was correct but ran under the global write lock on
+// every single Subscribe: at the default ceiling of 10 000 subscriptions
+// that is a 10 000-entry scan blocking every other subscription
+// operation, for a number the manager can just as well carry along.
+func (m *Manager) totalItemsLocked() int { return m.totalItems }
 
 // armTimer arms a clock.Clock.AfterFunc timer whose callback is tracked
 // by m.wg for its whole lifetime — from the moment it is armed, not from
@@ -465,6 +512,37 @@ func (m *Manager) armTimer(d time.Duration, f func()) (clock.Timer, bool) {
 		f()
 	})
 	return &trackedTimer{inner: t, release: release}, true
+}
+
+// goTracked starts f on a background goroutine tracked by m.wg, taking
+// the WaitGroup slot under m.mu together with the shutdown check — the
+// same pairing armTimer relies on, and for exactly the same reason.
+//
+// sync.WaitGroup forbids a positive Add that takes the counter off zero
+// from racing a Wait. Create releases m.mu after inserting the
+// subscription and only then calls startRefreshing, so a
+// BeginShutdown+Wait that won the mutex in between could otherwise
+// observe a zero counter, return — and race the Add that startPush's
+// goroutines perform. BeginShutdown calls rootCancel while holding this
+// same mutex, so once shutdown has begun no further Add can pass the
+// check below, and Wait has nothing left to race.
+//
+// Reports false, having started nothing, when shutdown has already
+// begun: the subscription's own context is cancelled by then, so there
+// is no work left for f to do.
+func (m *Manager) goTracked(f func()) bool {
+	m.mu.Lock()
+	if m.rootCtx.Err() != nil {
+		m.mu.Unlock()
+		return false
+	}
+	m.wg.Add(1)
+	m.mu.Unlock()
+	go func() {
+		defer m.wg.Done()
+		f()
+	}()
+	return true
 }
 
 // trackedTimer is armTimer's return value: a clock.Timer whose Stop also
@@ -524,6 +602,7 @@ func (m *Manager) terminate(handle Handle) bool {
 	s, ok := m.subs[handle]
 	if ok {
 		delete(m.subs, handle)
+		m.totalItems -= len(s.items)
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -550,6 +629,10 @@ func (s *subState) releaseBuffers(b *sampleBudget) {
 			b.release(int64(len(it.buffer)))
 		}
 		it.buffer = nil
+		// Set under the same lock that guards the release above, so an
+		// applyUpdate racing this cannot slip a budget acquisition in
+		// between the two.
+		it.released = true
 		it.mu.Unlock()
 	}
 }

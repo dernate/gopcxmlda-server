@@ -69,6 +69,11 @@ type CreateItemResult struct {
 	// true and this item was valid.
 	Sample     backend.ItemSample
 	HaveSample bool
+	// DiagnosticInfo is the backend's per-item diagnostic text for this
+	// item's outcome, carried through so the server layer can honor
+	// RequestOptions.ReturnDiagnosticInfo on Subscribe exactly as it does
+	// on Read and Write.
+	DiagnosticInfo string
 }
 
 // CreateResult is the outcome of Create. Handle is "" iff no item was
@@ -146,6 +151,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 			RevisedSamplingRate: rate,
 			ReqType:             it.ReqType,
 			ResultID:            resultID,
+			DiagnosticInfo:      res.DiagnosticInfo,
 		}
 		if usable {
 			items = append(items, &itemState{
@@ -171,7 +177,28 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		return out, nil // Handle stays "" — no subscription created
 	}
 
-	ctx2, cancel := context.WithCancel(m.rootCtx)
+	// The subscription's context carries the REQUEST's values, not
+	// context.Background()'s.
+	//
+	// Everything a backend needs to authorize a call — the identity an
+	// HTTP middleware put in the request context, a tenant, a trace — is
+	// carried as context values, and Read, Write, Browse and
+	// GetProperties all deliver them because the request context is what
+	// reaches the backend. Building the subscription's own context from
+	// m.rootCtx instead meant the Subscribe-time validation read carried
+	// the caller's identity and every poll and every WatchItems after it
+	// carried none: a mandatory-access-control backend authorized once and
+	// then served an anonymous caller for the life of the subscription,
+	// and one that correctly refused the anonymous poll made the
+	// subscription go quiet with no way to see why.
+	//
+	// WithoutCancel keeps the values and drops the request's own
+	// cancellation and deadline, which is exactly right: a subscription
+	// outlives the Subscribe call that created it. Its lifetime is
+	// governed by the cancel below — and BeginShutdown now calls that
+	// explicitly for every subscription, since m.rootCtx is no longer an
+	// ancestor that could propagate to it.
+	ctx2, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s := &subState{
 		handle:              newHandle(),
 		mgr:                 m,
@@ -218,6 +245,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (CreateResult, 
 		return CreateResult{}, ErrTooManyItems
 	}
 	m.subs[s.handle] = s
+	m.totalItems += len(items)
 	m.mu.Unlock()
 	m.metrics.SetActiveSubscriptions(m.count())
 

@@ -13,24 +13,26 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 	var env soap.Envelope[xmlda.WriteRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Write", "parse")
-		writeFault(w, requestDecodeFault("Write", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("Write", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Write", "deadline_exceeded")
-		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
-	if len(req.ItemList.Items) == 0 {
-		h.metrics.IncRequestError("Write", "empty_item_list")
-		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
-		return
-	}
+	// An empty (or absent) ItemList is schema-legal: both the element and
+	// its Items are minOccurs="0", and §3.3.1 only says "It is expected
+	// that there are one or more Items per ItemList". A request that asks
+	// for nothing gets an empty, successful reply rather than a
+	// whole-operation fault — refusing it invents a requirement the
+	// schema does not state, and a client assembling its item list
+	// dynamically hits it for a perfectly ordinary reason.
 	if !h.checkItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Write", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many items in one Write request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many items in one Write request"))
 		return
 	}
 
@@ -117,12 +119,12 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 			origIdx = append(origIdx, i)
 		}
 		if len(writeItems) > 0 {
-			backendResults, err := observeBackend(h.metrics, h.clk, "Write", func() ([]backend.Result[backend.WriteOutcome], error) {
+			backendResults, err := observeBackend(ctx, h.metrics, h.clk, "Write", h.cfg.BackendTimeout, func() ([]backend.Result[backend.WriteOutcome], error) {
 				return h.backend.Writer.Write(ctx, writeItems)
 			})
 			if err != nil {
 				h.metrics.IncRequestError("Write", "backend_error")
-				writeFault(w, backendErrorFault(err))
+				writeFault(w, soapVersion(doc), backendErrorFault(err))
 				return
 			}
 			// A conforming backend returns exactly one Result per
@@ -175,7 +177,7 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 	resp := xmlda.WriteResponse{
 		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
-		Errors:    xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
+		Errors:    buildErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }

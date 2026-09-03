@@ -19,7 +19,7 @@ func TestItemValue_RoundTrip(t *testing.T) {
 		Quality:          qualityPtr(NewQuality(QualityUncertain, LimitHigh, 3)),
 		Timestamp:        &ts,
 		ResultID:         SuccessUnsupportedRate,
-		DiagnosticInfo:   "sampling rate reduced",
+		DiagnosticInfo:   strPtrIV("sampling rate reduced"),
 	}
 	out, err := xmlMarshalNamed(t, "Items", iv)
 	if err != nil {
@@ -54,8 +54,8 @@ func TestItemValue_RoundTrip(t *testing.T) {
 	if got.ResultID != iv.ResultID {
 		t.Fatalf("ResultID: got %+v, want %+v", got.ResultID, iv.ResultID)
 	}
-	if got.DiagnosticInfo != iv.DiagnosticInfo {
-		t.Fatalf("DiagnosticInfo: got %q, want %q", got.DiagnosticInfo, iv.DiagnosticInfo)
+	if got.DiagnosticInfo == nil || iv.DiagnosticInfo == nil || *got.DiagnosticInfo != *iv.DiagnosticInfo {
+		t.Fatalf("DiagnosticInfo: got %v, want %v", got.DiagnosticInfo, iv.DiagnosticInfo)
 	}
 }
 
@@ -248,7 +248,7 @@ func TestItemValue_QualityNilVsEmptyElement(t *testing.T) {
 func TestItemValue_DiagnosticInfoIsElementInSequence(t *testing.T) {
 	v := NewInt32(42)
 	out, err := xmlMarshalNamed(t, "Items", ItemValue{
-		ItemName: "A", Value: &v, Quality: qualityPtr(NewGoodQuality()), DiagnosticInfo: "why it failed",
+		ItemName: "A", Value: &v, Quality: qualityPtr(NewGoodQuality()), DiagnosticInfo: strPtrIV("why it failed"),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -287,8 +287,8 @@ func TestItemValue_DecodesDiagnosticInfoBothWays(t *testing.T) {
 			if err := doc.Decode(&iv); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if iv.DiagnosticInfo != "d" {
-				t.Fatalf("got DiagnosticInfo %q, want %q", iv.DiagnosticInfo, "d")
+			if iv.DiagnosticInfo == nil || *iv.DiagnosticInfo != "d" {
+				t.Fatalf("got DiagnosticInfo %v, want %q", iv.DiagnosticInfo, "d")
 			}
 		})
 	}
@@ -329,3 +329,8 @@ func TestItemValueList_CarriesTypeAndReserved(t *testing.T) {
 		t.Fatalf("round trip lost the items: %+v", back.L)
 	}
 }
+
+// strPtrIV is the local helper for ItemValue.DiagnosticInfo, whose
+// pointer-ness distinguishes "the client asked and there is nothing to
+// say" (a blank string, §3.1.6) from "the client did not ask".
+func strPtrIV(s string) *string { return &s }

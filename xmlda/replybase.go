@@ -127,7 +127,7 @@ type ReplyBase struct {
 // type, which strict/.NET-generated clients may expect xsi:type to
 // disambiguate.
 func (r ReplyBase) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ReplyBase"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "ReplyBase"})...)
 	start.Attr = append(start.Attr,
 		xml.Attr{Name: xml.Name{Local: "RcvTime"}, Value: formatWireTime(r.RcvTime)},
 		xml.Attr{Name: xml.Name{Local: "ReplyTime"}, Value: formatWireTime(r.ReplyTime)},

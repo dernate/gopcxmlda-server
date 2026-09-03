@@ -22,7 +22,10 @@ package soap
 import (
 	"encoding/xml"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
+	"strings"
 )
 
 // NS11 and NS12 are the SOAP 1.1 and SOAP 1.2 envelope namespace URIs.
@@ -31,6 +34,47 @@ const (
 	NS11 = "http://schemas.xmlsoap.org/soap/envelope/"
 	NS12 = "http://www.w3.org/2003/05/soap-envelope"
 )
+
+// Version identifies a SOAP envelope version.
+type Version int
+
+// The SOAP versions this package can read and write.
+const (
+	// Version11 is SOAP 1.1, the version OPC XML-DA 1.0 is defined over
+	// and the default for a zero Version.
+	Version11 Version = iota
+	// Version12 is SOAP 1.2. Accepted on input and mirrored on output, so
+	// a client that speaks it is answered in it rather than handed a 1.1
+	// envelope its stack discards.
+	Version12
+)
+
+// NS returns the envelope namespace URI for v.
+func (v Version) NS() string {
+	if v == Version12 {
+		return NS12
+	}
+	return NS11
+}
+
+// ContentType returns the media type a response of this version is served
+// with: SOAP 1.1 uses text/xml, SOAP 1.2 has its own type.
+func (v Version) ContentType() string {
+	if v == Version12 {
+		return "application/soap+xml; charset=utf-8"
+	}
+	return "text/xml; charset=utf-8"
+}
+
+// VersionOf reports the SOAP version an envelope namespace URI denotes,
+// defaulting to 1.1 for anything else — this package matches envelopes by
+// local name and never rejects one over its namespace (ADR-004).
+func VersionOf(envelopeNS string) Version {
+	if envelopeNS == NS12 {
+		return Version12
+	}
+	return Version11
+}
 
 // QName is a namespace URI plus a local name, package-local to soap so
 // this package has no dependency on xmlda (see
@@ -69,13 +113,32 @@ type Envelope[T any] struct {
 	Header *Header
 	// Body carries either a successful payload or a Fault.
 	Body Body[T]
+	// Version selects the envelope shape MarshalXML writes. The zero value
+	// is SOAP 1.1, which is what OPC XML-DA 1.0 is defined over; set it
+	// from the request being answered (VersionOf(env.Name.Space)) so a
+	// client that spoke 1.2 is answered in 1.2.
+	Version Version
+	// ExtraNamespaces are prefix -> URI declarations emitted on the
+	// Envelope element itself, so the payload below need not repeat them
+	// on every element it writes.
+	//
+	// This package knows nothing about those namespaces and does not use
+	// them; it only writes them where XML says a declaration belongs — on
+	// the outermost element that needs it. A caller setting this is
+	// responsible for making its payload actually reference the prefixes
+	// declared here (see xmlda.DeclareAncestorNamespaces).
+	ExtraNamespaces map[string]string
 }
 
 // MarshalXML implements xml.Marshaler, always emitting the SOAP 1.1
 // envelope shape (ADR-004): an empty Header, then Body.
 func (e Envelope[T]) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
 	start.Name = xml.Name{Local: "SOAP-ENV:Envelope"}
-	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:SOAP-ENV"}, Value: NS11})
+	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:SOAP-ENV"}, Value: e.Version.NS()})
+	for _, prefix := range slices.Sorted(maps.Keys(e.ExtraNamespaces)) {
+		start.Attr = append(start.Attr,
+			xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: e.ExtraNamespaces[prefix]})
+	}
 	if err := enc.EncodeToken(start); err != nil {
 		return err
 	}
@@ -86,7 +149,9 @@ func (e Envelope[T]) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 	if err := enc.EncodeToken(headerStart.End()); err != nil {
 		return err
 	}
-	if err := enc.EncodeElement(e.Body, xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Body"}}); err != nil {
+	body := e.Body
+	body.version = e.Version
+	if err := enc.EncodeElement(body, xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Body"}}); err != nil {
 		return err
 	}
 	return enc.EncodeToken(start.End())
@@ -103,16 +168,66 @@ func (e *Envelope[T]) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 		return fmt.Errorf("soap: root element %q is not a SOAP Envelope", start.Name.Local)
 	}
 	var shadow struct {
-		Header *Header `xml:"Header"`
-		Body   Body[T] `xml:"Body"`
+		Headers []Header  `xml:"Header"`
+		Bodies  []Body[T] `xml:"Body"`
 	}
 	if err := d.DecodeElement(&shadow, &start); err != nil {
 		return fmt.Errorf("soap: decoding envelope: %w", err)
 	}
+	// SOAP 1.1 §4 allows exactly one Body. Accepting more and using one of
+	// them — encoding/xml keeps the LAST for a non-slice field — is a
+	// request-smuggling shape: an intermediary that inspects the FIRST
+	// Body (a proxy, an audit log, a policy filter) sees a different
+	// operation than the one this server executes.
+	if len(shadow.Bodies) != 1 {
+		return fmt.Errorf("soap: envelope carries %d Body elements, want exactly 1", len(shadow.Bodies))
+	}
+	if len(shadow.Headers) > 1 {
+		return fmt.Errorf("soap: envelope carries %d Header elements, want at most 1", len(shadow.Headers))
+	}
 	e.Name = QName{Space: start.Name.Space, Local: start.Name.Local}
-	e.Header = shadow.Header
-	e.Body = shadow.Body
-	return nil
+	if len(shadow.Headers) == 1 {
+		e.Header = &shadow.Headers[0]
+	}
+	e.Body = shadow.Bodies[0]
+	return e.checkMustUnderstand()
+}
+
+// checkMustUnderstand enforces SOAP 1.1 §4.2.3: a header block flagged
+// mustUnderstand that the recipient does not understand must be answered
+// with a MustUnderstand fault, not processed as though the block were not
+// there.
+//
+// This package understands no header blocks at all — OPC XML-DA defines
+// none — so any flagged block is, by definition, one it does not
+// understand. Ignoring them was not merely non-conformant: a deployment
+// that puts authorization in a WS-Security header would have had that
+// header dropped and the operation carried out anyway.
+func (e *Envelope[T]) checkMustUnderstand() error {
+	if e.Header == nil {
+		return nil
+	}
+	var names []string
+	for _, b := range e.Header.Blocks {
+		if b.MustUnderstand() {
+			names = append(names, QName{Space: b.XMLName.Space, Local: b.XMLName.Local}.String())
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return &MustUnderstandError{Blocks: names}
+}
+
+// MustUnderstandError reports header blocks flagged mustUnderstand that
+// this package does not understand. The server layer turns it into a
+// SOAP-ENV:MustUnderstand fault (§4.2.3, §4.4).
+type MustUnderstandError struct {
+	Blocks []string
+}
+
+func (e *MustUnderstandError) Error() string {
+	return "soap: unsupported mustUnderstand header block(s): " + strings.Join(e.Blocks, ", ")
 }
 
 // Header carries a SOAP envelope's header content verbatim. OPC XML-DA
@@ -125,6 +240,37 @@ func (e *Envelope[T]) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 // decode-then-encode round trip.
 type Header struct {
 	InnerXML []byte `xml:",innerxml"`
+	// Blocks are the header's immediate children, decoded IN THE
+	// DOCUMENT'S CONTEXT so their namespace prefixes resolve. Re-parsing
+	// InnerXML on its own cannot do that: a mustUnderstand attribute is
+	// qualified with the SOAP prefix, and that prefix is declared on the
+	// Envelope, outside the captured fragment — so it comes back
+	// unresolved and the flag reads as an unrelated attribute.
+	Blocks []HeaderBlock `xml:",any"`
+}
+
+// HeaderBlock is one immediate child of a SOAP Header, carrying just
+// enough to answer the only question this package asks of it: was the
+// recipient told it has to understand this block?
+type HeaderBlock struct {
+	XMLName xml.Name
+	// MustUnderstand11 and MustUnderstand12 are the same attribute in the
+	// two envelope namespaces; a document uses one or the other.
+	MustUnderstand11 string `xml:"http://schemas.xmlsoap.org/soap/envelope/ mustUnderstand,attr"`
+	MustUnderstand12 string `xml:"http://www.w3.org/2003/05/soap-envelope mustUnderstand,attr"`
+}
+
+// MustUnderstand reports whether this block carries a true mustUnderstand
+// flag in either envelope namespace. SOAP 1.1 spells it "1", SOAP 1.2
+// also allows "true".
+func (b HeaderBlock) MustUnderstand() bool {
+	for _, v := range []string{b.MustUnderstand11, b.MustUnderstand12} {
+		v = strings.TrimSpace(v)
+		if v == "1" || strings.EqualFold(v, "true") {
+			return true
+		}
+	}
+	return false
 }
 
 // Body carries either a successful payload (Content) or a Fault, never
@@ -134,6 +280,9 @@ type Header struct {
 type Body[T any] struct {
 	Content *T
 	Fault   *Fault
+	// version is threaded down from the Envelope so a Fault is written in
+	// the same SOAP version as the envelope carrying it.
+	version Version
 }
 
 // MarshalXML implements xml.Marshaler.
@@ -143,7 +292,9 @@ func (b Body[T]) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
 	}
 	switch {
 	case b.Fault != nil:
-		if err := enc.Encode(*b.Fault); err != nil {
+		f := *b.Fault
+		f.version = b.version
+		if err := enc.Encode(f); err != nil {
 			return err
 		}
 	case b.Content != nil:

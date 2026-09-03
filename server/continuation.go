@@ -36,6 +36,13 @@ import (
 // a feature. Clients see E_INVALIDCONTINUATIONPOINT and restart the
 // browse, which the specification already requires them to handle.
 
+// noExpiry is the expiry stamp a token carries when
+// Config.ContinuationPointTTL requests that tokens not expire on their
+// own. It is part of the MAC like any other expiry, so it cannot be
+// forged onto a token that was issued with a real one — and a token still
+// stops working when the process restarts, since the key is per Handler.
+const noExpiry int64 = 0
+
 // continuationKeyLen is the HMAC key length in bytes — 32, matching
 // SHA-256's block-independent output size.
 const continuationKeyLen = 32
@@ -101,7 +108,14 @@ func (h *Handler) buildContinuationToken(req xmlda.BrowseRequest, backendCursor 
 	if backendCursor == "" {
 		return ""
 	}
-	expiry := h.clk.Now().Add(h.cfg.ContinuationPointTTL).Unix()
+	// A negative TTL means "no expiry", which is what Config documents and
+	// what an operator setting it expects. Feeding it to Now().Add()
+	// instead dated every token into the past and broke Browse pagination
+	// outright — the exact opposite of the setting's stated effect.
+	expiry := noExpiry
+	if h.cfg.ContinuationPointTTL > 0 {
+		expiry = h.clk.Now().Add(h.cfg.ContinuationPointTTL).Unix()
+	}
 	return h.continuationMAC(req, expiry, backendCursor) + ":" +
 		strconv.FormatInt(expiry, 10) + ":" + backendCursor
 }
@@ -138,7 +152,7 @@ func (h *Handler) parseContinuationToken(token string, req xmlda.BrowseRequest) 
 	if !hmac.Equal([]byte(gotMAC), []byte(want)) {
 		return "", false
 	}
-	if h.clk.Now().After(time.Unix(expiry, 0)) {
+	if expiry != noExpiry && h.clk.Now().After(time.Unix(expiry, 0)) {
 		return "", false
 	}
 	return cursor, true

@@ -115,7 +115,7 @@ func ResolveValuePresence(q OPCQuality, haveLastKnown bool) bool {
 // (testdata/responses/subscribe_680.response.xml):
 // <Quality LimitField="none" QualityField="good" VendorField="0" xsi:type="opc:OPCQuality"/>.
 func (q OPCQuality) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "OPCQuality"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "OPCQuality"})...)
 	if q.qualityField != nil {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "QualityField"}, Value: string(*q.qualityField)})
 	}

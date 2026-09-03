@@ -33,6 +33,55 @@ any other backend call is made, the server checks `xmlda.RequiresFault(operation
 server process's lifetime (a client may poll it to detect a restart). `SupportedLocaleIDs` must list at
 least one entry.
 
+## Checking your backend: `backendtest`
+
+Everything on this page is a contract, and until now every part of it was
+prose. `backend/backendtest` turns the checkable parts into a test suite
+you run from your own package:
+
+```go
+func TestConformance(t *testing.T) {
+	backendtest.Run(t, func(t *testing.T) backendtest.Fixture {
+		be := newMyBackend(t)
+		return backendtest.Fixture{
+			Backend:      be.AsBackend(),
+			ReadableItem: backend.ItemRef{ItemName: "Plant.Line1.Temp"},
+			UnknownItem:  backend.ItemRef{ItemName: "no.such.item"},
+			WritableItem: backend.ItemRef{ItemName: "Plant.Line1.Setpoint"},
+			WriteValue:   xmlda.NewFloat64(42),
+		}
+	})
+}
+```
+
+It checks result length and order, that an unknown item is a per-item
+`ResultID` rather than a whole-operation error, that every returned
+`Value` can actually be encoded, that a continuation cursor is treated as
+untrusted input, that `WatchItems` closes its channel when its context is
+done, and more. Anything the fixture does not describe is skipped, so a
+backend implementing only `Status` and `Reader` is a supported shape.
+`examples/basic-server/memorybackend` runs the suite as a worked example.
+
+## The context you are given
+
+Every method receives a `context.Context`, and it is the request's — so
+values an HTTP middleware placed in it (an authenticated principal, a
+tenant, a trace) reach you. A subscription's polls and its `WatchItems`
+call carry the values of the `Subscribe` request that created it, but
+none of its cancellation or deadline: a subscription outlives the call
+that created it, and its lifetime is the manager's to end.
+
+**Honor cancellation.** The server bounds every backend call itself
+(`Config.BackendTimeout`), so a blocking call no longer wedges it — but
+the goroutine, and whatever it holds, stays alive with nobody waiting for
+the result. A backend that checks `ctx.Done()` releases its connection or
+transaction when the client has already gone.
+
+**Do not block indefinitely without checking `ctx`.** In poll mode this is
+sharper than it looks: `Config.MaxConcurrentPolls` (32 by default) bounds
+how many poll calls run at once across *all* subscriptions, so 32 stuck
+reads stop the refresh of every subscription on the server.
+
 ## `Reader` — required
 
 ```go

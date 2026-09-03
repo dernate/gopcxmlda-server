@@ -10,11 +10,13 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
@@ -36,7 +38,17 @@ type Handler struct {
 
 	// statusVal/statusFresh/statusOK memoize the pre-dispatch server
 	// status for Config.StatusCacheTTL — see statusFor.
-	statusMu    sync.Mutex
+	//
+	// statusLock is a buffered channel of capacity 1 rather than a
+	// sync.Mutex, because the lock is deliberately held across the backend
+	// call and a caller must be able to give up on it. sync.Mutex has no
+	// cancellable Lock, so waiting on one with a context meant parking a
+	// goroutine per waiter — and against a backend that ignores ctx and
+	// never returns, those goroutines never came back either: the request
+	// itself timed out and freed its MaxConcurrentRequests slot, so the
+	// leak scaled with the request RATE and nothing bounded it. A channel
+	// send composes with ctx.Done() in one select and costs no goroutine.
+	statusLock  chan struct{}
 	statusVal   backend.ServerStatus
 	statusFresh time.Time
 	statusOK    bool
@@ -48,9 +60,21 @@ type Handler struct {
 	// Handler and never persisted — see continuation.go.
 	cpKey []byte
 
+	// shuttingDown flips once BeginShutdown/Shutdown has been called, so a
+	// readiness probe can fail before the server starts refusing work —
+	// otherwise the load balancer keeps sending requests until the last
+	// moment. See Stats/HealthHandler.
+	shuttingDown atomic.Bool
+
 	// reqSem bounds in-flight requests (Config.MaxConcurrentRequests);
 	// nil when the limit is disabled.
 	reqSem chan struct{}
+	// pollSem is the sub-budget SubscriptionPolledRefresh draws from on
+	// top of reqSem (Config.MaxConcurrentPolledRefresh); nil when that
+	// limit is disabled. A long poll holds its slot for up to
+	// MaxPolledRefreshWait, so without a class of its own it starves
+	// every operation that answers in milliseconds.
+	pollSem chan struct{}
 }
 
 // normalizeStatus checks a backend-supplied ServerStatus for the
@@ -110,12 +134,30 @@ func (h *Handler) requiresFault(op string, state xmlda.ServerState) (bool, xmlda
 // a no-op when the limit is disabled, so callers can defer it
 // unconditionally.
 func (h *Handler) acquireRequestSlot() (release func(), ok bool) {
-	if h.reqSem == nil {
+	return acquire(h.reqSem)
+}
+
+// acquireOperationSlot takes the per-class slot an operation needs on top
+// of its general request slot. Only SubscriptionPolledRefresh has one:
+// it is the only operation that holds its slot for a duration the client
+// chooses (up to Config.MaxPolledRefreshWait), so it is the only one that
+// can starve the rest.
+func (h *Handler) acquireOperationSlot(opName string) (release func(), ok bool) {
+	if opName != "SubscriptionPolledRefresh" {
+		return func() {}, true
+	}
+	return acquire(h.pollSem)
+}
+
+// acquire takes one slot from sem, or reports false if none is free. A nil
+// sem means the limit is disabled.
+func acquire(sem chan struct{}) (release func(), ok bool) {
+	if sem == nil {
 		return func() {}, true
 	}
 	select {
-	case h.reqSem <- struct{}{}:
-		return func() { <-h.reqSem }, true
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
 	default:
 		return func() {}, false
 	}
@@ -139,7 +181,7 @@ func (h *Handler) acquireRequestSlot() (release func(), ok bool) {
 // error is never cached — the next request retries.
 func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerStatus, error) {
 	if h.cfg.StatusCacheTTL < 0 || opName == "GetStatus" {
-		st, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
+		st, err := observeBackend(ctx, h.metrics, h.clk, "GetStatus", h.cfg.BackendTimeout, func() (backend.ServerStatus, error) {
 			return h.backend.Status.GetStatus(ctx, "")
 		})
 		if err != nil {
@@ -148,70 +190,84 @@ func (h *Handler) statusFor(ctx context.Context, opName string) (backend.ServerS
 		st = h.normalizeStatus(st)
 		// A live read supersedes whatever the cache holds: a state change
 		// observed here must not be masked by an older entry.
-		h.storeStatus(st)
+		h.storeStatus(ctx, st)
 		return st, nil
 	}
-	// Acquiring the cache lock is itself cancellable. Holding it across
-	// the backend call is what collapses a burst into a single fetch, but
-	// it also means a waiter can be parked here for as long as that call
-	// takes — and a client that has already hung up should not be made to
-	// wait for a backend it will never hear from.
-	if err := lockContext(ctx, &h.statusMu); err != nil {
-		return backend.ServerStatus{}, err
+	// Acquiring the cache lock is itself cancellable, so a client that has
+	// already hung up is never parked behind a backend it will not hear
+	// from.
+	select {
+	case h.statusLock <- struct{}{}:
+	case <-ctx.Done():
+		return backend.ServerStatus{}, ctx.Err()
 	}
-	defer h.statusMu.Unlock()
 	now := h.clk.Now()
 	if h.statusOK && now.Sub(h.statusFresh) < h.cfg.StatusCacheTTL {
-		return h.statusVal, nil
+		st := h.statusVal
+		<-h.statusLock
+		return st, nil
 	}
-	st, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
-		return h.backend.Status.GetStatus(ctx, "")
-	})
-	if err != nil {
-		return backend.ServerStatus{}, err
-	}
-	st = h.normalizeStatus(st)
-	h.statusVal, h.statusFresh, h.statusOK = st, now, true
-	return st, nil
-}
 
-// lockContext acquires mu, or gives up if ctx is done first. sync.Mutex
-// has no cancellable Lock, so the acquisition runs on its own goroutine;
-// if ctx wins the race that goroutine still completes and immediately
-// releases, leaving no leak and no lock held by a caller that has gone.
-func lockContext(ctx context.Context, mu *sync.Mutex) error {
-	// Fast path: an uncontended mutex — which, for the status cache, is
-	// the overwhelmingly common case, since a cache HIT also comes through
-	// here. Without it every request paid for a goroutine, a channel
-	// allocation and a select just to discover the lock was free.
-	if mu.TryLock() {
-		return nil
+	// The lock is released by the FETCH, not by whoever is waiting for it.
+	//
+	// That distinction is the whole point of holding it across the backend
+	// call: it collapses a burst into one fetch. Releasing it when a
+	// waiter gives up instead let the next request start a second fetch
+	// against a backend that had not answered the first — so against a
+	// backend that ignores ctx and never returns, every request rate
+	// bought another permanently-blocked goroutine. Holding it until the
+	// call actually completes means at most ONE such goroutine exists,
+	// however long the backend stays stuck and however many requests
+	// arrive meanwhile; the rest give up cheaply below.
+	type fetch struct {
+		st  backend.ServerStatus
+		err error
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	acquired := make(chan struct{})
+	done := make(chan fetch, 1)
 	go func() {
-		mu.Lock()
-		close(acquired)
+		// Detached from the request's deadline on purpose. This fetch
+		// serves whoever asks next as much as the request that started
+		// it, and — more importantly — the lock must stay held until the
+		// CALL is finished, not until the first waiter's 50 ms elapses.
+		// Bounding it by the request context instead released the lock
+		// while the backend was still stuck, so the next request started
+		// another fetch, and the count of permanently-blocked goroutines
+		// grew with the request rate. BackendTimeout is what bounds it.
+		fetchCtx := context.WithoutCancel(ctx)
+		st, err := observeBackend(fetchCtx, h.metrics, h.clk, "GetStatus", h.cfg.BackendTimeout,
+			func() (backend.ServerStatus, error) {
+				return h.backend.Status.GetStatus(fetchCtx, "")
+			})
+		if err == nil {
+			st = h.normalizeStatus(st)
+			h.statusVal, h.statusFresh, h.statusOK = st, now, true
+		}
+		done <- fetch{st, err}
+		<-h.statusLock
 	}()
+
 	select {
-	case <-acquired:
-		return nil
+	case f := <-done:
+		if f.err != nil {
+			return backend.ServerStatus{}, f.err
+		}
+		return f.st, nil
 	case <-ctx.Done():
-		go func() {
-			<-acquired
-			mu.Unlock()
-		}()
-		return ctx.Err()
+		return backend.ServerStatus{}, ctx.Err()
 	}
 }
 
-// storeStatus records st as the current cached status.
-func (h *Handler) storeStatus(st backend.ServerStatus) {
-	h.statusMu.Lock()
+// storeStatus records st as the current cached status, unless ctx is done
+// first — the same cancellable acquisition statusFor uses, so a client
+// that has hung up never waits on a backend it will not hear from.
+func (h *Handler) storeStatus(ctx context.Context, st backend.ServerStatus) {
+	select {
+	case h.statusLock <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
 	h.statusVal, h.statusFresh, h.statusOK = st, h.clk.Now(), true
-	h.statusMu.Unlock()
+	<-h.statusLock
 }
 
 // checkSOAPAction compares the request's SOAPAction header against the
@@ -280,18 +336,24 @@ func New(deps Deps, cfg Config) (*Handler, error) {
 	if cfg.MaxConcurrentRequests > 0 {
 		reqSem = make(chan struct{}, cfg.MaxConcurrentRequests)
 	}
+	var pollSem chan struct{}
+	if cfg.MaxConcurrentPolledRefresh > 0 {
+		pollSem = make(chan struct{}, cfg.MaxConcurrentPolledRefresh)
+	}
 
 	subs := subscription.NewManager(deps.Backend, clk, log, metrics, cfg.subscriptionConfig())
 
 	return &Handler{
-		cfg:     cfg,
-		backend: deps.Backend,
-		clk:     clk,
-		log:     log,
-		metrics: metrics,
-		subs:    subs,
-		cpKey:   cpKey,
-		reqSem:  reqSem,
+		cfg:        cfg,
+		statusLock: make(chan struct{}, 1),
+		backend:    deps.Backend,
+		clk:        clk,
+		log:        log,
+		metrics:    metrics,
+		subs:       subs,
+		cpKey:      cpKey,
+		reqSem:     reqSem,
+		pollSem:    pollSem,
 	}, nil
 }
 
@@ -301,12 +363,14 @@ func New(deps Deps, cfg Config) (*Handler, error) {
 // own http.Server must call this before http.Server.Shutdown — see
 // docs/architecture/subscription-model.md.
 func (h *Handler) Shutdown(ctx context.Context) error {
+	h.shuttingDown.Store(true)
 	return h.subs.Shutdown(ctx)
 }
 
 // BeginShutdown cancels every subscription without waiting for
 // background goroutines to exit — see subscription.Manager.BeginShutdown.
 func (h *Handler) BeginShutdown() {
+	h.shuttingDown.Store(true)
 	h.subs.BeginShutdown()
 }
 
@@ -325,12 +389,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rcvTime := h.clk.Now()
 
 	opName := "unknown"
+	// Until the document has been parsed there is nothing to mirror, and
+	// SOAP 1.1 is what OPC XML-DA 1.0 is defined over.
+	version := soap.Version11
+	// Measured for EVERY request, including the ones rejected before an
+	// operation is even known — a latency series with the failures cut out
+	// hides exactly the requests an operator is looking for.
+	defer func() {
+		h.metrics.ObserveRequestLatency(opName, h.clk.Now().Sub(rcvTime))
+	}()
 	defer func() {
 		if rec := recover(); rec != nil {
+			// A panic raised inside a backend call is re-raised here by
+			// callBounded, carrying the stack it actually happened on;
+			// debug.Stack() at this point would only show the re-raise.
+			stack := debug.Stack()
+			if bp, ok := rec.(backendPanic); ok {
+				rec, stack = bp.value, bp.stack
+			}
 			h.log.Error("panic recovered while handling request",
-				"operation", opName, "panic", rec, "stack", string(debug.Stack()))
+				"operation", opName, "panic", rec, "stack", string(stack))
 			h.metrics.IncRequestError(opName, "panic")
-			writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
+			writeFault(w, version, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
 		}
 	}()
 
@@ -339,6 +419,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// response that *does* carry a SOAP Fault goes through writeFault,
 	// which is fixed at 500 per the SOAP 1.1 HTTP binding.
 	if r.Method != http.MethodPost {
+		// RFC 9110 §15.5.6 makes the Allow header mandatory on a 405.
+		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed: OPC XML-DA is POST-only", http.StatusMethodNotAllowed)
 		return
 	}
@@ -350,11 +432,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// convert exhaustion into unbounded latency.
 	release, ok := h.acquireRequestSlot()
 	if !ok {
+		// opName is still "unknown" here by construction: admission
+		// control runs before the body is read, which is the point.
 		h.metrics.IncRequestError(opName, "busy")
-		writeFault(w, fault(xmlda.ErrBusy, xmlda.StandardErrorText(xmlda.ErrBusy)))
+		writeFault(w, version, fault(xmlda.ErrBusy, xmlda.StandardErrorText(xmlda.ErrBusy)))
 		return
 	}
 	defer release()
+
+	// A Content-Type check, deliberately narrow. OPC XML-DA is SOAP 1.1
+	// over HTTP, whose binding names text/xml; real clients also send
+	// application/soap+xml, and some send nothing at all — all three are
+	// accepted, because rejecting a well-formed request over a header is
+	// the kind of strictness that breaks interoperability for no protocol
+	// benefit. What is refused is a type that positively claims to be
+	// something else: without any check the endpoint accepts a
+	// cross-origin form post, which is a "simple request" the browser
+	// sends without a preflight.
+	if ct := r.Header.Get("Content-Type"); ct != "" && !acceptableContentType(ct) {
+		h.metrics.IncRequestError(opName, "unsupported_media_type")
+		w.Header().Set("Accept", "text/xml, application/soap+xml")
+		http.Error(w, "unsupported media type: expected text/xml or application/soap+xml",
+			http.StatusUnsupportedMediaType)
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -372,29 +473,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// One Document for the whole request: its namespace-prefix table is
 	// built once here and reused by the typed decode in each handler,
 	// instead of being rebuilt from scratch per decode.
-	doc, err := xmlda.NewDocument(body)
+	doc, err := xmlda.NewDocumentLimited(body, h.cfg.MaxElementDepth)
 	if err != nil {
 		// Bucket 1: not well-formed XML/SOAP at all.
 		h.metrics.IncParseError()
-		writeFault(w, soapClientFault("malformed request: "+err.Error()))
+		writeFault(w, version, soapClientFault("malformed request: "+err.Error()))
 		return
 	}
+	// From here on, answer in the version the peer spoke: a SOAP 1.2
+	// client handed a 1.1 envelope discards it, losing the very payload or
+	// error code it was waiting for.
+	version = soapVersion(doc)
 	op, ok, err := doc.IdentifyOperation()
 	if err != nil {
 		h.metrics.IncParseError()
-		writeFault(w, soapClientFault("malformed request: "+err.Error()))
+		writeFault(w, version, soapClientFault("malformed request: "+err.Error()))
 		return
 	}
 	if !ok {
 		// Bucket 2: well-formed, but not one of the 8 known operations.
 		h.metrics.IncRequestError("unknown", "unsupported_operation")
-		writeFault(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
+		writeFault(w, version, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
 		return
 	}
 
 	opName = op.Name.Local
 	h.metrics.IncRequest(opName)
 	h.checkSOAPAction(r, op)
+
+	// The per-class slot can only be taken once the operation is known,
+	// which is after the body has been decoded far enough to name it. That
+	// is deliberate: the general slot above is what protects the decode
+	// itself, and this one protects the long, client-controlled wait that
+	// only SubscriptionPolledRefresh performs.
+	releaseOp, ok := h.acquireOperationSlot(opName)
+	if !ok {
+		h.metrics.IncRequestError(opName, "busy")
+		writeFault(w, version, fault(xmlda.ErrBusy, xmlda.StandardErrorText(xmlda.ErrBusy)))
+		return
+	}
+	defer releaseOp()
 
 	timeout := h.cfg.RequestTimeout
 	if opName == "SubscriptionPolledRefresh" {
@@ -419,12 +537,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status, err := h.statusFor(ctx, opName)
 	if err != nil {
 		h.metrics.IncRequestError(opName, "backend_error")
-		writeFault(w, backendErrorFault(err))
+		writeFault(w, version, backendErrorFault(err))
 		return
 	}
 	if needsFault, code := h.requiresFault(opName, status.State); needsFault {
 		h.metrics.IncRequestError(opName, "server_state")
-		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
+		writeFault(w, version, fault(code, xmlda.StandardErrorText(code)))
 		return
 	}
 
@@ -450,8 +568,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		// Unreachable: op came from xmlda's own registry, which only
 		// contains these 8 names.
-		writeFault(w, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
+		writeFault(w, version, fault(xmlda.ErrNotSupported, xmlda.StandardErrorText(xmlda.ErrNotSupported)))
 	}
+}
+
+// acceptableContentType reports whether ct names a media type this
+// server will read a SOAP envelope out of. Parameters (charset, action)
+// are ignored; a missing type is handled by the caller.
+func acceptableContentType(ct string) bool {
+	mediaType := ct
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = mediaType[:i]
+	}
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "text/xml", "application/soap+xml", "application/xml":
+		return true
+	default:
+		return false
+	}
+}
+
+// soapVersion reports the SOAP version a decoded request was written in,
+// so the response can be written in the same one.
+func soapVersion(doc *xmlda.Document) soap.Version {
+	if doc == nil {
+		return soap.Version11
+	}
+	return soap.VersionOf(doc.EnvelopeNamespace())
 }
 
 // polledRefreshGrace is the headroom added to a SubscriptionPolledRefresh
@@ -475,22 +618,46 @@ const polledRefreshGrace = 5 * time.Second
 // as encoded to: Encode flushes on its own, but Close is what reports an
 // element left unclosed, and that too must surface as a fault rather
 // than as a truncated body.
-func writeResponse[T any](w http.ResponseWriter, resp T) {
-	env := soap.Envelope[T]{Body: soap.Body[T]{Content: &resp}}
+// It reports whether the response actually reached the client. An encode
+// failure is also logged: without that, a whole operation's result
+// collapses into an opaque E_FAIL with nothing anywhere naming the
+// response or the reason — and the cause is almost always a backend
+// returning a value this library cannot represent, which the operator has
+// no other way to find. The return value lets a caller that committed
+// state before writing (handleSubscribe, which by then holds a live
+// subscription the client is about to be told about) roll that state back
+// instead of leaving it stranded.
+func writeResponse[T any](w http.ResponseWriter, log telemetry.Logger, version soap.Version, resp T) bool {
+	// The three namespaces every response element references are declared
+	// once, on the Envelope, and the payload is told so. Each element
+	// declaring its own is correct XML and is what keeps a standalone
+	// xmlda.Value self-contained — but inside a full response it produced
+	// 6004 xmlns declarations for a 1000-item Read, 62 % of the bytes on
+	// the wire, on every poll cycle.
+	ns := xmlda.ResponseNamespaces()
+	byPrefix := make(map[string]string, len(ns))
+	for uri, prefix := range ns {
+		byPrefix[prefix] = uri
+	}
+	env := soap.Envelope[T]{Version: version, Body: soap.Body[T]{Content: &resp}, ExtraNamespaces: byPrefix}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
 	enc := xml.NewEncoder(&buf)
-	if err := enc.Encode(env); err != nil {
-		writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
-		return
+	defer xmlda.DeclareAncestorNamespaces(enc, ns)()
+	err := enc.Encode(env)
+	if err == nil {
+		err = enc.Close()
 	}
-	if err := enc.Close(); err != nil {
-		writeFault(w, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
-		return
+	if err != nil {
+		log.Error("encoding the response failed; replying with a fault instead",
+			"responseType", fmt.Sprintf("%T", resp), "error", err.Error())
+		writeFault(w, version, fault(xmlda.ErrFail, xmlda.StandardErrorText(xmlda.ErrFail)))
+		return false
 	}
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.Header().Set("Content-Type", version.ContentType())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(buf.Bytes())
+	return true
 }
 
 // writeFault encodes f as a SOAP Fault response body.
@@ -508,8 +675,8 @@ func writeResponse[T any](w http.ResponseWriter, resp T) {
 // Encoding goes into a buffer first for the same reason writeResponse
 // does it: WriteHeader cannot be taken back, so an encode failure partway
 // through must not reach the client as a truncated fault body.
-func writeFault(w http.ResponseWriter, f *soap.Fault) {
-	env := soap.Envelope[struct{}]{Body: soap.Body[struct{}]{Fault: f}}
+func writeFault(w http.ResponseWriter, version soap.Version, f *soap.Fault) {
+	env := soap.Envelope[struct{}]{Version: version, Body: soap.Body[struct{}]{Fault: f}}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
 	enc := xml.NewEncoder(&buf)
@@ -523,9 +690,31 @@ func writeFault(w http.ResponseWriter, f *soap.Fault) {
 		http.Error(w, "internal error encoding SOAP fault", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.WriteHeader(http.StatusInternalServerError)
+	w.Header().Set("Content-Type", version.ContentType())
+	// SOAP 1.1's HTTP binding fixes a fault at 500 (§6.2). SOAP 1.2 §7
+	// splits it: a Sender fault — the client's own malformed input — is a
+	// 400, everything else a 500. Answering a 1.2 client with 500 for its
+	// own mistake is not wrong enough to matter, but it is wrong.
+	status := http.StatusInternalServerError
+	if version == soap.Version12 && f != nil && isSenderFault(f.Code) {
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
+}
+
+// isSenderFault reports whether code names a fault SOAP 1.2 classifies as
+// the sender's, which its HTTP binding answers with 400 rather than 500.
+func isSenderFault(code soap.QName) bool {
+	if code.Space != soap.NS11 && code.Space != soap.NS12 {
+		return false
+	}
+	switch code.Local {
+	case "Client", "Sender", "MustUnderstand", "VersionMismatch":
+		return true
+	default:
+		return false
+	}
 }
 
 // checkItemCount rejects a request whose item count exceeds

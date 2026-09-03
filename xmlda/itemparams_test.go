@@ -69,7 +69,7 @@ func TestItemParamsAttrs_RoundTrip(t *testing.T) {
 		EnableBuffering:       &enable,
 	}
 
-	attrs := encodeItemParamsAttrs(p)
+	attrs := encodeItemParamsAttrs(nil, p)
 	start := xmlStartElementFor("Items", attrs)
 	doc, err := xmlMarshalStart(t, start)
 	if err != nil {

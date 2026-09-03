@@ -1,6 +1,6 @@
 module github.com/dernate/gopcxmlda-server/test/clientintegration
 
-go 1.26.5
+go 1.26.7
 
 replace github.com/dernate/gopcxmlda-server => ../..
 

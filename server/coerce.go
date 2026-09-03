@@ -219,7 +219,20 @@ func uint64ToScalar(u uint64, target xmlda.ScalarType) (xmlda.Value, bool) {
 func numericToScalar(f float64, target xmlda.ScalarType) (xmlda.Value, bool) {
 	switch target {
 	case xmlda.TypeFloat:
-		return xmlda.NewFloat32(float32(f)), true
+		// A finite double beyond ±math.MaxFloat32 becomes ±Inf under Go's
+		// float64→float32 conversion. Handing that back as the item's
+		// value — with an empty ResultID and the backend's quality, which
+		// is usually good — is exactly the silent substitution every other
+		// target in this function refuses: the client reads "INF" as a
+		// valid measurement. NaN and an already-infinite source are
+		// faithful representations rather than overflow and still pass
+		// through; underflow to zero is ordinary rounding into the
+		// target's representable range and stays allowed.
+		g := float32(f)
+		if math.IsInf(float64(g), 0) && !math.IsInf(f, 0) {
+			return xmlda.Value{}, false
+		}
+		return xmlda.NewFloat32(g), true
 	case xmlda.TypeDouble:
 		return xmlda.NewFloat64(f), true
 	}
@@ -308,6 +321,15 @@ func numericToScalar(f float64, target xmlda.ScalarType) (xmlda.Value, bool) {
 // same outcome Read produces (REQ-TYPE-006).
 func applyReqType(sample backend.ItemSample, haveSample bool, resultID xmlda.ErrorCode, reqType *xmlda.QName) (backend.ItemSample, bool, xmlda.ErrorCode) {
 	if !haveSample || reqType == nil {
+		return sample, haveSample, resultID
+	}
+	// A Bad-quality item with no last-known value carries no value to
+	// coerce — xmlda.NewNil(typ) by contract, or an unconstructed Value
+	// from a backend that skipped that step. Coercion would fail on the
+	// missing value and report E_BADTYPE, telling the client "wrong type"
+	// where "sensor unreadable" is the truth, and discarding the Quality
+	// that carried it. The requested type is simply not applicable here.
+	if !sample.Value.IsValid() || sample.Value.IsNil() {
 		return sample, haveSample, resultID
 	}
 	coerced, ok := coerceToReqType(sample.Value, reqType)

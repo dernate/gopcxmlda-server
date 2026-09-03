@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"time"
@@ -37,19 +38,19 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 	var env soap.Envelope[xmlda.SubscribeRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Subscribe", "parse")
-		writeFault(w, requestDecodeFault("Subscribe", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("Subscribe", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Subscribe", "deadline_exceeded")
-		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
 	if len(req.ItemList.Items) == 0 {
 		h.metrics.IncRequestError("Subscribe", "empty_item_list")
-		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrFail, "at least one item is required"))
 		return
 	}
 	// Both limits, not just the per-subscription one: MaxItemsPerRequest is
@@ -58,7 +59,7 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 	// Subscribe too.
 	if !h.checkItemCount(len(req.ItemList.Items)) || !h.checkSubscriptionItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Subscribe", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many items in one Subscribe request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many items in one Subscribe request"))
 		return
 	}
 
@@ -96,6 +97,20 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 		var deadband float64
 		if p.Deadband != nil {
 			deadband = *p.Deadband
+			// §3.5.1: "The deadband value shall be in the range 0-100
+			// percent." Taking an out-of-range value at face value has a
+			// failure mode a deadband must not have: anything above 100
+			// silences the item almost completely, and the client is never
+			// told. Reported as this one item's condition, like every
+			// other unusable item attribute.
+			if deadband < 0 || deadband > 100 || math.IsNaN(deadband) {
+				decodeErrs[i] = &xmlda.ItemDecodeError{
+					Field: "Deadband",
+					Code:  xmlda.ErrRange,
+					Err:   fmt.Errorf("%v is outside the permitted range of 0-100 percent", deadband),
+				}
+				continue
+			}
 		}
 		var enableBuffering bool
 		if p.EnableBuffering != nil {
@@ -134,18 +149,18 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 		if err != nil {
 			if errors.Is(err, subscription.ErrTooManySubscriptions) || errors.Is(err, subscription.ErrTooManyItems) {
 				h.metrics.IncRequestError("Subscribe", "limit_exceeded")
-				writeFault(w, limitExceededFault(err.Error()))
+				writeFault(w, soapVersion(doc), limitExceededFault(err.Error()))
 				return
 			}
 			if errors.Is(err, subscription.ErrShuttingDown) {
 				// A shutting-down server is a server-state condition, not the
 				// generic E_FAIL a bare context.Canceled used to produce.
 				h.metrics.IncRequestError("Subscribe", "server_state")
-				writeFault(w, fault(xmlda.ErrServerState, xmlda.StandardErrorText(xmlda.ErrServerState)))
+				writeFault(w, soapVersion(doc), fault(xmlda.ErrServerState, xmlda.StandardErrorText(xmlda.ErrServerState)))
 				return
 			}
 			h.metrics.IncRequestError("Subscribe", "backend_error")
-			writeFault(w, backendErrorFault(err))
+			writeFault(w, soapVersion(doc), backendErrorFault(err))
 			return
 		}
 	}
@@ -165,7 +180,17 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 		}
 	}
 
-	listItems := make([]xmlda.SubscribeItemValue, len(req.ItemList.Items))
+	// §3.5.2: "If ReturnValuesOnReply is false and no errors are found,
+	// RItemList will be empty." Sending one entry per requested item
+	// regardless meant a client got a list of value-less, quality-less
+	// <ItemValue> elements it had explicitly not asked for — and a client
+	// that reads an RItemList entry as "this item is reporting something"
+	// (the usual shape of a DA bridge) then sees an item with no quality.
+	// Items carrying a condition are still reported: those ARE the errors
+	// the sentence excludes, and S_UNSUPPORTEDRATE in particular is how a
+	// revised sampling rate reaches the client at all.
+	keepValueless := req.ReturnValuesOnReply
+	listItems := make([]xmlda.SubscribeItemValue, 0, len(req.ItemList.Items))
 	codes := make([]xmlda.ErrorCode, 0, len(req.ItemList.Items))
 	// listRate is the list-level RevisedSamplingRate: the slowest rate
 	// among the items actually subscribed. The attribute used to go out as
@@ -176,18 +201,27 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 	for i := range req.ItemList.Items {
 		if decodeErrs[i] != nil {
 			iv, code := buildItemDecodeFailure(refs[i], clientHandles[i], decodeErrs[i], req.Options)
-			listItems[i] = xmlda.SubscribeItemValue{ItemValue: iv}
+			listItems = append(listItems, xmlda.SubscribeItemValue{ItemValue: iv})
 			codes = append(codes, code)
 			continue
 		}
 		itemRes := engineResults[i]
 		sample, haveSample, resultID := applyReqType(itemRes.Sample, itemRes.HaveSample, itemRes.ResultID, itemRes.ReqType)
-		iv := buildItemValue(refs[i], itemRes.ClientItemHandle, sample, haveSample, resultID, "", req.Options)
-		listItems[i] = xmlda.SubscribeItemValue{
+		codes = append(codes, resultID)
+		if !keepValueless && resultID.IsZero() {
+			// Nothing to report for this item and no values were asked
+			// for: it stays out of RItemList entirely.
+			if itemRes.RevisedSamplingRate > listRate {
+				listRate = itemRes.RevisedSamplingRate
+			}
+			continue
+		}
+		iv := buildItemValue(refs[i], itemRes.ClientItemHandle, sample, haveSample, resultID,
+			itemRes.DiagnosticInfo, req.Options)
+		listItems = append(listItems, xmlda.SubscribeItemValue{
 			RevisedSamplingRate: msInt32(itemRes.RevisedSamplingRate),
 			ItemValue:           iv,
-		}
-		codes = append(codes, resultID)
+		})
 		if hasUsableValue(resultID) && itemRes.RevisedSamplingRate > listRate {
 			listRate = itemRes.RevisedSamplingRate
 		}
@@ -200,7 +234,16 @@ func (h *Handler) handleSubscribe(ctx context.Context, w http.ResponseWriter, do
 			RevisedSamplingRate: msInt32(listRate),
 			Items:               listItems,
 		},
-		Errors: xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
+		Errors: buildErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
-	writeResponse(w, resp)
+	if !writeResponse(w, h.log, soapVersion(doc), resp) {
+		// The subscription exists, but the client never learned its
+		// handle — it can neither poll nor cancel it, and only the
+		// abandonment reaper would eventually collect it (after
+		// SubscriptionPingRate × ReapGraceMultiplier, a value the client
+		// itself chooses and which is not capped). A client retrying the
+		// failed Subscribe would accumulate one such unreachable,
+		// backend-polling subscription per attempt.
+		h.subs.Cancel(res.Handle)
+	}
 }

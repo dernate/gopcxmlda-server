@@ -316,3 +316,46 @@ func TestIntegerToScalar_EveryTargetWidth_BoundaryChecked(t *testing.T) {
 		})
 	}
 }
+
+// TestNumericToScalar_Float32OverflowIsRejected pins the one narrowing
+// this file used to perform silently. A finite double beyond
+// ±math.MaxFloat32 becomes ±Inf, and handing that back as the item's
+// value — empty ResultID, the backend's usually-good quality — is exactly
+// the silent substitution every other target here refuses:
+// docs/protocol-support.md promises "explicit range checking
+// (out-of-range → the value is not silently truncated)", and a client
+// reading "INF" as a measurement is worse than a truncation.
+func TestNumericToScalar_Float32OverflowIsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   float64
+		want bool // want the coercion to succeed
+	}{
+		{"overflow above", 1e300, false},
+		{"overflow below", -1e300, false},
+		{"MaxFloat32 itself", math.MaxFloat32, true},
+		{"-MaxFloat32", -math.MaxFloat32, true},
+		{"underflow rounds to zero", 1e-300, true},
+		{"NaN passes through", math.NaN(), true},
+		{"+Inf passes through", math.Inf(1), true},
+		{"-Inf passes through", math.Inf(-1), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := coerceToReqType(xmlda.NewFloat64(tc.in), &xmlda.QName{Space: xmlda.XSDNamespace, Local: "float"})
+			if ok != tc.want {
+				t.Fatalf("coercing %v to xsd:float: ok = %v, want %v (value %v)", tc.in, ok, tc.want, got)
+			}
+			if !ok {
+				return
+			}
+			f, err := got.Float32()
+			if err != nil {
+				t.Fatalf("result is not a float32: %v", err)
+			}
+			// An accepted result must never be an infinity the source did not have.
+			if math.IsInf(float64(f), 0) && !math.IsInf(tc.in, 0) {
+				t.Errorf("coercing %v produced %v — a finite value became infinite", tc.in, f)
+			}
+		})
+	}
+}

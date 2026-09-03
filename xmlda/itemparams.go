@@ -133,13 +133,13 @@ func decodeItemParamsAttrs(d *xml.Decoder, attrs []xml.Attr) (ItemParams, error)
 
 // encodeItemParamsAttrs renders p's set fields as xml.Attr, for a caller
 // assembling its own StartElement. Fields left nil in p are omitted.
-func encodeItemParamsAttrs(p ItemParams) []xml.Attr {
+func encodeItemParamsAttrs(e *xml.Encoder, p ItemParams) []xml.Attr {
 	var attrs []xml.Attr
 	if p.ItemPath != nil {
 		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "ItemPath"}, Value: *p.ItemPath})
 	}
 	if p.ReqType != nil {
-		attrs = append(attrs, qnameAttr(attrs, "ReqType", *p.ReqType)...)
+		attrs = append(attrs, qnameAttr(e, attrs, "ReqType", *p.ReqType)...)
 	}
 	if p.MaxAge != nil {
 		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "MaxAge"}, Value: strconv.FormatInt(int64(*p.MaxAge), 10)})
@@ -161,7 +161,7 @@ func encodeItemParamsAttrs(p ItemParams) []xml.Attr {
 // per-item request element that carries just hierarchical params plus
 // those two identifying attributes and no child content.
 func marshalRequestItem(e *xml.Encoder, start xml.StartElement, params ItemParams, itemName, clientItemHandle string) error {
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, params)...)
 	if itemName != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: itemName})
 	}

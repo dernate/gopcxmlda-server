@@ -44,6 +44,39 @@ type Metrics interface {
 	IncSubscriptionError(cause string)
 	// IncParseError counts one request body that failed to parse.
 	IncParseError()
+
+	// ObserveRequestLatency records how long the server took to answer one
+	// request, measured from receipt to the moment the response is
+	// written.
+	//
+	// ObserveBackendLatency answers "is the data source slow"; this one
+	// answers the other half, "is the server slow", which without it could
+	// not be asked at all. The two together are what separates a field
+	// problem from a server problem — usually the first question after a
+	// client complains.
+	ObserveRequestLatency(operation string, d time.Duration)
+
+	// IncDroppedSamples counts n subscription samples the server discarded
+	// because a buffer limit was reached.
+	//
+	// This is the moment the server loses process data. It was previously
+	// neither logged nor counted anywhere: the only trace was the
+	// DataBufferOverflow flag on whichever reply happened to follow, which
+	// tells a client something was lost but tells an operator nothing
+	// about how often or where.
+	IncDroppedSamples(n int)
+
+	// ObservePollLag records how far behind schedule one poll-mode tick
+	// ran — the difference between when it was due and when it actually
+	// executed.
+	//
+	// A subscription promises the client a RevisedSamplingRate, and the
+	// promise quietly stops being true once the poll semaphore saturates
+	// or the backend slows down. Nothing else in this interface can see
+	// that: the subscription keeps working, just slower than it said,
+	// which is the failure mode hardest to notice and easiest to fix once
+	// visible.
+	ObservePollLag(d time.Duration)
 }
 
 type noopLogger struct{}
@@ -65,6 +98,9 @@ func (noopMetrics) ObserveBackendLatency(operation string, d time.Duration) {}
 func (noopMetrics) SetActiveSubscriptions(n int)                            {}
 func (noopMetrics) IncSubscriptionError(cause string)                       {}
 func (noopMetrics) IncParseError()                                          {}
+func (noopMetrics) ObserveRequestLatency(operation string, d time.Duration) {}
+func (noopMetrics) IncDroppedSamples(n int)                                 {}
+func (noopMetrics) ObservePollLag(d time.Duration)                          {}
 
 // NoopMetrics returns a Metrics that discards everything — the default
 // when no Metrics is configured.

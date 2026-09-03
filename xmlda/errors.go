@@ -133,7 +133,7 @@ func DedupeErrors(codes []ErrorCode, textOf func(ErrorCode) string) Errors {
 // MarshalXML implements xml.Marshaler, rendering <Errors ID="prefix:CODE">
 // with a nested <Text> child, per §2.6's example.
 func (e OPCError) MarshalXML(enc *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ID", e.ID.QName)...)
+	start.Attr = mergeAttrs(start.Attr, qnameAttr(enc, start.Attr, "ID", e.ID.QName)...)
 	if err := enc.EncodeToken(start); err != nil {
 		return err
 	}

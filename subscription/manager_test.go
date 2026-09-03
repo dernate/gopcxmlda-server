@@ -25,7 +25,7 @@ func TestSampleBudget_ExhaustionDegradesToLatestValue(t *testing.T) {
 
 	for v := int32(1); v <= 6; v++ {
 		applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, budget)
+			xmlda.ErrorCode{}, "", 100, budget)
 	}
 
 	it.mu.Lock()
@@ -79,7 +79,7 @@ func TestSampleBudget_ReleasedOnDeliveryAndCancel(t *testing.T) {
 	// one fewer entry than the loop suggests.
 	for v := int32(2); v <= 6; v++ {
 		applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, m.budget)
+			xmlda.ErrorCode{}, "", 100, m.budget)
 	}
 	if got := m.budget.count(); got != 5 {
 		t.Fatalf("budget counter = %d after 5 buffered samples, want 5", got)
@@ -100,7 +100,7 @@ func TestSampleBudget_ReleasedOnDeliveryAndCancel(t *testing.T) {
 	// So does cancelling a subscription with an undelivered backlog.
 	for v := int32(10); v <= 13; v++ {
 		applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, m.budget)
+			xmlda.ErrorCode{}, "", 100, m.budget)
 	}
 	if got := m.budget.count(); got != 4 {
 		t.Fatalf("budget counter = %d, want 4", got)
@@ -124,7 +124,7 @@ func TestSampleBudget_NonBufferingItemsAreOutsideTheBudget(t *testing.T) {
 	it := &itemState{enableBuffering: false}
 	for v := int32(1); v <= 5; v++ {
 		applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, budget)
+			xmlda.ErrorCode{}, "", 100, budget)
 	}
 	if got := budget.count(); got != 0 {
 		t.Errorf("budget counter = %d, want 0: non-buffering items are not counted", got)
@@ -146,7 +146,7 @@ func TestSampleBudget_UnlimitedWhenNotConfigured(t *testing.T) {
 		it := &itemState{enableBuffering: true}
 		for v := int32(1); v <= 50; v++ {
 			applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-				xmlda.ErrorCode{}, 1000, budget)
+				xmlda.ErrorCode{}, "", 1000, budget)
 		}
 		it.mu.Lock()
 		n := len(it.buffer)

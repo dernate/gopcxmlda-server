@@ -46,7 +46,7 @@ type ReadItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l ReadItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -84,7 +84,7 @@ type ReadRequest struct {
 // MarshalXML implements xml.Marshaler.
 func (r ReadRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	start.Name = xml.Name{Local: "Read"}
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(r.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, r.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}

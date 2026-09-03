@@ -3,6 +3,7 @@ package xmlda
 import (
 	"encoding/xml"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -26,7 +27,7 @@ type ItemValueList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l ItemValueList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ReplyItemList"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "ReplyItemList"})...)
 	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Reserved"}, Value: ""})
 	if err := e.EncodeToken(start); err != nil {
 		return err
@@ -97,8 +98,14 @@ type ItemValue struct {
 	// zero ErrorCode means none.
 	ResultID ErrorCode
 	// DiagnosticInfo is verbose, non-deduplicated per-item diagnostic
-	// text, populated only if RequestOptions.ReturnDiagnosticInfo is true.
-	DiagnosticInfo string
+	// text. A pointer, because §3.1.6 makes the element's PRESENCE the
+	// answer to ReturnDiagnosticInfo rather than its content: "The server
+	// is required to return specific diagnostic information or a blank
+	// string if diagnostic information is not available." nil means the
+	// client did not ask (no element); a non-nil pointer to "" means it
+	// asked and there was nothing to say, which is the blank string the
+	// specification calls for.
+	DiagnosticInfo *string
 	// DecodeErr is non-nil when this item was structurally readable but
 	// one of its own attributes or its <Value> could not be interpreted
 	// (see ItemDecodeError). Used on the request side (Write): the server
@@ -126,7 +133,12 @@ func (iv ItemValue) QualityOrDefault() OPCQuality {
 // because the schema declares them as members of a polymorphic type,
 // which strict/.NET-generated clients may expect xsi:type to disambiguate).
 func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "ItemValue"})...)
+	// Grown once rather than six times. ItemValue is the per-item hot path
+	// — a 1000-item Read writes a thousand of these — and encoding/xml
+	// hands over a nil or short Attr slice, so each conditional append
+	// below reallocated and copied.
+	start.Attr = slices.Grow(start.Attr, 7)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "ItemValue"})...)
 	if iv.ItemName != "" {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: iv.ItemName})
 	}
@@ -137,7 +149,7 @@ func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ClientItemHandle"}, Value: iv.ClientItemHandle})
 	}
 	if !iv.ResultID.IsZero() {
-		start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ResultID", iv.ResultID.QName)...)
+		start.Attr = mergeAttrs(start.Attr, qnameAttr(e, start.Attr, "ResultID", iv.ResultID.QName)...)
 	}
 	if iv.Timestamp != nil {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "Timestamp"}, Value: formatWireTime(*iv.Timestamp)})
@@ -151,12 +163,12 @@ func (iv ItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	// other order. The real captured traffic in
 	// testdata/responses/subscribe_680.response.xml agrees: Value then
 	// Quality.
-	if iv.DiagnosticInfo != "" {
+	if iv.DiagnosticInfo != nil {
 		// DiagnosticInfo is an ELEMENT in the schema, not an attribute:
 		// <s:element minOccurs="0" maxOccurs="1" name="DiagnosticInfo"
 		// type="s:string"/>. It used to be emitted as an attribute, which
 		// no schema-bound client would find.
-		if err := e.EncodeElement(iv.DiagnosticInfo, xml.StartElement{Name: xml.Name{Local: "DiagnosticInfo"}}); err != nil {
+		if err := e.EncodeElement(*iv.DiagnosticInfo, xml.StartElement{Name: xml.Name{Local: "DiagnosticInfo"}}); err != nil {
 			return err
 		}
 	}
@@ -205,7 +217,9 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 	// library itself emitted that form until the encoder was corrected to
 	// the schema's element, so a peer (or a stored fixture) may still
 	// carry it. An element, if present, wins.
-	iv.DiagnosticInfo, _ = attrValue(start.Attr, xml.Name{Local: "DiagnosticInfo"})
+	if v, ok := attrValue(start.Attr, xml.Name{Local: "DiagnosticInfo"}); ok {
+		iv.DiagnosticInfo = &v
+	}
 
 	var decodeErr error
 	record := func(field string, code ErrorCode, err error) {
@@ -253,9 +267,10 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 				if err != nil {
 					return err
 				}
-				if text != "" {
-					iv.DiagnosticInfo = text
-				}
+				// The element wins over the tolerated attribute spelling,
+				// including when it is empty: an empty element is the
+				// specification's own "blank string" answer, not an absence.
+				iv.DiagnosticInfo = &text
 			case "Value":
 				var v Value
 				if err := v.UnmarshalXML(d, t); err != nil {
@@ -296,8 +311,18 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 // time or date, and a string-typed v becomes duration, according to the
 // qualifier's local name. Any other qualifier, or a v whose current type
 // doesn't match the expected wire-base type for that qualifier, is left
-// unchanged — this is a tolerant best-effort reinterpretation, not a
-// strict validation.
+// unchanged.
+//
+// The reinterpretation is tolerant about WHICH qualifiers it honors and
+// strict about the literal it retypes. Retyping without re-parsing was
+// the tolerant reading, and it moved the failure from the decoder to the
+// encoder: a <Value xsi:type="xsd:string">hello</Value> carrying
+// ValueTypeQualifier="xsd:duration" decoded cleanly, was written to the
+// backend, and only then failed to encode — collapsing the whole
+// response into an opaque E_FAIL after the write had already happened,
+// so the client could not even tell whether it had. A literal that does
+// not fit the type it is being retyped to is that one item's E_BADTYPE,
+// which is what the caller makes of the error returned here.
 func applyValueTypeQualifier(v *Value, qualifierRaw string, d *xml.Decoder, elemAttrs []xml.Attr) error {
 	qn, err := resolveQNameIn(d, elemAttrs, qualifierRaw)
 	if err != nil {
@@ -319,6 +344,13 @@ func applyValueTypeQualifier(v *Value, qualifierRaw string, d *xml.Decoder, elem
 		}
 	case "duration":
 		if v.typ == TypeString {
+			lit, ok := v.scalar.(string)
+			if !ok {
+				return fmt.Errorf("xmlda: ValueTypeQualifier %s on a value that holds no literal", qn)
+			}
+			if !ValidDuration(lit) {
+				return fmt.Errorf("xmlda: ValueTypeQualifier %s, but %q is not a valid xsd:duration literal", qn, lit)
+			}
 			v.typ = TypeDuration
 			v.typeName = QName{XSDNamespace, "duration"}
 		}

@@ -2,7 +2,9 @@ package soap
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -23,9 +25,22 @@ type Fault struct {
 	Code QName
 	// Text is the human-readable fault description (faultstring / Reason/Text).
 	Text string
-	// Detail is opaque passthrough text (the spec's <detail> content
+	// Detail is the <detail> element's content, carried through verbatim.
+	//
+	// It is an XML FRAGMENT, not plain text: decode captures it with
+	// ,innerxml so a peer's structured detail survives a round trip, and
+	// encode writes it back the same way. A caller constructing a Fault by
+	// hand may still pass plain text — MarshalXML checks the fragment for
+	// well-formedness and escapes it if it is not one, so text containing
+	// & or < produces a valid document rather than a corrupt one.
+	//
+	// Opaque passthrough (the spec's <detail> content
 	// varies too much to structure further).
 	Detail string
+
+	// version selects the fault shape MarshalXML writes. Set by the
+	// Envelope carrying this fault; the zero value is SOAP 1.1.
+	version Version
 }
 
 // Error implements the error interface. Safe to call on a nil *Fault (the
@@ -41,11 +56,30 @@ func (f *Fault) Error() string {
 	return fmt.Sprintf("soap fault %s: %s", f.Code, f.Text)
 }
 
+// wellFormedFragment reports whether s parses as a sequence of XML
+// tokens — i.e. whether writing it verbatim inside an element produces a
+// well-formed document.
+func wellFormedFragment(s string) bool {
+	d := xml.NewDecoder(strings.NewReader(s))
+	for {
+		_, err := d.Token()
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
 // MarshalXML implements xml.Marshaler, always emitting the spec-conformant
 // SOAP 1.1 shape: a QName-qualified faultcode (via a locally-declared
 // "q0" prefix) when Code has a namespace, faultstring, and an (empty, if
 // Detail=="") detail element.
 func (f Fault) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if f.version == Version12 {
+		return f.marshalXML12(e, start)
+	}
 	start.Name = xml.Name{Local: "SOAP-ENV:Fault"}
 	if err := e.EncodeToken(start); err != nil {
 		return err
@@ -82,6 +116,17 @@ func (f Fault) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		// corrupting a decode->encode->decode round trip. Encoding it back
 		// through the same ,innerxml tag writes it verbatim, symmetric
 		// with the decode side.
+		// Well-formedness decides which of the two it is. A captured
+		// fragment goes back verbatim; anything else (a hand-built Fault
+		// carrying a message with & or <) is encoded as text, because
+		// writing it verbatim would emit a document no parser accepts —
+		// in the one response whose entire job is to carry an error.
+		if !wellFormedFragment(f.Detail) {
+			if err := e.EncodeElement(f.Detail, detailStart); err != nil {
+				return err
+			}
+			return e.EncodeToken(start.End())
+		}
 		holder := struct {
 			InnerXML string `xml:",innerxml"`
 		}{InnerXML: f.Detail}
@@ -293,4 +338,105 @@ func resolveLenient(attrs []xml.Attr, raw string) QName {
 		}
 	}
 	return QName{Local: raw}
+}
+
+// marshalXML12 writes the SOAP 1.2 fault shape (§5.4): Code/Value and
+// Reason/Text instead of 1.1's faultcode/faultstring, with the code
+// carried as a QName in a Value element rather than as the Fault's own
+// text.
+//
+// The two versions do not share a shape, so answering a SOAP 1.2 request
+// with a 1.1 fault handed a strict 1.2 stack a document it discards —
+// losing the very error code the fault existed to convey. This package
+// accepts either version on input (ADR-004) and now answers in the one it
+// was asked in.
+func (f Fault) marshalXML12(e *xml.Encoder, start xml.StartElement) error {
+	start.Name = xml.Name{Local: "SOAP-ENV:Fault"}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+
+	codeStart := xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Code"}}
+	if err := e.EncodeToken(codeStart); err != nil {
+		return err
+	}
+	valueStart := xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Value"}}
+	valueText := f.Code.Local
+	switch {
+	case f.Code.Space == NS11 || f.Code.Space == NS12:
+		// A SOAP-defined code (Client/Sender, Server/Receiver,
+		// MustUnderstand, VersionMismatch) belongs in the 1.2 envelope
+		// namespace, and two of them were renamed.
+		valueText = "SOAP-ENV:" + soap12CodeName(f.Code.Local)
+	case f.Code.Space != "":
+		valueStart.Attr = append(valueStart.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:q0"}, Value: f.Code.Space})
+		valueText = "q0:" + f.Code.Local
+	}
+	if err := e.EncodeToken(valueStart); err != nil {
+		return err
+	}
+	if valueText != "" {
+		if err := e.EncodeToken(xml.CharData(valueText)); err != nil {
+			return err
+		}
+	}
+	if err := e.EncodeToken(valueStart.End()); err != nil {
+		return err
+	}
+	if err := e.EncodeToken(codeStart.End()); err != nil {
+		return err
+	}
+
+	reasonStart := xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Reason"}}
+	if err := e.EncodeToken(reasonStart); err != nil {
+		return err
+	}
+	textStart := xml.StartElement{
+		Name: xml.Name{Local: "SOAP-ENV:Text"},
+		Attr: []xml.Attr{{Name: xml.Name{Local: "xml:lang"}, Value: "en"}},
+	}
+	if err := e.EncodeElement(f.Text, textStart); err != nil {
+		return err
+	}
+	if err := e.EncodeToken(reasonStart.End()); err != nil {
+		return err
+	}
+
+	if f.Detail != "" {
+		detailStart := xml.StartElement{Name: xml.Name{Local: "SOAP-ENV:Detail"}}
+		if !wellFormedFragment(f.Detail) {
+			if err := e.EncodeElement(f.Detail, detailStart); err != nil {
+				return err
+			}
+		} else {
+			holder := struct {
+				InnerXML string `xml:",innerxml"`
+			}{InnerXML: f.Detail}
+			if err := e.EncodeElement(holder, detailStart); err != nil {
+				return err
+			}
+		}
+	}
+	return e.EncodeToken(start.End())
+}
+
+// soap12CodeName maps SOAP 1.1's fault code names to their SOAP 1.2
+// equivalents. Only two were renamed; the rest are identical.
+func soap12CodeName(local string) string {
+	switch local {
+	case "Client":
+		return "Sender"
+	case "Server":
+		return "Receiver"
+	default:
+		return local
+	}
+}
+
+// WithVersion returns a copy of f that marshals in the given SOAP version.
+// Callers that write a Fault outside an Envelope need this; inside one,
+// the Envelope sets it.
+func (f Fault) WithVersion(v Version) Fault {
+	f.version = v
+	return f
 }

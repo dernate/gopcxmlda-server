@@ -32,6 +32,55 @@ type Config struct {
 	// MaxRequestBodyBytes bounds the size of an incoming HTTP request
 	// body, enforced via http.MaxBytesReader before any XML parsing.
 	MaxRequestBodyBytes int64
+	// MaxElementDepth bounds how deeply a request document may nest its
+	// elements, checked on the first tokenizer pass — before any protocol
+	// limit, all of which apply only after a full decode.
+	//
+	// It is the companion MaxRequestBodyBytes needs: that field bounds the
+	// input, this one bounds what the input costs. Nesting is charged
+	// super-linearly in encoding/xml's own bookkeeping, so a body of
+	// nothing but nested start tags turns 4 MiB into roughly 128 MiB of
+	// live heap and a second of CPU per request. Zero applies the built-in
+	// default (xmlda.DefaultMaxElementDepth, 64 — the deepest conforming
+	// shape in the schema is seven levels); a negative value explicitly
+	// requests no limit.
+	MaxElementDepth int
+	// MaxConcurrentPolledRefresh bounds how many SubscriptionPolledRefresh
+	// calls may be in flight at once, as a sub-budget of
+	// MaxConcurrentRequests.
+	//
+	// The two operation classes have nothing in common but the semaphore
+	// they used to share: a Read passes through in milliseconds, while a
+	// long poll legitimately holds its slot for up to
+	// MaxPolledRefreshWait. Without a separate budget, enough concurrent
+	// long polls answer every other client's Read, Write and GetStatus
+	// with E_BUSY for minutes at a time — and with no authentication in
+	// front of the server, "enough" is whatever one client chooses to
+	// open. Zero applies the built-in default (three quarters of the
+	// effective MaxConcurrentRequests, leaving a quarter that short
+	// operations can always reach); a negative value explicitly requests
+	// no separate limit.
+	MaxConcurrentPolledRefresh int
+	// BackendTimeout bounds how long the server waits for one
+	// backend.Backend call before answering E_TIMEDOUT, enforced rather
+	// than merely requested.
+	//
+	// RequestTimeout and PollTimeout are context deadlines, and a context
+	// deadline is a request to stop, not a mechanism that stops anything:
+	// a backend that reaches a device through a blocking call and never
+	// consults ctx holds its handler goroutine — and its
+	// MaxConcurrentRequests slot — for as long as the device stays
+	// unresponsive. Measured: four such calls against a stuck backend and
+	// the fifth request gets E_BUSY, permanently, while the four clients
+	// never receive an answer at all.
+	//
+	// With this set, the call runs on its own goroutine and the handler
+	// stops waiting when the timeout elapses. The abandoned goroutine
+	// still runs — Go cannot cancel it — but it no longer holds the
+	// request, so the server stays answerable. Zero applies the built-in
+	// default (RequestTimeout plus a small grace); a negative value
+	// restores the previous cooperative-only behavior.
+	BackendTimeout time.Duration
 	// RequestTimeout bounds every non-subscription-poll operation.
 	RequestTimeout time.Duration
 	// MaxPolledRefreshWait caps the client-requested Hold+Wait duration
@@ -215,6 +264,12 @@ type Config struct {
 	IdleTimeout time.Duration
 }
 
+// backendTimeoutGrace is how far BackendTimeout's default sits beyond
+// RequestTimeout: the request's own context deadline should be what a
+// cooperative backend observes, and this hard ceiling only catches the
+// ones that do not.
+const backendTimeoutGrace = 5 * time.Second
+
 // WithDefaults returns a copy of c with every unset (zero-value) field
 // replaced by its built-in default. server.New/server.NewServer call
 // this internally, but it is also exported so an embedding application
@@ -257,8 +312,21 @@ func (c Config) WithDefaults() Config {
 	if c.MaxRequestBodyBytes <= 0 {
 		c.MaxRequestBodyBytes = 4 << 20 // 4 MiB
 	}
+	if c.MaxElementDepth == 0 {
+		c.MaxElementDepth = xmlda.DefaultMaxElementDepth
+	}
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 30 * time.Second
+	}
+	if c.MaxConcurrentPolledRefresh == 0 && c.MaxConcurrentRequests > 0 {
+		// Three quarters, so a saturated long-poll population still leaves
+		// a quarter of the capacity for the operations that answer in
+		// milliseconds. At least one, so a tiny MaxConcurrentRequests does
+		// not disable polling outright.
+		c.MaxConcurrentPolledRefresh = max(1, c.MaxConcurrentRequests*3/4)
+	}
+	if c.BackendTimeout == 0 {
+		c.BackendTimeout = c.RequestTimeout + backendTimeoutGrace
 	}
 	if c.MaxPolledRefreshWait <= 0 {
 		// 120s, not 90s: the specification's own guidance is "generally no
@@ -277,7 +345,37 @@ func (c Config) WithDefaults() Config {
 	if c.IdleTimeout <= 0 {
 		c.IdleTimeout = 120 * time.Second
 	}
+	// The seven fields this struct only forwards to subscription.Config
+	// are resolved here too, from that package's own defaults. WithDefaults
+	// promises "every unset field replaced by its built-in default" and is
+	// exported precisely so an application can inspect the effective
+	// limits — for a log line, a diagnostics endpoint, a sizing
+	// calculation. Leaving these seven at zero made that inspection wrong
+	// in exactly the places where the numbers matter.
+	c.applySubscriptionDefaults()
 	return c
+}
+
+// applySubscriptionDefaults fills in the fields whose real defaults live
+// in subscription.Config, by asking that package rather than restating
+// its numbers here — two copies of a default is how they drift.
+func (c *Config) applySubscriptionDefaults() {
+	d := subscription.Config{
+		MaxConcurrentPolls:          c.MaxConcurrentPolls,
+		ReapInterval:                c.ReapInterval,
+		ReapGraceMultiplier:         c.ReapGraceMultiplier,
+		DefaultSubscriptionPingRate: c.DefaultSubscriptionPingRate,
+		DefaultSamplingRate:         c.DefaultSamplingRate,
+		MaxBufferedSamplesPerItem:   c.MaxBufferedSamplesPerItem,
+		PollTimeout:                 c.PollTimeout,
+	}.WithDefaults()
+	c.MaxConcurrentPolls = d.MaxConcurrentPolls
+	c.ReapInterval = d.ReapInterval
+	c.ReapGraceMultiplier = d.ReapGraceMultiplier
+	c.DefaultSubscriptionPingRate = d.DefaultSubscriptionPingRate
+	c.DefaultSamplingRate = d.DefaultSamplingRate
+	c.MaxBufferedSamplesPerItem = d.MaxBufferedSamplesPerItem
+	c.PollTimeout = d.PollTimeout
 }
 
 // subscriptionConfig maps Config's overlapping fields onto

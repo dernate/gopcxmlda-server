@@ -11,8 +11,8 @@ a conformance claim. Status words used below:
 - **not implemented** — not built.
 
 The authoritative, requirement-by-requirement version of this table is
-[`docs/specification/traceability-matrix.md`](specification/traceability-matrix.md) (68 requirements: 60
-tested, 4 implemented, 1 in progress, 0 not started). This document summarizes it per operation.
+[`docs/specification/traceability-matrix.md`](specification/traceability-matrix.md) (75 requirements: 69
+tested, 5 implemented, 1 in progress, 0 not started). This document summarizes it per operation.
 
 ## Operations
 

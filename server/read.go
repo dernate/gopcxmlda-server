@@ -14,24 +14,26 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 	var env soap.Envelope[xmlda.ReadRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Read", "parse")
-		writeFault(w, requestDecodeFault("Read", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("Read", err))
 		return
 	}
 	req := env.Body.Content
 
 	if deadlinePassed(req.Options, h.clk.Now()) {
 		h.metrics.IncRequestError("Read", "deadline_exceeded")
-		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
-	if len(req.ItemList.Items) == 0 {
-		h.metrics.IncRequestError("Read", "empty_item_list")
-		writeFault(w, fault(xmlda.ErrFail, "at least one item is required"))
-		return
-	}
+	// An empty (or absent) ItemList is schema-legal: both the element and
+	// its Items are minOccurs="0", and §3.3.1 only says "It is expected
+	// that there are one or more Items per ItemList". A request that asks
+	// for nothing gets an empty, successful reply rather than a
+	// whole-operation fault — refusing it invents a requirement the
+	// schema does not state, and a client assembling its item list
+	// dynamically hits it for a perfectly ordinary reason.
 	if !h.checkItemCount(len(req.ItemList.Items)) {
 		h.metrics.IncRequestError("Read", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many items in one Read request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many items in one Read request"))
 		return
 	}
 
@@ -75,12 +77,12 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 		results[i] = backend.Result[backend.ItemSample]{ResultID: xmlda.ErrFail}
 	}
 	if len(readItems) > 0 {
-		backendResults, err := observeBackend(h.metrics, h.clk, "Read", func() ([]backend.Result[backend.ItemSample], error) {
+		backendResults, err := observeBackend(ctx, h.metrics, h.clk, "Read", h.cfg.BackendTimeout, func() ([]backend.Result[backend.ItemSample], error) {
 			return h.backend.Reader.Read(ctx, readItems)
 		})
 		if err != nil {
 			h.metrics.IncRequestError("Read", "backend_error")
-			writeFault(w, backendErrorFault(err))
+			writeFault(w, soapVersion(doc), backendErrorFault(err))
 			return
 		}
 		// A conforming backend returns exactly one Result per requested
@@ -117,7 +119,10 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 		// where the client is entitled to both the code and the data.
 		haveSample := hasUsableValue(resultID)
 
-		if haveSample && merged[i].ReqType != nil {
+		// The value-presence guard mirrors applyReqType's: an item with no
+		// value to coerce must keep its real condition rather than being
+		// relabelled E_BADTYPE.
+		if haveSample && merged[i].ReqType != nil && sample.Value.IsValid() && !sample.Value.IsNil() {
 			coerced, ok := coerceToReqType(sample.Value, merged[i].ReqType)
 			if !ok {
 				resultID = xmlda.ErrBadType
@@ -134,7 +139,7 @@ func (h *Handler) handleRead(ctx context.Context, w http.ResponseWriter, doc *xm
 	resp := xmlda.ReadResponse{
 		Result:    h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		RItemList: xmlda.ItemValueList{Items: items},
-		Errors:    xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
+		Errors:    buildErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }

@@ -9,11 +9,24 @@ The library has **no dependency on any concrete SCADA system, database, or vendo
 your own process data by implementing a handful of small interfaces (see
 [`docs/backend-implementation.md`](docs/backend-implementation.md)).
 
+## Versioning and stability
+
+The exported API is **not yet stable**. There is no `v1.0.0` tag; until
+there is, treat every release as `v0.x` and expect source-incompatible
+changes, each of which is listed in [`CHANGELOG.md`](CHANGELOG.md). Pin an
+exact version.
+
+The largest open question before a `v1` is the size of the exported
+surface: `xmlda` alone exports well over two hundred symbols, a number of
+which are implementation helpers rather than things an application needs.
+Moving those behind `internal/` is a breaking change worth making before
+the API is frozen, not after.
+
 ## Status
 
 This library implements the 8 OPC XML-DA 1.0 operations (`GetStatus`, `Read`, `Write`, `Subscribe`,
 `SubscriptionPolledRefresh`, `SubscriptionCancel`, `Browse`, `GetProperties`) against the specification in
-`docs/OPCDataAccessXMLSpecification.pdf`, backed by 68 tracked requirements and 450+ tests (unit, golden-file,
+`docs/OPCDataAccessXMLSpecification.pdf`, backed by a tracked requirements matrix and 485 tests across all three modules (460 in the base module) (unit, golden-file,
 round-trip, HTTP-handler, subscription-lifecycle, and real-concurrency stress tests), all clean under
 `go test -race ./...`, plus two separate integration modules that drive the server over real HTTP — one
 in-process, one against a real Docker container. It has **not** been run against an official OPC Foundation conformance test suite,

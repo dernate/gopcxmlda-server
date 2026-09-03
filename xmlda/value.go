@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -151,6 +153,19 @@ func (d Decimal) String() string { return string(d) }
 type RawValue struct {
 	// TypeName is the xsi:type this value declared, resolved to a QName.
 	TypeName QName
+	// Namespaces are the prefix -> URI bindings the captured content
+	// references but does not itself declare, collected from the document
+	// it was decoded out of.
+	//
+	// Without them the round trip is not one: ,innerxml captures the
+	// bytes and nothing else, so a <v:inner> whose xmlns:v was declared on
+	// an ancestor came back out with the prefix intact and the binding
+	// gone. A peer re-reading the value then resolved v against whatever
+	// happened to be in scope — usually nothing, making the prefix an
+	// unbound one — which is precisely the fidelity KindUnknown exists to
+	// provide (docs/protocol-support.md: "unknown/vendor xsi:type
+	// preserved verbatim for round-trip").
+	Namespaces map[string]string
 	// InnerXML is the exact captured child content (text and/or nested
 	// elements), re-emitted unmodified on MarshalXML.
 	InnerXML []byte
@@ -285,8 +300,39 @@ func scalarEqual(t ScalarType, a, b any) bool {
 		at, aok := a.(time.Time)
 		bt, bok := b.(time.Time)
 		return aok == bok && at.Equal(bt)
+	case TypeFloat, TypeDouble:
+		// IEEE-754 says NaN != NaN, but the question this function
+		// answers is "is this the same value as before", and two
+		// consecutive NaN readings from a failed analog input are the
+		// same reading. Comparing them with == reported a change on
+		// every single poll: every long-poll returned immediately, the
+		// buffer filled, DataBufferOverflow was raised, and one broken
+		// sensor turned a subscription into a busy loop. The deadband
+		// path already treats consecutive NaNs as unchanged
+		// (subscription/poll.go's sampleChanged); this is the same rule
+		// for the far more common no-deadband path.
+		af, aok := numericAsFloat(a)
+		bf, bok := numericAsFloat(b)
+		if aok && bok && math.IsNaN(af) && math.IsNaN(bf) {
+			return true
+		}
+		return a == b
 	default:
 		return a == b
+	}
+}
+
+// numericAsFloat reports a's float value for the two floating-point
+// scalar representations, so scalarEqual can ask about NaN without
+// duplicating the type switch.
+func numericAsFloat(a any) (float64, bool) {
+	switch v := a.(type) {
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
 	}
 }
 
@@ -731,6 +777,15 @@ type Array struct {
 	data     any
 }
 
+// The typed accessors below (Int32s, Float64s, Strings, Any, ...) return a
+// COPY of the array's storage. That matches the constructors, which copy
+// their input, and Value.Bytes, which already did. Handing out the
+// internal slice made a Value mutable through an accessor — and in the
+// subscription engine one backing array is shared by an item's last
+// reported sample, every buffered update referring to it and the encoder
+// writing the response, none of which the item lock can protect once a
+// slice has escaped.
+
 // ElemType returns the array's element ScalarType.
 func (a Array) ElemType() ScalarType { return a.elemType }
 
@@ -861,7 +916,7 @@ func (a Array) Int8s() ([]int8, error) {
 	if err := a.checkElem("Int8s", TypeByte); err != nil {
 		return nil, err
 	}
-	return a.data.([]int8), nil
+	return slices.Clone(a.data.([]int8)), nil
 }
 
 // Int16s returns the array's elements as []int16, or a *TypeError if the
@@ -870,7 +925,7 @@ func (a Array) Int16s() ([]int16, error) {
 	if err := a.checkElem("Int16s", TypeShort); err != nil {
 		return nil, err
 	}
-	return a.data.([]int16), nil
+	return slices.Clone(a.data.([]int16)), nil
 }
 
 // Uint16s returns the array's elements as []uint16, or a *TypeError if the
@@ -879,7 +934,7 @@ func (a Array) Uint16s() ([]uint16, error) {
 	if err := a.checkElem("Uint16s", TypeUnsignedShort); err != nil {
 		return nil, err
 	}
-	return a.data.([]uint16), nil
+	return slices.Clone(a.data.([]uint16)), nil
 }
 
 // Int32s returns the array's elements as []int32, or a *TypeError if the
@@ -888,7 +943,7 @@ func (a Array) Int32s() ([]int32, error) {
 	if err := a.checkElem("Int32s", TypeInt); err != nil {
 		return nil, err
 	}
-	return a.data.([]int32), nil
+	return slices.Clone(a.data.([]int32)), nil
 }
 
 // Uint32s returns the array's elements as []uint32, or a *TypeError if the
@@ -897,7 +952,7 @@ func (a Array) Uint32s() ([]uint32, error) {
 	if err := a.checkElem("Uint32s", TypeUnsignedInt); err != nil {
 		return nil, err
 	}
-	return a.data.([]uint32), nil
+	return slices.Clone(a.data.([]uint32)), nil
 }
 
 // Int64s returns the array's elements as []int64, or a *TypeError if the
@@ -906,7 +961,7 @@ func (a Array) Int64s() ([]int64, error) {
 	if err := a.checkElem("Int64s", TypeLong); err != nil {
 		return nil, err
 	}
-	return a.data.([]int64), nil
+	return slices.Clone(a.data.([]int64)), nil
 }
 
 // Uint64s returns the array's elements as []uint64, or a *TypeError if the
@@ -915,7 +970,7 @@ func (a Array) Uint64s() ([]uint64, error) {
 	if err := a.checkElem("Uint64s", TypeUnsignedLong); err != nil {
 		return nil, err
 	}
-	return a.data.([]uint64), nil
+	return slices.Clone(a.data.([]uint64)), nil
 }
 
 // Float32s returns the array's elements as []float32, or a *TypeError if
@@ -924,7 +979,7 @@ func (a Array) Float32s() ([]float32, error) {
 	if err := a.checkElem("Float32s", TypeFloat); err != nil {
 		return nil, err
 	}
-	return a.data.([]float32), nil
+	return slices.Clone(a.data.([]float32)), nil
 }
 
 // Decimals returns the array's elements as []Decimal, or a *TypeError if
@@ -933,7 +988,7 @@ func (a Array) Decimals() ([]Decimal, error) {
 	if err := a.checkElem("Decimals", TypeDecimal); err != nil {
 		return nil, err
 	}
-	return a.data.([]Decimal), nil
+	return slices.Clone(a.data.([]Decimal)), nil
 }
 
 // Float64s returns the array's elements as []float64, or a *TypeError if
@@ -942,7 +997,7 @@ func (a Array) Float64s() ([]float64, error) {
 	if err := a.checkElem("Float64s", TypeDouble); err != nil {
 		return nil, err
 	}
-	return a.data.([]float64), nil
+	return slices.Clone(a.data.([]float64)), nil
 }
 
 // Bools returns the array's elements as []bool, or a *TypeError if the
@@ -951,7 +1006,7 @@ func (a Array) Bools() ([]bool, error) {
 	if err := a.checkElem("Bools", TypeBoolean); err != nil {
 		return nil, err
 	}
-	return a.data.([]bool), nil
+	return slices.Clone(a.data.([]bool)), nil
 }
 
 // Strings returns the array's elements as []string, or a *TypeError if
@@ -960,7 +1015,7 @@ func (a Array) Strings() ([]string, error) {
 	if err := a.checkElem("Strings", TypeString); err != nil {
 		return nil, err
 	}
-	return a.data.([]string), nil
+	return slices.Clone(a.data.([]string)), nil
 }
 
 // DateTimes returns the array's elements as []time.Time, or a *TypeError
@@ -969,7 +1024,7 @@ func (a Array) DateTimes() ([]time.Time, error) {
 	if err := a.checkElem("DateTimes", TypeDateTime); err != nil {
 		return nil, err
 	}
-	return a.data.([]time.Time), nil
+	return slices.Clone(a.data.([]time.Time)), nil
 }
 
 // Any returns the array's elements as []Value, or a *TypeError if the
@@ -978,7 +1033,60 @@ func (a Array) Any() ([]Value, error) {
 	if err := a.checkElem("Any", TypeAnyType); err != nil {
 		return nil, err
 	}
-	return a.data.([]Value), nil
+	return slices.Clone(a.data.([]Value)), nil
+}
+
+// NumericFloat64s renders a numeric array's elements as float64, or
+// reports false for an array whose element type has no numeric reading
+// (string, boolean, dateTime, anyType, ...).
+//
+// It is the array counterpart of Value.NumericAsFloat64, and exists for
+// the same caller: the subscription engine's deadband comparison, which
+// §3.5.1 requires to apply element-wise to array types ("The entire array
+// is returned if any array element exceeds the deadband threshold").
+// The conversion is lossy for the widest integer types in the same way
+// NumericAsFloat64 is, which is inherent to comparing against a
+// percentage.
+func (a Array) NumericFloat64s() ([]float64, bool) {
+	out := make([]float64, a.Len())
+	for i := range out {
+		e, err := elementAt(a, i)
+		if err != nil {
+			return nil, false
+		}
+		f, ok := numericAnyAsFloat64(e)
+		if !ok {
+			return nil, false
+		}
+		out[i] = f
+	}
+	return out, true
+}
+
+// numericAnyAsFloat64 converts one stored numeric element to float64.
+func numericAnyAsFloat64(e any) (float64, bool) {
+	switch v := e.(type) {
+	case int8:
+		return float64(v), true
+	case int16:
+		return float64(v), true
+	case uint16:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
+	}
 }
 
 // elementAt returns element i of a's underlying storage as an any, for use
@@ -1406,19 +1514,29 @@ func formatScalar(st ScalarType, val any) (string, error) {
 // name. Putting xsi:type first costs nothing and happens to make that
 // client's Read/Write/Subscribe/GetProperties value decoding work; see
 // docs/interoperability.md.
-func typeAttrs(existing []xml.Attr, tn QName) []xml.Attr {
+func typeAttrs(e *xml.Encoder, existing []xml.Attr, tn QName) []xml.Attr {
+	out := make([]xml.Attr, 0, 3)
+	// xsi itself: declared here unless an ancestor already did, in which
+	// case that binding is used and nothing is emitted.
+	xsiPrefix, xsiInherited := ancestorPrefix(e, XSINamespace)
+	if !xsiInherited {
+		xsiPrefix = "xsi"
+	}
+	typeAttr := xml.Attr{Name: xml.Name{Local: xsiPrefix + ":type"}}
 	if tn.Space == "" {
-		return []xml.Attr{
-			{Name: xml.Name{Local: "xsi:type"}, Value: tn.Local},
-			{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
-		}
+		typeAttr.Value = tn.Local
+	} else if prefix, ok := ancestorPrefix(e, tn.Space); ok {
+		typeAttr.Value = prefix + ":" + tn.Local
+	} else {
+		prefix := prefixIn(existing, tn.Space)
+		typeAttr.Value = prefix + ":" + tn.Local
+		out = append(out, xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: tn.Space})
 	}
-	prefix := prefixIn(existing, tn.Space)
-	return []xml.Attr{
-		{Name: xml.Name{Local: "xsi:type"}, Value: prefix + ":" + tn.Local},
-		{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace},
-		{Name: xml.Name{Local: "xmlns:" + prefix}, Value: tn.Space},
+	out = append(out, typeAttr)
+	if !xsiInherited {
+		out = append(out, xml.Attr{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINamespace})
 	}
+	return out
 }
 
 func prefixForNamespace(space string) string {
@@ -1482,7 +1600,7 @@ func (v Value) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 		return fmt.Errorf("xmlda: cannot marshal a Value with no declared type")
 	}
 	base := append([]xml.Attr{}, start.Attr...)
-	start.Attr = mergeAttrs(base, typeAttrs(base, v.typeName)...)
+	start.Attr = mergeAttrs(base, typeAttrs(e, base, v.typeName)...)
 	if v.isNil {
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "xsi:nil"}, Value: "true"})
 		if err := e.EncodeToken(start); err != nil {
@@ -1501,6 +1619,13 @@ func (v Value) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 }
 
 func (v Value) marshalUnknown(e *xml.Encoder, start xml.StartElement) error {
+	// Re-declare whatever the captured content references but does not
+	// declare itself, so the fragment means the same thing on the way out
+	// as it did on the way in.
+	for _, prefix := range slices.Sorted(maps.Keys(v.raw.Namespaces)) {
+		start.Attr = mergeAttrs(start.Attr,
+			xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: v.raw.Namespaces[prefix]})
+	}
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -1515,6 +1640,9 @@ func writeRawInnerXML(e *xml.Encoder, raw []byte) error {
 		return nil
 	}
 	d := xml.NewDecoder(strings.NewReader(string(raw)))
+	// Declarations the fragment makes itself, so a name whose prefix the
+	// tokenizer resolved can be written back under that same prefix.
+	uriToPrefix := map[string]string{}
 	for {
 		tok, err := d.Token()
 		if err != nil {
@@ -1531,8 +1659,17 @@ func writeRawInnerXML(e *xml.Encoder, raw []byte) error {
 		// producing invalid XML with no error to signal it, since the
 		// encode itself succeeds. Comments are dropped for the same
 		// reason: they carry no value and only widen the pass-through.
-		switch tok.(type) {
-		case xml.StartElement, xml.EndElement, xml.CharData:
+		switch t := tok.(type) {
+		case xml.StartElement:
+			for _, a := range t.Attr {
+				if a.Name.Space == "xmlns" {
+					uriToPrefix[a.Value] = a.Name.Local
+				}
+			}
+			tok = flattenNames(t, uriToPrefix)
+		case xml.EndElement:
+			tok = xml.EndElement{Name: flatName(t.Name, uriToPrefix)}
+		case xml.CharData:
 		default:
 			continue
 		}
@@ -1540,6 +1677,50 @@ func writeRawInnerXML(e *xml.Encoder, raw []byte) error {
 			return err
 		}
 	}
+}
+
+// flattenNames rewrites an element's own name and its attribute names into
+// the flat "prefix:local" form this package uses everywhere it writes XML
+// by hand.
+//
+// Relaying the decoded token unchanged corrupted the very bytes ADR-003
+// exists to preserve. encoding/xml puts a resolved namespace URI in
+// Name.Space — and an UNRESOLVED prefix there too, verbatim — while its
+// encoder turns any non-empty Space into an xmlns declaration of its own.
+// So <v:inner> from a document whose xmlns:v sat on an ancestor came back
+// out as <inner xmlns="v">: the prefix promoted to a namespace URI, the
+// real URI gone, and the value no longer the one the peer sent.
+func flattenNames(t xml.StartElement, uriToPrefix map[string]string) xml.StartElement {
+	out := xml.StartElement{Name: flatName(t.Name, uriToPrefix)}
+	out.Attr = make([]xml.Attr, 0, len(t.Attr))
+	for _, a := range t.Attr {
+		switch {
+		case a.Name.Space == "xmlns":
+			out.Attr = append(out.Attr, xml.Attr{
+				Name:  xml.Name{Local: "xmlns:" + a.Name.Local},
+				Value: a.Value,
+			})
+		case a.Name.Space == "" && a.Name.Local == "xmlns":
+			out.Attr = append(out.Attr, a)
+		default:
+			out.Attr = append(out.Attr, xml.Attr{Name: flatName(a.Name, uriToPrefix), Value: a.Value})
+		}
+	}
+	return out
+}
+
+// flatName renders one name as it was written: a URI the fragment itself
+// declared maps back to that declaration's prefix, and an unresolved
+// prefix left in Space by the tokenizer IS the prefix.
+func flatName(n xml.Name, uriToPrefix map[string]string) xml.Name {
+	if n.Space == "" {
+		return xml.Name{Local: n.Local}
+	}
+	prefix := n.Space
+	if p, ok := uriToPrefix[n.Space]; ok {
+		prefix = p
+	}
+	return xml.Name{Local: prefix + ":" + n.Local}
 }
 
 func (v Value) marshalScalar(e *xml.Encoder, start xml.StartElement) error {
@@ -1718,8 +1899,24 @@ func (v *Value) decodeElement(d *xml.Decoder, start xml.StartElement, depth int)
 	if depth > maxAnyTypeArrayDepth {
 		return false, fmt.Errorf("xmlda: ArrayOfAnyType nesting exceeds the maximum depth of %d", maxAnyTypeArrayDepth)
 	}
+	isNil := false
+	if nilAttr, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "nil"}); ok {
+		isNil = strings.EqualFold(strings.TrimSpace(nilAttr), "true") || strings.TrimSpace(nilAttr) == "1"
+	}
+
 	rawType, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "type"})
 	if !ok {
+		// A nilled element needs no xsi:type: the schema declares
+		// ArrayOfAnyType's and ArrayOfString's elements nillable="true",
+		// and <anyType xsi:nil="true"/> is the shape a peer sends for a
+		// missing element of unknown type. Rejecting it cost the item
+		// E_BADTYPE and discarded the entire array value around it.
+		// xsd:anyType is the honest declared type here — it is what the
+		// schema says the element is — and IsNil() reports the absence.
+		if isNil {
+			v.kind, v.typ, v.typeName, v.isNil = KindUnknown, TypeAnyType, QName{XSDNamespace, "anyType"}, true
+			return true, d.Skip()
+		}
 		return false, fmt.Errorf("xmlda: <%s> is missing a required xsi:type attribute", start.Name.Local)
 	}
 	tn, err := resolveQNameIn(d, start.Attr, rawType)
@@ -1727,10 +1924,6 @@ func (v *Value) decodeElement(d *xml.Decoder, start xml.StartElement, depth int)
 		return false, err
 	}
 
-	isNil := false
-	if nilAttr, ok := attrValue(start.Attr, xml.Name{Space: XSINamespace, Local: "nil"}); ok {
-		isNil = strings.EqualFold(strings.TrimSpace(nilAttr), "true") || strings.TrimSpace(nilAttr) == "1"
-	}
 	if isNil {
 		kind, typ := decodeNilKind(tn)
 		v.kind, v.typ, v.typeName, v.isNil = kind, typ, tn, true
@@ -1913,6 +2106,21 @@ func decodeScalarArray[T any](d *xml.Decoder, tn QName, wantLocal string, parse 
 		switch t := tok.(type) {
 		case xml.StartElement:
 			if t.Name.Local != wantLocal {
+				// Skip the offending child before giving up. Returning
+				// with its start tag already consumed left the decoder
+				// one element deep inside <Value>, and unmarshalXML's
+				// d.Skip() then finished off that CHILD rather than the
+				// value — so ItemValue read the value's own </Value> as
+				// its own end tag, and the misalignment propagated all
+				// the way up to <ItemList>, failing the WHOLE request
+				// with a transport-level Client fault. One item's bad
+				// array element must cost that item, not the request
+				// (docs/limitations.md).
+				if skipErr := d.Skip(); skipErr != nil {
+					return nil, errors.Join(
+						fmt.Errorf("array %s: unexpected child element %q, want %q", tn, t.Name.Local, wantLocal),
+						skipErr)
+				}
 				return nil, fmt.Errorf("array %s: unexpected child element %q, want %q", tn, t.Name.Local, wantLocal)
 			}
 			var holder struct {
@@ -1966,6 +2174,82 @@ func (v *Value) decodeUnknown(d *xml.Decoder, start xml.StartElement, tn QName) 
 	if err := d.DecodeElement(&holder, &start); err != nil {
 		return true, fmt.Errorf("xmlda: decoding unrecognized-type value %s: %w", tn, err)
 	}
-	v.kind, v.typeName, v.raw = KindUnknown, tn, RawValue{TypeName: tn, InnerXML: holder.Inner}
+	v.kind, v.typeName, v.raw = KindUnknown, tn, RawValue{
+		TypeName:   tn,
+		InnerXML:   holder.Inner,
+		Namespaces: inheritedNamespaces(d, start.Attr, holder.Inner),
+	}
 	return true, nil
+}
+
+// inheritedNamespaces collects the prefix bindings inner references but
+// does not declare itself, resolving them against the element's own
+// attributes first and the document's prefix table second — the same
+// order resolveQNameIn uses.
+func inheritedNamespaces(d *xml.Decoder, elemAttrs []xml.Attr, inner []byte) map[string]string {
+	used := prefixesUsedIn(inner)
+	if len(used) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(used))
+	for prefix := range used {
+		if uri, ok := localPrefixBinding(elemAttrs, prefix); ok {
+			out[prefix] = uri
+			continue
+		}
+		if uri, ok := documentPrefix(d, prefix); ok {
+			out[prefix] = uri
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// prefixesUsedIn lists the element and attribute prefixes appearing in a
+// captured fragment, minus the ones the fragment declares itself.
+func prefixesUsedIn(inner []byte) map[string]struct{} {
+	used := map[string]struct{}{}
+	declared := map[string]struct{}{}
+	d := xml.NewDecoder(bytes.NewReader(inner))
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			break
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		// encoding/xml reports an unresolvable prefix by leaving it in
+		// Name.Space, which is exactly the case being repaired here.
+		if se.Name.Space != "" {
+			used[se.Name.Space] = struct{}{}
+		}
+		for _, a := range se.Attr {
+			if a.Name.Space == "xmlns" {
+				declared[a.Name.Local] = struct{}{}
+				continue
+			}
+			if a.Name.Space != "" && a.Name.Space != "xmlns" {
+				used[a.Name.Space] = struct{}{}
+			}
+		}
+	}
+	for p := range declared {
+		delete(used, p)
+	}
+	return used
+}
+
+// documentPrefix resolves prefix against the whole-document table
+// registered for d, if there is one.
+func documentPrefix(d *xml.Decoder, prefix string) (string, bool) {
+	v, ok := decoderScopes.Load(d)
+	if !ok {
+		return "", false
+	}
+	uri, ok := v.(*prefixScope).table[prefix]
+	return uri, ok
 }

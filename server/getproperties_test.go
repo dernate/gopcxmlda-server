@@ -92,27 +92,35 @@ func TestHandleGetProperties_UnknownItem(t *testing.T) {
 // bool (Go zero value false) rather than a *bool, so "omitted" and
 // "explicitly false" were indistinguishable and always resolved to no
 // error text at all.
-func TestHandleGetProperties_ReturnErrorText_DefaultsTrue(t *testing.T) {
+func TestHandleGetProperties_ReturnErrorText_DefaultsFalse(t *testing.T) {
 	status := newTestStatus()
 	reader := newTestReader()
 	props := &testProperties{props: map[backend.ItemRef][]backend.Property{}} // Unknown item -> E_UNKNOWNITEMNAME
 	be := backend.Backend{Status: status, Reader: reader, Properties: props}
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
-	// No ReturnErrorText attribute at all.
+	// No ReturnErrorText attribute at all. The schema gives THIS element
+	// default="false" — unlike RequestOptions, which is where the true
+	// default lives — so an omitted attribute means no error text, and
+	// therefore (§3.1.9) no Errors entries.
 	body := soapEnvelopeOpen + `<GetProperties xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true">` +
 		`<ItemIDs ItemName="Unknown"/></GetProperties>` + soapEnvelopeClose
 	got := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, body))
-	if len(got.Errors) != 1 || got.Errors[0].Text == "" {
-		t.Fatalf("expected non-empty error text by default (ReturnErrorText omitted), got %+v", got.Errors)
+	if len(got.Errors) != 0 {
+		t.Fatalf("GetProperties without ReturnErrorText produced %d Errors entries; "+
+			"the element's own schema default is false: %+v", len(got.Errors), got.Errors)
+	}
+	// The condition itself must still reach the client.
+	if len(got.PropertyLists) != 1 || got.PropertyLists[0].ResultID != xmlda.ErrUnknownItemName {
+		t.Fatalf("the per-item ResultID was lost: %+v", got.PropertyLists)
 	}
 
-	// Explicit false must still suppress it.
-	bodyFalse := soapEnvelopeOpen + `<GetProperties xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true" ReturnErrorText="false">` +
+	// Explicit true turns the list on.
+	bodyTrue := soapEnvelopeOpen + `<GetProperties xmlns="` + xmlda.Namespace + `" ReturnAllProperties="true" ReturnErrorText="true">` +
 		`<ItemIDs ItemName="Unknown"/></GetProperties>` + soapEnvelopeClose
-	gotFalse := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, bodyFalse))
-	if len(gotFalse.Errors) != 1 || gotFalse.Errors[0].Text != "" {
-		t.Fatalf("expected empty error text when ReturnErrorText=false, got %+v", gotFalse.Errors)
+	gotTrue := decodeResponse[xmlda.GetPropertiesResponse](t, postSOAP(t, h, bodyTrue))
+	if len(gotTrue.Errors) != 1 || gotTrue.Errors[0].Text == "" {
+		t.Fatalf("expected one Errors entry with text when ReturnErrorText=true, got %+v", gotTrue.Errors)
 	}
 }
 

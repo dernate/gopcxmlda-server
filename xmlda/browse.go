@@ -65,7 +65,13 @@ type BrowseRequest struct {
 // ReturnErrorTextOrDefault returns ReturnErrorText, or its default (true)
 // if unset.
 func (r BrowseRequest) ReturnErrorTextOrDefault() bool {
-	return returnErrorTextOrDefault(r.ReturnErrorText)
+	// false, not RequestOptions' true: the schema gives this attribute a
+	// different default on this element. RequestOptions declares
+	// default="true" (§3.1.6, "If TRUE (default) …"), while the Browse and
+	// GetProperties elements both declare default="false" and their prose
+	// deliberately drops the "(default)" — see the WSDL in
+	// docs/OPCDataAccessXMLSpecification.pdf and testdata/schema/opcxmlda.xsd.
+	return boolOrDefault(r.ReturnErrorText, false)
 }
 
 // MarshalXML implements xml.Marshaler.

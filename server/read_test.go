@@ -117,17 +117,28 @@ func TestHandleRead_PartialSuccess(t *testing.T) {
 	}
 }
 
-func TestHandleRead_EmptyItemList_Faults(t *testing.T) {
-	be, _, _ := newMinimalBackend()
+// TestHandleRead_EmptyItemListIsAnEmptySuccess pins that an empty item
+// list is served, not refused. Both <ItemList> and its <Items> are
+// minOccurs="0" in the schema, and §3.3.1 only goes as far as "It is
+// expected that there are one or more Items per ItemList" — expectation,
+// not requirement. Faulting invented a rule the schema does not state,
+// and a client assembling its list dynamically hits it for an entirely
+// ordinary reason.
+func TestHandleRead_EmptyItemListIsAnEmptySuccess(t *testing.T) {
+	be, _, _ := newRWBackend(t)
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
-	resp := postSOAP(t, h, readRequestBody(nil))
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("got status %d, want 500", resp.StatusCode)
+	body := soapEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `"><ItemList/></Read>` + soapEnvelopeClose
+	resp := postSOAP(t, h, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
 	}
-	f := decodeFault(t, resp)
-	if f == nil {
-		t.Fatalf("expected a fault for an empty item list")
+	out := decodeResponseFrom[xmlda.ReadResponse](t, readBody(t, resp))
+	if len(out.RItemList.Items) != 0 {
+		t.Errorf("got %d items for an empty request, want 0", len(out.RItemList.Items))
+	}
+	if len(out.Errors) != 0 {
+		t.Errorf("an empty request produced Errors entries: %+v", out.Errors)
 	}
 }
 
@@ -214,8 +225,11 @@ func TestHandleRead_MalformedItemIsPerItemCondition(t *testing.T) {
 	}
 	// The client must be able to tell WHICH field it got wrong: the
 	// deduplicated Errors entry carries the code but not the item.
-	if !strings.Contains(bad.DiagnosticInfo, "MaxAge") {
-		t.Errorf("H2: DiagnosticInfo does not name the field: %q", bad.DiagnosticInfo)
+	if bad.DiagnosticInfo == nil {
+		t.Fatal("H2: no DiagnosticInfo element at all, although the client asked for one")
+	}
+	if !strings.Contains(*bad.DiagnosticInfo, "MaxAge") {
+		t.Errorf("H2: DiagnosticInfo does not name the field: %q", *bad.DiagnosticInfo)
 	}
 	if len(out.Errors) != 1 || out.Errors[0].ID != xmlda.ErrFail {
 		t.Errorf("Errors = %+v, want a single E_FAIL entry", out.Errors)
@@ -224,13 +238,18 @@ func TestHandleRead_MalformedItemIsPerItemCondition(t *testing.T) {
 
 // --- a failing item must not claim good quality ---
 
-// TestHandleRead_FailedItemOmitsQuality pins the wire shape. The zero
-// OPCQuality emits no attributes, and under the schema's own defaults
-// (QualityField="good") that reads as good quality — so an item reporting
-// E_UNKNOWNITEMNAME also reported good quality with no value, and for a
-// client bridging this onto OPC DA's wQuality the quality is the half
-// that reaches the process image.
-func TestHandleRead_FailedItemOmitsQuality(t *testing.T) {
+// TestHandleRead_FailedItemReportsBadQuality pins the wire shape. The
+// zero OPCQuality emits no attributes, and under the schema's own
+// defaults (QualityField="good") that reads as good quality — so an item
+// reporting E_UNKNOWNITEMNAME must not carry one, since for a client
+// bridging this onto OPC DA's wQuality the quality is the half that
+// reaches the process image. Omitting the element entirely has the same
+// failure mode one step removed: the schema default applies to the
+// missing element too. The specification resolves it by stating the
+// quality outright — §2.6 p.22 shows
+// <Items ResultID="E_UNKNOWNITEMNAME"><Quality QualityField="bad"/></Items>
+// — which is what this asserts.
+func TestHandleRead_FailedItemReportsBadQuality(t *testing.T) {
 	be, _, r := newRWBackend(t)
 	r.Set(backend.ItemRef{ItemName: "good"}, xmlda.NewInt32(1))
 	h := newTestHandler(t, be, Config{}, clock.Real{})
@@ -250,15 +269,21 @@ func TestHandleRead_FailedItemOmitsQuality(t *testing.T) {
 	if items[1].ResultID != xmlda.ErrUnknownItemName {
 		t.Fatalf("items[1].ResultID = %v, want E_UNKNOWNITEMNAME", items[1].ResultID)
 	}
-	if items[1].Quality != nil {
-		t.Errorf("a failing item still carries a Quality (%v) that reads as good",
-			items[1].Quality.QualityField())
+	if items[1].Quality == nil {
+		t.Fatal("a failing item carries no Quality at all; the schema default then reads as good")
+	}
+	if got := items[1].Quality.QualityField(); got != xmlda.QualityBad {
+		t.Errorf("a failing item reports QualityField %q, want %q", got, xmlda.QualityBad)
 	}
 
 	// ...and on the bytes, since the defect was invisible in the decoded
-	// form: Go's own decoder filled in the same zero value either way.
-	if n := strings.Count(raw, "<Quality"); n != 1 {
-		t.Errorf("the response carries %d Quality elements, want exactly 1 (only the healthy item):\n%s", n, raw)
+	// form: Go's own decoder filled in the same zero value either way. The
+	// failing item's quality must be spelled out, not left to the default.
+	if n := strings.Count(raw, "<Quality"); n != 2 {
+		t.Errorf("the response carries %d Quality elements, want 2 (one per item):\n%s", n, raw)
+	}
+	if !strings.Contains(raw, `QualityField="bad"`) {
+		t.Errorf("the failing item's Quality does not spell out bad:\n%s", raw)
 	}
 }
 

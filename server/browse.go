@@ -13,14 +13,14 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 	var env soap.Envelope[xmlda.BrowseRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("Browse", "parse")
-		writeFault(w, requestDecodeFault("Browse", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("Browse", err))
 		return
 	}
 	req := env.Body.Content
 
 	if h.backend.Browser == nil {
 		h.metrics.IncRequestError("Browse", "not_supported")
-		writeFault(w, fault(xmlda.ErrNotSupported, "Browse is not supported by this server"))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrNotSupported, "Browse is not supported by this server"))
 		return
 	}
 
@@ -32,20 +32,20 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 	// schema's own default of "all".)
 	if !req.BrowseFilter.IsValid() {
 		h.metrics.IncRequestError("Browse", "invalid_filter")
-		writeFault(w, fault(xmlda.ErrInvalidFilter, xmlda.StandardErrorText(xmlda.ErrInvalidFilter)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrInvalidFilter, xmlda.StandardErrorText(xmlda.ErrInvalidFilter)))
 		return
 	}
 
 	backendCursor, ok := h.parseContinuationToken(req.ContinuationPoint, *req)
 	if !ok {
 		h.metrics.IncRequestError("Browse", "invalid_continuation_point")
-		writeFault(w, fault(xmlda.ErrInvalidContinuationPoint, xmlda.StandardErrorText(xmlda.ErrInvalidContinuationPoint)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrInvalidContinuationPoint, xmlda.StandardErrorText(xmlda.ErrInvalidContinuationPoint)))
 		return
 	}
 
 	if !h.checkItemCount(len(req.PropertyNames)) {
 		h.metrics.IncRequestError("Browse", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many property names in one Browse request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many property names in one Browse request"))
 		return
 	}
 
@@ -76,12 +76,12 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 		ReturnPropertyValues: req.ReturnPropertyValues,
 		PropertyNames:        req.PropertyNames,
 	}
-	bres, err := observeBackend(h.metrics, h.clk, "Browse", func() (backend.BrowseResult, error) {
+	bres, err := observeBackend(ctx, h.metrics, h.clk, "Browse", h.cfg.BackendTimeout, func() (backend.BrowseResult, error) {
 		return h.backend.Browser.Browse(ctx, breq)
 	})
 	if err != nil {
 		h.metrics.IncRequestError("Browse", "backend_error")
-		writeFault(w, backendErrorFault(err))
+		writeFault(w, soapVersion(doc), backendErrorFault(err))
 		return
 	}
 
@@ -91,10 +91,24 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 	// the ceiling above would be advisory only.
 	moreElements := bres.MoreElements
 	if maxElements > 0 && len(bres.Elements) > maxElements {
-		h.log.Warn("backend returned more Browse elements than requested; truncating",
-			"requested", maxElements, "returned", len(bres.Elements))
+		returned := len(bres.Elements)
 		bres.Elements = bres.Elements[:maxElements]
 		moreElements = true
+		if bres.ContinuationPoint == "" {
+			// MoreElements without a continuation point is a dead end: the
+			// client is told the result set is incomplete and given no way
+			// to fetch the rest, and the truncated elements are simply
+			// unreachable. Only a backend that ignored MaxElementsReturned
+			// can produce this, so say so plainly rather than shipping a
+			// silently unpageable response.
+			h.log.Error("backend returned more Browse elements than requested AND no continuation point; "+
+				"the truncated elements are unreachable — honor BrowseRequest.MaxElementsReturned "+
+				"and return a cursor when more elements remain",
+				"requested", maxElements, "returned", returned)
+		} else {
+			h.log.Warn("backend returned more Browse elements than requested; truncating",
+				"requested", maxElements, "returned", returned)
+		}
 	}
 
 	includeValues := req.ReturnPropertyValues
@@ -127,16 +141,22 @@ func (h *Handler) handleBrowse(ctx context.Context, w http.ResponseWriter, doc *
 	opts := xmlda.RequestOptions{
 		ClientRequestHandle: req.ClientRequestHandle,
 		LocaleID:            req.LocaleID,
-		ReturnErrorText:     req.ReturnErrorText,
+		// Resolved through the request's OWN accessor, then passed on as an
+		// explicit value: Browse and GetProperties declare
+		// ReturnErrorText with default="false" while RequestOptions
+		// declares default="true", so handing the raw pointer to a
+		// RequestOptions would silently apply the wrong default whenever
+		// the client omits the attribute.
+		ReturnErrorText: boolPtr(req.ReturnErrorTextOrDefault()),
 	}
 	resp := xmlda.BrowseResponse{
 		MoreElements:      moreElements,
 		ContinuationPoint: h.buildContinuationToken(*req, bres.ContinuationPoint),
 		Result:            h.replyBase(oc, req.ClientRequestHandle, req.LocaleID),
 		Elements:          elements,
-		Errors:            xmlda.DedupeErrors(codes, h.errorTextFunc(opts, oc)),
+		Errors:            buildErrors(codes, h.errorTextFunc(opts, oc)),
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }
 
 // toItemProperty converts a backend.Property to the wire xmlda.ItemProperty

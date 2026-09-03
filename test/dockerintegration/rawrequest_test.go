@@ -201,7 +201,7 @@ func TestDockerServer_TolerantInput(t *testing.T) {
 		rawDecode[xmlda.WriteResponse](t, data)
 	})
 
-	t.Run("failed item omits quality", func(t *testing.T) {
+	t.Run("failed item reports bad quality", func(t *testing.T) {
 		body := rawEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `">` +
 			`<Options ReturnItemName="true"/><ItemList>` +
 			`<Items ItemName="` + dockerItem + `" ClientItemHandle="OK"/>` +
@@ -211,11 +211,17 @@ func TestDockerServer_TolerantInput(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("got status %d: %s", status, data)
 		}
-		// Exactly one <Quality> for two items: the readable one has it, the
-		// unknown one must not — an attribute-less <Quality/> reads as
-		// QualityField="good" under the schema's own defaults.
-		if n := strings.Count(string(data), "<Quality"); n != 1 {
-			t.Errorf("the response carries %d Quality elements, want 1:\n%s", n, data)
+		// One <Quality> per item, and the failing one must SAY bad. An
+		// attribute-less <Quality/> reads as QualityField="good" under the
+		// schema's own defaults — and so does a missing element, which is
+		// why omitting it (the first attempt at this) had the same failure
+		// mode one step removed. §2.6 p.22 states the quality outright:
+		// <Items ResultID="E_UNKNOWNITEMNAME"><Quality QualityField="bad"/></Items>.
+		if n := strings.Count(string(data), "<Quality"); n != 2 {
+			t.Errorf("the response carries %d Quality elements, want 2 (one per item):\n%s", n, data)
+		}
+		if !strings.Contains(string(data), `QualityField="bad"`) {
+			t.Errorf("the failing item's Quality does not spell out bad:\n%s", data)
 		}
 		out := rawDecode[xmlda.ReadResponse](t, data)
 		for _, iv := range out.RItemList.Items {
@@ -225,8 +231,10 @@ func TestDockerServer_TolerantInput(t *testing.T) {
 			if iv.ResultID.IsZero() {
 				t.Error("the unknown item reported no condition")
 			}
-			if iv.Quality != nil {
-				t.Errorf("the failing item still asserts quality %v", iv.Quality.QualityField())
+			if iv.Quality == nil {
+				t.Error("the failing item carries no Quality; the schema default then reads as good")
+			} else if got := iv.Quality.QualityField(); got != xmlda.QualityBad {
+				t.Errorf("the failing item reports quality %q, want %q", got, xmlda.QualityBad)
 			}
 		}
 	})

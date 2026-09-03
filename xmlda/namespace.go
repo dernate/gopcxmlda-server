@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,20 +100,60 @@ var decoderScopes sync.Map // map[*xml.Decoder]*prefixScope
 // depth-correct shadowing. No real OPC XML-DA traffic observed during this
 // project's specification analysis does that; see
 // docs/specification/open-questions.md OQ-6 for the accepted limitation.
-func buildPrefixTable(raw []byte) (map[string]string, error) {
+func buildPrefixTable(raw []byte, maxDepth int) (map[string]string, xml.Name, string, error) {
 	table := map[string]string{"xml": xmlNamespace}
-	d := xml.NewDecoder(bytes.NewReader(raw))
+	d := newDecoder(raw)
+	depth := 0
+	// path records the local names of the currently-open elements, so this
+	// pass can also pick out the SOAP Body's first child — the operation
+	// name. It is the only thing IdentifyOperation ever needed, and
+	// tokenizing the entire document a second time to learn it cost 1.8 ms
+	// and 293 KB on a 1000-item Read, roughly a ninth of the whole
+	// request. This pass already visits every start element.
+	var path []string
+	var op xml.Name
+	var envNS string
 	for {
 		tok, err := d.Token()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("xmlda: scanning namespace declarations: %w", err)
+			return nil, xml.Name{}, "", fmt.Errorf("xmlda: scanning namespace declarations: %w", err)
+		}
+		if _, ok := tok.(xml.EndElement); ok {
+			depth--
+			if len(path) > 0 {
+				path = path[:len(path)-1]
+			}
+			continue
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok {
 			continue
+		}
+		depth++
+		if depth == 1 {
+			envNS = se.Name.Space
+		}
+		// Envelope / Body / operation: the first grandchild of a Body that
+		// is itself a child of the root. Matching on the local name alone
+		// keeps this prefix-independent, exactly as the typed decode is.
+		if op.Local == "" && len(path) == 2 && path[1] == "Body" {
+			op = se.Name
+		}
+		path = append(path, se.Name.Local)
+		// The depth check rides along on this pass because it is the first
+		// thing that touches the document, and every protocol limit —
+		// MaxItemsPerRequest above all — only applies after a full decode.
+		// Nesting costs memory super-linearly in the decoder's own
+		// bookkeeping: at the default 4 MiB body limit, ~600 000 nested
+		// elements turned one request into ~128 MiB of live heap and a
+		// second of CPU, which is an amplification MaxRequestBodyBytes
+		// cannot see. No conforming OPC XML-DA document comes close to
+		// the default ceiling.
+		if maxDepth > 0 && depth > maxDepth {
+			return nil, xml.Name{}, "", fmt.Errorf("xmlda: element nesting exceeds the maximum depth of %d", maxDepth)
 		}
 		for _, a := range se.Attr {
 			switch {
@@ -122,7 +164,74 @@ func buildPrefixTable(raw []byte) (map[string]string, error) {
 			}
 		}
 	}
-	return table, nil
+	return table, op, envNS, nil
+}
+
+// encoderScopes associates an *xml.Encoder with the namespace prefixes an
+// ANCESTOR element has already declared, so the elements below it need not
+// declare them again.
+//
+// It is the encode-side twin of decoderScopes and exists for the same
+// reason: xml.Marshaler's signature is MarshalXML(*xml.Encoder,
+// xml.StartElement) and leaves no room for caller-supplied context, while
+// the decision "does this element still have to declare xmlns:opc" needs
+// exactly that. Keying on the encoder pointer is safe for the same two
+// reasons as on the decoder side: encoding/xml threads one *Encoder
+// through every nested MarshalXML of a single Encode, and each top-level
+// Encode uses a fresh one.
+//
+// Without it every element declared its own prefixes, because none could
+// know what its parent had done. That is correct XML and it is what makes
+// a standalone xmlda.Value self-contained — but inside a full response it
+// meant 6004 xmlns declarations for a 1000-item Read, 62 % of the bytes on
+// the wire.
+var encoderScopes sync.Map // map[*xml.Encoder]map[string]string  (URI -> prefix)
+
+// DeclareAncestorNamespaces records that an enclosing element of whatever
+// e writes next already declares decls (a URI -> prefix map), so this
+// package's marshalers can reference those prefixes without redeclaring
+// them. It returns a cleanup function the caller must defer.
+//
+// The caller is responsible for actually emitting the declarations on that
+// ancestor; getting that wrong produces a document with unbound prefixes.
+// In this library there is exactly one such caller — the response writer,
+// which is also the one place that knows both the SOAP envelope and the
+// OPC XML-DA namespaces.
+func DeclareAncestorNamespaces(e *xml.Encoder, decls map[string]string) func() {
+	if len(decls) == 0 {
+		return func() {}
+	}
+	cp := make(map[string]string, len(decls))
+	maps.Copy(cp, decls)
+	encoderScopes.Store(e, cp)
+	return func() { encoderScopes.Delete(e) }
+}
+
+// ancestorPrefix reports the prefix an ancestor already bound to space,
+// if any.
+func ancestorPrefix(e *xml.Encoder, space string) (string, bool) {
+	if e == nil || space == "" {
+		return "", false
+	}
+	v, ok := encoderScopes.Load(e)
+	if !ok {
+		return "", false
+	}
+	prefix, ok := v.(map[string]string)[space]
+	return prefix, ok
+}
+
+// ResponseNamespaces is the set of namespaces this package's response
+// marshalers reference, in the conventional prefixes they use. A caller
+// that declares exactly these on an enclosing element and passes them to
+// DeclareAncestorNamespaces gets the same document with each declaration
+// written once instead of once per element.
+func ResponseNamespaces() map[string]string {
+	return map[string]string{
+		Namespace:    "opc",
+		XSDNamespace: "xsd",
+		XSINamespace: "xsi",
+	}
 }
 
 // withScope registers table as the prefix scope for d and returns a cleanup
@@ -241,23 +350,52 @@ func resolveQName(d *xml.Decoder, raw string) (QName, error) {
 type Document struct {
 	raw   []byte
 	table map[string]string
+	// operation is the resolved name of the SOAP Body's first child,
+	// picked up by the same pass that built the prefix table. The zero
+	// Name means the document has no Body child at all.
+	operation xml.Name
+	// envelopeNS is the namespace of the document's root element, from
+	// the same pass. It is what tells a caller which SOAP version the
+	// peer spoke; this package does not interpret it.
+	envelopeNS string
 }
+
+// EnvelopeNamespace returns the namespace URI of the document's root
+// element — for a SOAP envelope, the one that says which SOAP version the
+// peer spoke. Empty when the root carries no namespace.
+func (doc *Document) EnvelopeNamespace() string { return doc.envelopeNS }
 
 // NewDocument scans raw's namespace declarations, returning an error only
 // if raw is not well-formed XML at all.
 func NewDocument(raw []byte) (*Document, error) {
-	table, err := buildPrefixTable(raw)
+	return NewDocumentLimited(raw, DefaultMaxElementDepth)
+}
+
+// DefaultMaxElementDepth is the element-nesting ceiling NewDocument
+// applies. It is a resource limit, not a protocol one: no conforming OPC
+// XML-DA document nests anywhere near this deep (the deepest shape in the
+// schema is Envelope/Body/Operation/ItemList/Items/Value/element, seven
+// levels), while a body of nothing but nested start tags costs memory
+// super-linearly in encoding/xml's own bookkeeping — an amplification
+// MaxRequestBodyBytes cannot see, because it bounds the input rather than
+// what the input costs.
+const DefaultMaxElementDepth = 64
+
+// NewDocumentLimited is NewDocument with an explicit nesting ceiling.
+// A maxDepth of zero or less disables the check.
+func NewDocumentLimited(raw []byte, maxDepth int) (*Document, error) {
+	table, op, envNS, err := buildPrefixTable(raw, maxDepth)
 	if err != nil {
 		return nil, err
 	}
-	return &Document{raw: raw, table: table}, nil
+	return &Document{raw: raw, table: table, operation: op, envelopeNS: envNS}, nil
 }
 
 // Decode decodes doc into v, with doc's prefix scope available to every
 // nested UnmarshalXML call (via resolveQName) for the decode's duration.
 // It may be called more than once, with different target types.
 func (doc *Document) Decode(v any) error {
-	d := xml.NewDecoder(bytes.NewReader(doc.raw))
+	d := newDecoder(doc.raw)
 	defer withScope(d, doc.table)()
 	return d.Decode(v)
 }
@@ -273,6 +411,15 @@ func Decode(raw []byte, v any) error {
 		return err
 	}
 	return doc.Decode(v)
+}
+
+// newDecoder returns the decoder every entry point in this package uses:
+// one that can read the encodings a real peer sends, not only UTF-8 (see
+// newCharsetReader).
+func newDecoder(raw []byte) *xml.Decoder {
+	d := xml.NewDecoder(bytes.NewReader(transcodeToUTF8(raw)))
+	d.CharsetReader = newCharsetReader
+	return d
 }
 
 // attrValue returns the value of the first attribute in attrs whose
@@ -294,18 +441,37 @@ func attrValue(attrs []xml.Attr, name xml.Name) (string, bool) {
 // prefix for the same namespace. Used for every QName-shaped attribute
 // value in this package: OPCError.ID, ItemValue/ItemProperty ResultID,
 // ItemProperty.Name, and similar.
-func qnameAttr(existing []xml.Attr, local string, qn QName) []xml.Attr {
+func qnameAttr(e *xml.Encoder, existing []xml.Attr, local string, qn QName) []xml.Attr {
 	if qn.Space == "" {
-		return []xml.Attr{
-			{Name: xml.Name{Local: "xmlns"}, Value: ""},
-			{Name: xml.Name{Local: local}, Value: qn.Local},
-		}
+		return unqualifiedQNameAttr(local, qn.Local)
+	}
+	if prefix, ok := ancestorPrefix(e, qn.Space); ok {
+		return []xml.Attr{{Name: xml.Name{Local: local}, Value: prefix + ":" + qn.Local}}
 	}
 	prefix := prefixIn(existing, qn.Space)
 	return []xml.Attr{
 		{Name: xml.Name{Local: "xmlns:" + prefix}, Value: qn.Space},
 		{Name: xml.Name{Local: local}, Value: prefix + ":" + qn.Local},
 	}
+}
+
+// unqualifiedQNameAttr renders a QName that carries no namespace, as an
+// attribute value.
+//
+// No xmlns="" reset, and that is not a shortcut: an unprefixed QName in
+// an ATTRIBUTE value has no namespace by definition — unlike one in
+// element content, attributes are not covered by the default namespace
+// (Namespaces in XML 1.0 §6.2, "the default namespace does not apply to
+// attribute names", and by extension to QName-typed attribute values).
+// So the reset changed nothing about how the value reads, while doing
+// real damage: xmlns="" applies to the whole carrier element, so a single
+// vendor property with no namespace pulled its <Properties> element out
+// of the OPC XML-DA namespace and made the ENTIRE response fail schema
+// validation. A vendor name still belongs in a vendor namespace
+// (§3.1.10) — that is what the warning at the call site is for — but a
+// backend that omits one must not cost every other item its response.
+func unqualifiedQNameAttr(local, value string) []xml.Attr {
+	return []xml.Attr{{Name: xml.Name{Local: local}, Value: value}}
 }
 
 // mergeAttrs appends add to base, dropping any namespace declaration
@@ -337,6 +503,7 @@ func qnameAttr(existing []xml.Attr, local string, qn QName) []xml.Attr {
 // invariant across every response shape, including the two-vendor-
 // namespace case.
 func mergeAttrs(base []xml.Attr, add ...xml.Attr) []xml.Attr {
+	base = slices.Grow(base, len(add))
 	for _, a := range add {
 		if isNamespaceDecl(a) && hasIdenticalDecl(base, a) {
 			continue

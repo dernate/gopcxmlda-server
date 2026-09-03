@@ -62,5 +62,28 @@ func reviseLocale(requested string, supported []string) string {
 			return s
 		}
 	}
+	// §2.4's intermediate step, which jumping straight to the default
+	// skipped: drop the country subtag and try the language alone. A
+	// client asking for de-AT against a server offering ["en-US", "de"]
+	// was answered in English, although the server speaks its language —
+	// and RevisedLocaleID then reported en-US, so the client could not
+	// even tell it had been misunderstood. Both a bare language match
+	// ("de") and another region of the same language ("de-DE") are far
+	// closer to what was asked for than the default is.
+	// The language subtag, whether or not a country followed it: a client
+	// may equally ask for "de-AT" or plain "de", and both should reach a
+	// server offering "de-DE".
+	if lang, _, _ := strings.Cut(requested, "-"); lang != "" {
+		for _, s := range supported {
+			if strings.EqualFold(lang, s) {
+				return s
+			}
+		}
+		for _, s := range supported {
+			if sLang, _, _ := strings.Cut(s, "-"); strings.EqualFold(lang, sLang) {
+				return s
+			}
+		}
+	}
 	return supported[0]
 }

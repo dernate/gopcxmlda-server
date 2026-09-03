@@ -43,13 +43,20 @@ type RefreshItemResult struct {
 	// Sample is meaningful only if HaveSample is true.
 	Sample backend.ItemSample
 	// HaveSample is false when this entry reports an abnormal condition
-	// rather than a value — i.e. whenever ResultID is non-zero. The server
-	// layer must not build a wire Value from Sample in that case.
+	// rather than a value — i.e. whenever ResultID is a critical E_ code.
+	// An S_ code is a success-with-caveat that accompanies a usable value
+	// (§2.6), so those entries carry both. The server layer must not build
+	// a wire Value from Sample when HaveSample is false.
 	HaveSample bool
 	// ResultID is the item's condition at the time this entry was
-	// recorded; the zero ErrorCode means the item was healthy and Sample
-	// holds its value.
+	// recorded; the zero ErrorCode means the item was healthy. A non-zero
+	// S_ code still leaves HaveSample true.
 	ResultID xmlda.ErrorCode
+	// DiagnosticInfo is the backend's per-item diagnostic text for this
+	// entry, so the server layer can honor
+	// RequestOptions.ReturnDiagnosticInfo here exactly as it does for
+	// Read and Write.
+	DiagnosticInfo string
 }
 
 // RefreshSubscriptionResult is one polled subscription's changed (or, if
@@ -302,6 +309,7 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 							Sample:           u.sample,
 							HaveSample:       u.haveSample,
 							ResultID:         u.resultID,
+							DiagnosticInfo:   u.diagnosticInfo,
 						})
 					}
 				}
@@ -309,13 +317,18 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 				// condition, not its stale last value dressed up as
 				// current: ReturnAllItems asks for every item's state, and
 				// "unreadable" is that state.
+				// IsError, not "non-zero": an S_ code accompanies a usable
+				// value rather than replacing it (§2.6), so an item whose
+				// current condition is S_CLAMP must still report its value
+				// here — see applyUpdate for the same distinction.
 				switch {
-				case !it.lastResultID.IsZero():
+				case it.lastResultID.IsError():
 					itemResults = append(itemResults, RefreshItemResult{
 						Ref:              it.ref,
 						ClientItemHandle: it.clientItemHandle,
 						ReqType:          it.reqType,
 						ResultID:         it.lastResultID,
+						DiagnosticInfo:   it.lastDiagnosticInfo,
 					})
 				case it.haveLast:
 					itemResults = append(itemResults, RefreshItemResult{
@@ -324,6 +337,8 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 						ReqType:          it.reqType,
 						Sample:           it.last,
 						HaveSample:       true,
+						ResultID:         it.lastResultID,
+						DiagnosticInfo:   it.lastDiagnosticInfo,
 					})
 				}
 				m.releaseItemBuffer(it)
@@ -336,6 +351,7 @@ func (m *Manager) snapshotResult(subs []*subState, invalid []Handle, returnAllIt
 						Sample:           u.sample,
 						HaveSample:       u.haveSample,
 						ResultID:         u.resultID,
+						DiagnosticInfo:   u.diagnosticInfo,
 					})
 				}
 				m.releaseItemBuffer(it)

@@ -134,7 +134,7 @@ func TestPolledRefresh_EarlyReturnOnChangeDuringWait(t *testing.T) {
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	if changed := applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem, nil); changed {
+	if changed := applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, "", m.cfg.MaxBufferedSamplesPerItem, nil); changed {
 		s.notifyChanged()
 	}
 
@@ -178,7 +178,7 @@ func TestPolledRefresh_ChangeDuringHold_ReturnsFastAfterHoldElapses(t *testing.T
 	m.mu.RLock()
 	s := m.subs[handle]
 	m.mu.RUnlock()
-	applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, m.cfg.MaxBufferedSamplesPerItem, nil)
+	applyUpdate(s.items[0], backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()}, xmlda.ErrorCode{}, "", m.cfg.MaxBufferedSamplesPerItem, nil)
 
 	select {
 	case <-ch:
@@ -674,7 +674,7 @@ func TestPolledRefresh_ReturnAllItemsIncludesBufferedValues(t *testing.T) {
 	it := s.items[0]
 	for _, v := range []int32{10, 20, 30} {
 		applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, nil)
+			xmlda.ErrorCode{}, "", 100, nil)
 	}
 
 	rr, err := m.PolledRefresh(context.Background(), RefreshRequest{

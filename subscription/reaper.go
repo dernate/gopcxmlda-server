@@ -119,23 +119,35 @@ func (m *Manager) reapOnce() {
 // window between reapOnce's decision pass and this action pass.
 func (m *Manager) terminateIfStillAbandoned(handle Handle, asOf time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	s, ok := m.subs[handle]
 	if !ok {
+		m.mu.Unlock()
 		return false
 	}
 	// Re-checked here too, not just in the decision pass: a PolledRefresh
 	// may have started in the window between the two.
 	if s.isBusy() {
+		m.mu.Unlock()
 		return false
 	}
 	s.mu.Lock()
 	stillAbandoned := asOf.Sub(s.lastPolledAt) > reapGrace(s.pingRate, m.cfg.ReapGraceMultiplier)
 	s.mu.Unlock()
 	if !stillAbandoned {
+		m.mu.Unlock()
 		return false
 	}
 	delete(m.subs, handle)
+	m.totalItems -= len(s.items)
+	// Unlocked before the teardown, exactly as terminate does it. Removing
+	// the entry is what makes the handle unusable and is all that needs the
+	// global write lock; cancel/stopPolling/releaseBuffers then touch only
+	// this subscription's own state — and releaseBuffers takes every one of
+	// its item locks in turn, which at the default ceiling of 1000 items per
+	// subscription is a thousand lock cycles the whole manager would
+	// otherwise wait behind.
+	m.mu.Unlock()
+
 	s.cancel()
 	s.stopPolling()
 	s.releaseBuffers(m.budget)

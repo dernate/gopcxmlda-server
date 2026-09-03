@@ -244,8 +244,14 @@ func TestIntegration_MalformedItemDoesNotFailTheBatch(t *testing.T) {
 			if iv.ResultID != xmlda.ErrFail {
 				t.Errorf("item %d: ResultID = %v, want E_FAIL", i, iv.ResultID)
 			}
-			if !strings.Contains(iv.DiagnosticInfo, "MaxAge") {
-				t.Errorf("item %d: DiagnosticInfo does not name the field: %q", i, iv.DiagnosticInfo)
+			// DiagnosticInfo is a *string: §3.1.6 makes the element's
+			// presence the answer to ReturnDiagnosticInfo, so nil means
+			// "the client did not ask" and a pointer to "" means "asked,
+			// nothing to report".
+			if iv.DiagnosticInfo == nil {
+				t.Errorf("item %d: no DiagnosticInfo element although the request asked for one", i)
+			} else if !strings.Contains(*iv.DiagnosticInfo, "MaxAge") {
+				t.Errorf("item %d: DiagnosticInfo does not name the field: %q", i, *iv.DiagnosticInfo)
 			}
 			continue
 		}
@@ -418,8 +424,14 @@ func TestIntegration_BrowseInvalidFilterFaults(t *testing.T) {
 // a response a client reads as error-free.
 func TestIntegration_BrowsePropertyErrorsCarryText(t *testing.T) {
 	url := newPagingTestServer(t, server.Config{})
+	// ReturnErrorText="true" explicitly. The Browse element's own schema
+	// declaration gives this attribute default="false" — unlike
+	// RequestOptions, which is where the true default lives — and with no
+	// text there are no OPCError entries to assert on at all (§3.1.9:
+	// "For each OPCError there will be a Text element"). The per-property
+	// ResultIDs, checked below, are unaffected either way.
 	body := rawEnvelopeOpen + `<Browse xmlns="` + xmlda.Namespace + `"` +
-		` ReturnPropertyValues="true" ReturnAllProperties="true"/>` +
+		` ReturnPropertyValues="true" ReturnAllProperties="true" ReturnErrorText="true"/>` +
 		rawEnvelopeClose
 	status, data := rawPost(t, url, body)
 	if status != http.StatusOK {

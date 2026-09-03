@@ -184,6 +184,16 @@ func checkItemValueChildOrder(t *testing.T, doc []byte) {
 // untyped anyType).
 func checkValueTypes(t *testing.T, doc []byte) {
 	t.Helper()
+	// Prefix bindings are collected as the document is walked, so a
+	// declaration on an ANCESTOR counts — which is where the response
+	// writer now puts them, once on the Envelope rather than once per
+	// element. Requiring the declaration on the element itself was the
+	// right check while every element carried its own; it is not a
+	// property XML requires, and holding on to it would have pinned 62 %
+	// of a large response's bytes in place.
+	scope := map[string]string{}
+	depth := 0
+	declaredAt := map[string][]int{}
 	d := xml.NewDecoder(strings.NewReader(string(doc)))
 	for {
 		tok, err := d.Token()
@@ -193,8 +203,30 @@ func checkValueTypes(t *testing.T, doc []byte) {
 		if err != nil {
 			t.Fatalf("tokenizing response: %v", err)
 		}
+		if _, ok := tok.(xml.EndElement); ok {
+			for prefix, depths := range declaredAt {
+				if n := len(depths); n > 0 && depths[n-1] == depth {
+					declaredAt[prefix] = depths[:n-1]
+					if len(declaredAt[prefix]) == 0 {
+						delete(scope, prefix)
+					}
+				}
+			}
+			depth--
+			continue
+		}
 		se, ok := tok.(xml.StartElement)
-		if !ok || se.Name.Local != "Value" {
+		if !ok {
+			continue
+		}
+		depth++
+		for _, a := range se.Attr {
+			if a.Name.Space == "xmlns" {
+				scope[a.Name.Local] = a.Value
+				declaredAt[a.Name.Local] = append(declaredAt[a.Name.Local], depth)
+			}
+		}
+		if se.Name.Local != "Value" {
 			continue
 		}
 		var raw string
@@ -212,21 +244,16 @@ func checkValueTypes(t *testing.T, doc []byte) {
 			t.Errorf("<Value xsi:type=%q>: unprefixed type", raw)
 			continue
 		}
-		// The encoder always declares its own prefix locally, so it is
-		// resolvable from this element's own attributes.
-		var uri string
-		for _, a := range se.Attr {
-			if a.Name.Space == "xmlns" && a.Name.Local == prefix {
-				uri = a.Value
-			}
-		}
+		// Resolvable from the element or any ancestor — the ordinary XML
+		// scoping rule.
+		uri := scope[prefix]
 		switch uri {
 		case xmlda.XSDNamespace, xmlda.Namespace:
 			if local == "" {
 				t.Errorf("<Value xsi:type=%q>: empty local name", raw)
 			}
 		case "":
-			t.Errorf("<Value xsi:type=%q>: prefix %q is not declared on the element itself", raw, prefix)
+			t.Errorf("<Value xsi:type=%q>: prefix %q is not declared on this element or any ancestor", raw, prefix)
 		default:
 			t.Errorf("<Value xsi:type=%q>: unexpected namespace %q", raw, uri)
 		}
@@ -527,7 +554,7 @@ func TestNoDuplicateAttributes(t *testing.T) {
 		{"itemvalue_full", xmlda.ItemValue{
 			ItemName: "A", ItemPath: strPtr("Path"), ClientItemHandle: "H",
 			Value: &arr, Quality: ptr(xmlda.NewQuality(xmlda.QualityUncertain, xmlda.LimitHigh, 3)),
-			Timestamp: &ts, ResultID: xmlda.SuccessClamp, DiagnosticInfo: "diag",
+			Timestamp: &ts, ResultID: xmlda.SuccessClamp, DiagnosticInfo: ptr("diag"),
 		}},
 		// Name (opc) + ResultID (opc).
 		{"itemproperty_standard_with_resultid", xmlda.ItemProperty{

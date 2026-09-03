@@ -426,3 +426,181 @@ func TestCreate_TotalItemBudget(t *testing.T) {
 		t.Fatalf("a subscription within the remaining budget was rejected: %v", err)
 	}
 }
+
+// TestTotalItems_TracksTheMap guards the one risk a counter carries that
+// a map scan did not: drift. totalItemsLocked stopped summing m.subs so
+// the server-wide item budget no longer costs an O(subscriptions) scan
+// under the global write lock on every Subscribe, which means every path
+// that inserts or removes a subscription now has to keep the counter
+// honest — Create, Cancel, and the abandonment reaper alike.
+func TestTotalItems_TracksTheMap(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	for i := range 6 {
+		r.Set(backend.ItemRef{ItemName: fmt.Sprintf("I%d", i)}, xmlda.NewInt32(1))
+	}
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	check := func(step string) {
+		t.Helper()
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		want := 0
+		for _, s := range m.subs {
+			want += len(s.items)
+		}
+		if m.totalItems != want {
+			t.Fatalf("%s: totalItems = %d, but the map holds %d items across %d subscriptions",
+				step, m.totalItems, want, len(m.subs))
+		}
+	}
+
+	mk := func(n int) Handle {
+		t.Helper()
+		items := make([]CreateItemRequest, n)
+		for i := range items {
+			items[i] = CreateItemRequest{Ref: backend.ItemRef{ItemName: fmt.Sprintf("I%d", i)}}
+		}
+		res, err := m.Create(context.Background(), CreateRequest{Items: items})
+		if err != nil {
+			t.Fatalf("Create(%d items): %v", n, err)
+		}
+		return res.Handle
+	}
+
+	check("empty")
+	a := mk(3)
+	check("after first Create")
+	b := mk(5)
+	check("after second Create")
+
+	if !m.Cancel(a) {
+		t.Fatal("Cancel(a) reported the subscription was unknown")
+	}
+	check("after Cancel")
+
+	// Reap the second one: the reaper is the third path that removes a
+	// subscription, and it removes it from a different function.
+	fake.Advance(m.cfg.DefaultSubscriptionPingRate * 4)
+	m.reapOnce()
+	if m.count() != 0 {
+		t.Fatalf("reapOnce left %d subscriptions, want 0", m.count())
+	}
+	check("after reapOnce")
+	_ = b
+
+	// And the counter must be usable again afterwards, not stuck negative.
+	mk(2)
+	check("after Create following a reap")
+}
+
+type principalKey struct{}
+
+// principalReader records the principal (if any) carried by the context of
+// every Read it receives — the shape a mandatory-access-control backend
+// takes when an HTTP middleware puts the caller's identity in the request
+// context.
+type principalReader struct {
+	*fakeReader
+	mu   sync.Mutex
+	seen []string
+}
+
+func (p *principalReader) Read(ctx context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
+	who, _ := ctx.Value(principalKey{}).(string)
+	if who == "" {
+		who = "<anonymous>"
+	}
+	p.mu.Lock()
+	p.seen = append(p.seen, who)
+	p.mu.Unlock()
+	return p.fakeReader.Read(ctx, items)
+}
+
+func (p *principalReader) principals() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.seen...)
+}
+
+// TestCreate_SubscriptionCarriesRequestContextValues pins that the caller's
+// identity survives the Subscribe call that created the subscription.
+//
+// Everything a backend needs to authorize — the principal an HTTP
+// middleware put in the request context, a tenant, a trace — travels as
+// context values, and Read/Write/Browse/GetProperties all deliver them
+// because the request context reaches the backend. Building the
+// subscription's own context from context.Background() instead meant the
+// Subscribe-time validation read carried the identity and every poll
+// after it carried none: a backend authorized once and then served an
+// anonymous caller for the life of the subscription, and one that
+// correctly refused the anonymous poll made the subscription go quiet
+// with no way to see why.
+func TestCreate_SubscriptionCarriesRequestContextValues(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := &principalReader{fakeReader: newFakeReader()}
+	ref := backend.ItemRef{ItemName: "A"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	ctx := context.WithValue(context.Background(), principalKey{}, "alice")
+	if _, err := m.Create(ctx, CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, RequestedSamplingRate: time.Second}},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	for range 3 {
+		fake.Advance(time.Second)
+	}
+
+	seen := r.principals()
+	if len(seen) < 2 {
+		t.Fatalf("only %d reads happened (%v); the test needs the Subscribe read plus polls", len(seen), seen)
+	}
+	for i, who := range seen {
+		if who != "alice" {
+			t.Errorf("read %d of %d carried principal %q, want %q — an authorizing backend cannot "+
+				"tell who the poll is for", i+1, len(seen), who, "alice")
+		}
+	}
+}
+
+// TestCreate_RequestCancellationDoesNotKillTheSubscription is the other
+// half of carrying the request's values: the subscription must NOT inherit
+// the request's cancellation or deadline. Subscribe returns long before
+// the subscription ends.
+func TestCreate_RequestCancellationDoesNotKillTheSubscription(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	ref := backend.ItemRef{ItemName: "A"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	res, err := m.Create(ctx, CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, RequestedSamplingRate: time.Second}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cancel() // the Subscribe request is over
+
+	before := r.ReadCount()
+	r.Set(ref, xmlda.NewInt32(2))
+	fake.Advance(time.Second)
+	if r.ReadCount() == before {
+		t.Fatal("polling stopped when the Subscribe request's context was cancelled")
+	}
+
+	got, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}})
+	if err != nil {
+		t.Fatalf("PolledRefresh: %v", err)
+	}
+	if len(got.Subscriptions) != 1 {
+		t.Fatalf("the subscription is gone after its Subscribe request ended: %+v", got)
+	}
+}

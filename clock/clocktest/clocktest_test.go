@@ -196,3 +196,57 @@ func TestFake_Sleep_UnblocksOnAdvanceFromAnotherGoroutine(t *testing.T) {
 		t.Fatalf("Sleep did not unblock after Advance")
 	}
 }
+
+// TestFake_MultiPeriodJumpFiresEveryTick pins the fidelity of a jump over
+// several periods. Moving the clock straight to the target and firing
+// whatever had come due collapsed such a jump into a SINGLE tick for a
+// self-rescheduling AfterFunc chain — the shape subscription.Manager's
+// poll scheduling uses — because the callback rearms relative to the
+// clock's new time. A test advancing 10 s over a 1 s rate then exercised
+// one poll while appearing to exercise ten.
+func TestFake_MultiPeriodJumpFiresEveryTick(t *testing.T) {
+	f := New(time.Date(2026, 3, 4, 9, 0, 0, 0, time.UTC))
+	start := f.Now()
+
+	var seen []time.Duration
+	var rearm func()
+	rearm = func() {
+		seen = append(seen, f.Now().Sub(start))
+		f.AfterFunc(time.Second, rearm)
+	}
+	f.AfterFunc(time.Second, rearm)
+
+	f.Advance(10 * time.Second)
+
+	if len(seen) != 10 {
+		t.Fatalf("a 10 s jump over a 1 s chain fired %d times, want 10: %v", len(seen), seen)
+	}
+	// Each callback must see its OWN due time, not the end of the jump.
+	for i, d := range seen {
+		if want := time.Duration(i+1) * time.Second; d != want {
+			t.Errorf("tick %d saw Now()-start = %v, want %v", i+1, d, want)
+		}
+	}
+	if got := f.Now().Sub(start); got != 10*time.Second {
+		t.Errorf("clock ended at +%v, want +10s", got)
+	}
+}
+
+// TestFake_JumpPastANonRearmingTimerStillLandsOnTarget guards the loop's
+// exit: a one-shot timer inside the jump must not leave the clock short
+// of where it was told to go.
+func TestFake_JumpPastANonRearmingTimerStillLandsOnTarget(t *testing.T) {
+	f := New(time.Date(2026, 3, 4, 9, 0, 0, 0, time.UTC))
+	start := f.Now()
+	fired := 0
+	f.AfterFunc(2*time.Second, func() { fired++ })
+
+	f.Advance(10 * time.Second)
+
+	if fired != 1 {
+		t.Errorf("one-shot timer fired %d times, want 1", fired)
+	}
+	if got := f.Now().Sub(start); got != 10*time.Second {
+		t.Errorf("clock ended at +%v, want +10s", got)
+	}
+}

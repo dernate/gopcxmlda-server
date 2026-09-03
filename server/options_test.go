@@ -60,11 +60,12 @@ func TestHandleRead_ReturnErrorTextGating(t *testing.T) {
 		`<Options ClientRequestHandle="CRH1" ReturnErrorText="false"/>` +
 		`<ItemList><Items ItemName="Item1"/></ItemList></Read>` + soapEnvelopeClose
 	got2 := decodeResponse[xmlda.ReadResponse](t, postSOAP(t, h, withoutText))
-	if len(got2.Errors) != 1 {
-		t.Fatalf("expected the Errors entry to still exist (ResultID mechanism), got %+v", got2.Errors)
-	}
-	if got2.Errors[0].Text != "" {
-		t.Fatalf("expected empty error text when ReturnErrorText=false, got %q", got2.Errors[0].Text)
+	// §3.1.9: "For each OPCError there will be a Text element." An entry
+	// without one is not a reduced entry, it is one that should not have
+	// been sent — and the client loses nothing, because the code it needs
+	// is on the item's own ResultID (asserted below).
+	if len(got2.Errors) != 0 {
+		t.Fatalf("expected no Errors entries when ReturnErrorText=false, got %+v", got2.Errors)
 	}
 	// The per-item ResultID itself must still be present regardless.
 	if got2.RItemList.Items[0].ResultID != xmlda.ErrUnknownItemName {

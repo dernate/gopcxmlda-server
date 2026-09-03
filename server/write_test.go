@@ -199,14 +199,28 @@ func TestHandleWrite_ListLevelItemPath_AppliesToItemWithoutOwnPath(t *testing.T)
 	}
 }
 
-func TestHandleWrite_EmptyItemList_Faults(t *testing.T) {
-	be, _, _ := newWritableBackend()
+// TestHandleWrite_EmptyItemListIsAnEmptySuccess pins that an empty item
+// list is served, not refused. Both <ItemList> and its <Items> are
+// minOccurs="0" in the schema, and §3.3.1 only goes as far as "It is
+// expected that there are one or more Items per ItemList" — expectation,
+// not requirement. Faulting invented a rule the schema does not state,
+// and a client assembling its list dynamically hits it for an entirely
+// ordinary reason.
+func TestHandleWrite_EmptyItemListIsAnEmptySuccess(t *testing.T) {
+	be, _, _ := newRWBackend(t)
 	h := newTestHandler(t, be, Config{}, clock.Real{})
 
-	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `" ReturnValuesOnReply="false"><Options/><ItemList></ItemList></Write>` + soapEnvelopeClose
+	body := soapEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `"><ItemList/></Write>` + soapEnvelopeClose
 	resp := postSOAP(t, h, body)
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("got status %d, want 500", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	out := decodeResponseFrom[xmlda.WriteResponse](t, readBody(t, resp))
+	if len(out.RItemList.Items) != 0 {
+		t.Errorf("got %d items for an empty request, want 0", len(out.RItemList.Items))
+	}
+	if len(out.Errors) != 0 {
+		t.Errorf("an empty request produced Errors entries: %+v", out.Errors)
 	}
 }
 

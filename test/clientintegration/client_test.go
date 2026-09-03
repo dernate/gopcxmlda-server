@@ -530,6 +530,14 @@ func TestIntegration_FailedItemQualityAsSeenByRealClient(t *testing.T) {
 	// The raw bytes are the authoritative check: Go's own decoder fills in
 	// the same zero value whether <Quality> was present or absent, which is
 	// why the defect survived every round-trip test for so long.
+	//
+	// The element must be PRESENT and say "bad". Omitting it was the first
+	// attempt at this fix and has the same failure mode one step removed:
+	// the schema declares QualityField default="good", so a client applies
+	// that default to the missing element and reads "unknown item = good
+	// quality" anyway. §2.6 p.22 resolves it by stating the quality
+	// outright — <Items ResultID="E_UNKNOWNITEMNAME"><Quality
+	// QualityField="bad"/></Items>.
 	url := newRawTestServer(t, server.Config{})
 	body := rawEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `"><Options ReturnItemName="true"/><ItemList>` +
 		`<Items ItemName="No/Such/Tag"/></ItemList></Read>` + rawEnvelopeClose
@@ -537,8 +545,11 @@ func TestIntegration_FailedItemQualityAsSeenByRealClient(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("got status %d: %s", status, data)
 	}
-	if strings.Contains(string(data), "<Quality") {
-		t.Errorf("the response still carries a Quality element for a failed item:\n%s", data)
+	if !strings.Contains(string(data), "<Quality") {
+		t.Errorf("the failed item carries no Quality element; the schema default then reads as good:\n%s", data)
+	}
+	if !strings.Contains(string(data), `QualityField="bad"`) {
+		t.Errorf("the failed item's Quality does not spell out bad:\n%s", data)
 	}
 }
 

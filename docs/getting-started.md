@@ -128,13 +128,21 @@ between the two.
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
 
-go func() { log.Fatal(srv.Start()) }()
+// Start() reports a clean shutdown as a nil error, so log.Fatal in this
+// goroutine would call os.Exit(1) at exactly the moment Shutdown starts
+// doing its work — killing the process instead of letting it stop.
+serveErr := make(chan error, 1)
+go func() { serveErr <- srv.Start() }()
 
-<-ctx.Done()
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-if err := srv.Shutdown(shutdownCtx); err != nil {
-	log.Printf("shutdown: %v", err)
+select {
+case err := <-serveErr:
+	log.Printf("server stopped unexpectedly: %v", err)
+case <-ctx.Done():
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }
 ```
 

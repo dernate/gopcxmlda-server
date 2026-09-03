@@ -35,7 +35,13 @@ type GetPropertiesRequest struct {
 // ReturnErrorTextOrDefault returns ReturnErrorText, or its default (true)
 // if unset.
 func (r GetPropertiesRequest) ReturnErrorTextOrDefault() bool {
-	return returnErrorTextOrDefault(r.ReturnErrorText)
+	// false, not RequestOptions' true: the schema gives this attribute a
+	// different default on this element. RequestOptions declares
+	// default="true" (§3.1.6, "If TRUE (default) …"), while the Browse and
+	// GetProperties elements both declare default="false" and their prose
+	// deliberately drops the "(default)" — see the WSDL in
+	// docs/OPCDataAccessXMLSpecification.pdf and testdata/schema/opcxmlda.xsd.
+	return boolOrDefault(r.ReturnErrorText, false)
 }
 
 // MarshalXML implements xml.Marshaler.
@@ -149,7 +155,7 @@ func (l PropertyReplyList) MarshalXML(e *xml.Encoder, start xml.StartElement) er
 		start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "ItemName"}, Value: l.ItemName})
 	}
 	if !l.ResultID.IsZero() {
-		start.Attr = mergeAttrs(start.Attr, qnameAttr(start.Attr, "ResultID", l.ResultID.QName)...)
+		start.Attr = mergeAttrs(start.Attr, qnameAttr(e, start.Attr, "ResultID", l.ResultID.QName)...)
 	}
 	if err := e.EncodeToken(start); err != nil {
 		return err

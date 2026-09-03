@@ -1045,7 +1045,7 @@ func checkConsumesElement(t *testing.T, doc string) error {
 // newScopedDecoder builds a decoder over raw with raw's own prefix table
 // registered, the way xmlda's entry points do.
 func newScopedDecoder(raw []byte) (*xml.Decoder, func(), error) {
-	table, err := buildPrefixTable(raw)
+	table, _, _, err := buildPrefixTable(raw, DefaultMaxElementDepth)
 	if err != nil {
 		return nil, nil, err
 	}

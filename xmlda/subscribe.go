@@ -46,7 +46,7 @@ type SubscribeItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l SubscribeItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -97,7 +97,7 @@ func (r SubscribeRequest) MarshalXML(e *xml.Encoder, start xml.StartElement) err
 		xml.Attr{Name: xml.Name{Local: "ReturnValuesOnReply"}, Value: strconv.FormatBool(r.ReturnValuesOnReply)},
 		xml.Attr{Name: xml.Name{Local: "SubscriptionPingRate"}, Value: strconv.FormatInt(int64(r.SubscriptionPingRate), 10)},
 	)
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(r.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, r.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}
@@ -158,7 +158,7 @@ type SubscribeItemValue struct {
 
 // MarshalXML implements xml.Marshaler.
 func (s SubscribeItemValue) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "SubscribeItemValue"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "SubscribeItemValue"})...)
 	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatInt(int64(s.RevisedSamplingRate), 10)})
 	if err := e.EncodeToken(start); err != nil {
 		return err
@@ -196,7 +196,7 @@ type SubscribeReplyItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l SubscribeReplyItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, typeAttrs(start.Attr, QName{Space: Namespace, Local: "SubscribeReplyItemList"})...)
+	start.Attr = mergeAttrs(start.Attr, typeAttrs(e, start.Attr, QName{Space: Namespace, Local: "SubscribeReplyItemList"})...)
 	start.Attr = append(start.Attr, xml.Attr{Name: xml.Name{Local: "RevisedSamplingRate"}, Value: strconv.FormatInt(int64(l.RevisedSamplingRate), 10)})
 	if err := e.EncodeToken(start); err != nil {
 		return err

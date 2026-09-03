@@ -1,7 +1,5 @@
 package xmlda
 
-import "encoding/xml"
-
 // Operation identifies one of the 8 OPC XML-DA operations.
 type Operation struct {
 	// Name is the operation's element QName (always in Namespace).
@@ -33,25 +31,6 @@ func buildOperationRegistry() map[QName]Operation {
 		reg[qn] = Operation{Name: qn, SOAPAction: Namespace + local}
 	}
 	return reg
-}
-
-// peekOperation captures a SOAP Body's first child element's resolved
-// name, regardless of namespace prefix, without decoding its content —
-// used by IdentifyOperation to determine which of the 8 operations a raw
-// document represents before committing to a concrete request type.
-type peekOperation struct {
-	// No tag here: Go auto-populates XMLName with the decoded element's
-	// resolved name for any struct being unmarshaled from an element.
-	// The ",any" wildcard belongs on the *wrapping* field (see
-	// peekEnvelope.Body.Op below) — encoding/xml rejects ",any" directly
-	// on an XMLName field ("invalid tag").
-	XMLName xml.Name
-}
-
-type peekEnvelope struct {
-	Body struct {
-		Op peekOperation `xml:",any"`
-	} `xml:"Body"`
 }
 
 // IdentifyOperation peeks raw — a full SOAP document's bytes — and
@@ -86,11 +65,11 @@ func IdentifyOperation(raw []byte) (Operation, bool, error) {
 // IdentifyOperation (minus its parse-error case, already resolved when the
 // Document was built).
 func (doc *Document) IdentifyOperation() (Operation, bool, error) {
-	var peek peekEnvelope
-	if err := doc.Decode(&peek); err != nil {
-		return Operation{}, false, err
-	}
-	qn := QName{Space: peek.Body.Op.XMLName.Space, Local: peek.Body.Op.XMLName.Local}
+	// Read off the scan NewDocument already performed, rather than
+	// tokenizing the whole document a second time for a single element
+	// name: on a 1000-item Read that second pass cost 1.8 ms and 293 KB,
+	// about a ninth of the entire request.
+	qn := QName{Space: doc.operation.Space, Local: doc.operation.Local}
 	op, ok := operations[qn]
 	return op, ok, nil
 }

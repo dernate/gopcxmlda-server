@@ -85,11 +85,16 @@ Maps each requirement in `requirements.md` to its target Go package and planned/
 
 ## Coverage summary
 
-- Total requirements: 68
-- Must: 62, Should: 3, Optional: 1, Implementation-policy: 2
-- Status distribution (as of WP-9 completion, corrected 2026-08-24 for REQ-TYPE-006/REQ-WRITE-004 — both were
-  actually already covered by dedicated tests that predated this row's last update, see individual rows): 60
-  tested, 4 implemented (documented as backend-authoring responsibilities or awaiting a dedicated test — see
-  individual rows), 1 in progress, 0 not started, 0 blocked. `-race` re-verification for the
-  concurrency-sensitive rows was completed 2026-08-24 (tracked in `docs/development/tasks.md`);
-  REQ-SUBSCRIPTION-009 above is now unconditionally `tested`.
+- Total requirements: **75** (count the `REQ-` rows above; the summary previously said 68 and had drifted
+  from the table as rows were added).
+- Status distribution, recounted from the table itself: **69 tested** (68 plain `tested` plus
+  REQ-STATUS-004's `tested (wire-level)`), **5 implemented** (documented as backend-authoring
+  responsibilities or awaiting a dedicated test — see the individual rows), **1 in progress**, 0 not
+  started, 0 blocked. 69 + 5 + 1 = 75.
+- `-race` re-verification for the concurrency-sensitive rows was completed 2026-08-24 (tracked in
+  `docs/development/tasks.md`); REQ-SUBSCRIPTION-009 above is unconditionally `tested`.
+
+> These numbers are counted from the rows above, not maintained by hand alongside them. The previous
+> summary claimed 68 requirements with a 60/4/1 distribution that summed to 65 — a discrepancy nobody
+> could see without recounting, in the one document whose job is to be countable. If you add a row,
+> recount rather than adjust.

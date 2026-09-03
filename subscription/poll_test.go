@@ -240,7 +240,7 @@ func TestApplyUpdate_DeadbandReferenceIsLastReportedValue(t *testing.T) {
 	reported := 0
 	for _, v := range steps {
 		if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, nil) {
+			xmlda.ErrorCode{}, "", 100, nil) {
 			reported++
 		}
 	}
@@ -267,7 +267,7 @@ func TestApplyUpdate_DeadbandStillSuppressesSmallChanges(t *testing.T) {
 	}
 	for _, v := range []float64{101, 102, 103} {
 		if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(v), Quality: xmlda.NewGoodQuality()},
-			xmlda.ErrorCode{}, 100, nil) {
+			xmlda.ErrorCode{}, "", 100, nil) {
 			t.Fatalf("%v is within 10%% of the reported 100 but was notified", v)
 		}
 	}
@@ -281,11 +281,11 @@ func TestApplyUpdate_NoDeadbandUnchanged(t *testing.T) {
 		last:     backend.ItemSample{Value: xmlda.NewFloat64(1), Quality: xmlda.NewGoodQuality()},
 	}
 	if applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(1), Quality: xmlda.NewGoodQuality()},
-		xmlda.ErrorCode{}, 100, nil) {
+		xmlda.ErrorCode{}, "", 100, nil) {
 		t.Error("an identical value was reported as a change")
 	}
 	if !applyUpdate(it, backend.ItemSample{Value: xmlda.NewFloat64(2), Quality: xmlda.NewGoodQuality()},
-		xmlda.ErrorCode{}, 100, nil) {
+		xmlda.ErrorCode{}, "", 100, nil) {
 		t.Error("a different value was not reported as a change")
 	}
 	v, _ := it.last.Value.Float64()
@@ -336,5 +336,233 @@ func TestSchedulePoll_DoesNotDriftWithSlowBackend(t *testing.T) {
 	if got := slow.count(); got != ticks {
 		t.Fatalf("got %d polls across %d sampling intervals, want %d — "+
 			"the chain is drifting by the backend's own duration", got, ticks, ticks)
+	}
+}
+
+// TestApplyUpdate_SuccessCodeKeepsDeliveringValues pins the distinction
+// between a critical E_ code and a non-critical S_ one for the poll
+// engine. §2.6 is explicit that "in case of a critical error the returned
+// value may not be useful. For non-critical exceptions the returned value
+// IS useful" — server/itemvalue.go's hasUsableValue and
+// subscription/create.go's initial read both already applied that rule;
+// applyUpdate did not. It treated every non-zero ResultID as "no sample",
+// and since a persistent code then compared equal to itself on the next
+// tick, the item reported its condition exactly once and never delivered
+// another value for the whole lifetime of the subscription — silent
+// process-data loss for something as ordinary as a clamped analog value.
+func TestApplyUpdate_SuccessCodeKeepsDeliveringValues(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := &clampReader{fakeReader: newFakeReader()}
+	ref := backend.ItemRef{ItemName: "Clamped"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH", RequestedSamplingRate: time.Second}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if res.Handle == "" {
+		t.Fatal("Create returned no handle for an item reporting S_CLAMP")
+	}
+
+	// Drain whatever Create seeded, so the assertions below are about the
+	// poll engine rather than about the initial read.
+	if _, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}}); err != nil {
+		t.Fatalf("PolledRefresh (drain): %v", err)
+	}
+
+	for i := 2; i <= 4; i++ {
+		r.Set(ref, xmlda.NewInt32(int32(i)))
+		fake.Advance(time.Second)
+
+		got, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}})
+		if err != nil {
+			t.Fatalf("PolledRefresh %d: %v", i, err)
+		}
+		if len(got.Subscriptions) != 1 || len(got.Subscriptions[0].Items) != 1 {
+			t.Fatalf("poll %d: got %d subscriptions, want 1 with exactly 1 changed item "+
+				"(an S_ code must not suppress the change)", i, len(got.Subscriptions))
+		}
+		item := got.Subscriptions[0].Items[0]
+		if !item.HaveSample {
+			t.Fatalf("poll %d: HaveSample is false for an S_CLAMP item; the value is useful (§2.6)", i)
+		}
+		if item.ResultID != xmlda.SuccessClamp {
+			t.Fatalf("poll %d: ResultID = %v, want S_CLAMP carried alongside the value", i, item.ResultID)
+		}
+		if n, err := item.Sample.Value.Int32(); err != nil || n != int32(i) {
+			t.Fatalf("poll %d: value = %v (err=%v), want %d", i, item.Sample.Value, err, i)
+		}
+	}
+
+	// ReturnAllItems is the client's explicit "give me the current state"
+	// and must not degrade to the bare condition either.
+	all, err := m.PolledRefresh(context.Background(), RefreshRequest{
+		Handles: []Handle{res.Handle}, ReturnAllItems: true,
+	})
+	if err != nil {
+		t.Fatalf("PolledRefresh(ReturnAllItems): %v", err)
+	}
+	if len(all.Subscriptions) != 1 || len(all.Subscriptions[0].Items) != 1 {
+		t.Fatalf("ReturnAllItems: got %d subscriptions, want 1 with 1 item", len(all.Subscriptions))
+	}
+	if !all.Subscriptions[0].Items[0].HaveSample {
+		t.Fatal("ReturnAllItems: HaveSample is false for an S_CLAMP item")
+	}
+}
+
+// TestApplyUpdate_ErrorCodeStillSuppressesSample is the other half of the
+// rule above: a critical E_ code must keep suppressing the sample, and a
+// persistent one must still be reported only once rather than on every
+// tick.
+func TestApplyUpdate_ErrorCodeStillSuppressesSample(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	ref := backend.ItemRef{ItemName: "Gone"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: ref, ClientItemHandle: "CIH", RequestedSamplingRate: time.Second}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}}); err != nil {
+		t.Fatalf("PolledRefresh (drain): %v", err)
+	}
+
+	r.SetNotFound(ref)
+	fake.Advance(time.Second)
+	got, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}})
+	if err != nil {
+		t.Fatalf("PolledRefresh: %v", err)
+	}
+	if len(got.Subscriptions) != 1 || len(got.Subscriptions[0].Items) != 1 {
+		t.Fatalf("got %d subscriptions, want 1 with 1 item reporting the condition", len(got.Subscriptions))
+	}
+	item := got.Subscriptions[0].Items[0]
+	if item.HaveSample {
+		t.Error("HaveSample is true for an E_ condition; a critical error carries no usable value")
+	}
+	if !item.ResultID.IsError() {
+		t.Errorf("ResultID = %v, want a critical E_ code", item.ResultID)
+	}
+
+	// The same condition on the next tick is not a new change.
+	fake.Advance(time.Second)
+	again, err := m.PolledRefresh(context.Background(), RefreshRequest{Handles: []Handle{res.Handle}})
+	if err != nil {
+		t.Fatalf("PolledRefresh (repeat): %v", err)
+	}
+	if len(again.Subscriptions) != 0 {
+		t.Errorf("a persistent E_ condition was reported twice: %+v", again.Subscriptions)
+	}
+}
+
+// TestApplyUpdate_AfterReleaseDoesNotLeakBudget pins the server-wide
+// buffered-sample budget against the window between a subscription being
+// terminated and an update that was already in flight landing. terminate
+// returns the item's buffered slots via releaseBuffers; an applyUpdate
+// whose s.ctx check had already passed then acquired fresh slots and
+// wrote them into a buffer nobody would ever drain. Each such race leaked
+// its slots permanently, and ordinary client churn eventually exhausted
+// the budget — after which every buffering subscription server-wide
+// degraded to "latest value only" with DataBufferOverflow set, with no
+// way back short of a restart.
+func TestApplyUpdate_AfterReleaseDoesNotLeakBudget(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	ref := backend.ItemRef{ItemName: "Buffered"}
+	r.Set(ref, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour, MaxTotalBufferedSamples: 100})
+	defer shutdownManager(t, m)
+
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{
+			Ref: ref, ClientItemHandle: "CIH", RequestedSamplingRate: time.Second, EnableBuffering: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	for i := 2; i <= 4; i++ {
+		r.Set(ref, xmlda.NewInt32(int32(i)))
+		fake.Advance(time.Second)
+	}
+	if m.budget.count() == 0 {
+		t.Fatal("setup: nothing was buffered, so the test would prove nothing")
+	}
+
+	m.mu.RLock()
+	s := m.subs[res.Handle]
+	m.mu.RUnlock()
+	if s == nil {
+		t.Fatal("setup: subscription not found")
+	}
+	s.mu.Lock()
+	it := s.items[0]
+	s.mu.Unlock()
+
+	if !m.Cancel(res.Handle) {
+		t.Fatal("Cancel reported the subscription was unknown")
+	}
+	if n := m.budget.count(); n != 0 {
+		t.Fatalf("after Cancel the budget still holds %d slots, want 0", n)
+	}
+
+	// The update that was already in flight when Cancel ran lands now.
+	applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(99), Timestamp: fake.Now()},
+		xmlda.ErrorCode{}, "", 100, m.budget)
+
+	if n := m.budget.count(); n != 0 {
+		t.Fatalf("an update landing after the subscription was terminated leaked %d budget slot(s); "+
+			"they can never be released because the subscription is gone", n)
+	}
+}
+
+// TestSampleChanged_DeadbandAppliesToArrays pins §3.5.1's array rule:
+// "The deadband will also apply to array types. The entire array is
+// returned if any array element exceeds the deadband threshold." The
+// comparison used to fall through to plain equality for arrays, so a
+// client that had asked the server to suppress small changes got every
+// single element change instead — the exact flood a deadband exists to
+// prevent.
+func TestSampleChanged_DeadbandAppliesToArrays(t *testing.T) {
+	sample := func(v ...float64) backend.ItemSample {
+		return backend.ItemSample{Value: xmlda.NewArrayValue(xmlda.NewFloat64Array(v)), Quality: xmlda.NewGoodQuality()}
+	}
+	const deadband = 50.0
+
+	if sampleChanged(sample(100, 200), sample(100.0001, 200), deadband) {
+		t.Error("a 0.0001% element change was reported despite a 50% deadband")
+	}
+	if !sampleChanged(sample(100, 200), sample(100, 400), deadband) {
+		t.Error("a 100% change in one element was suppressed by a 50% deadband")
+	}
+	// A changed shape is a change regardless of the deadband: there is no
+	// element-wise comparison to make.
+	if !sampleChanged(sample(100), sample(100, 100), deadband) {
+		t.Error("an array that grew was reported as unchanged")
+	}
+	// Without a deadband, every element change is still reported.
+	if !sampleChanged(sample(100), sample(100.0001), 0) {
+		t.Error("a tiny element change was suppressed although no deadband was set")
+	}
+	// Non-numeric arrays have no percentage to compare and keep the plain
+	// comparison.
+	strs := func(v ...string) backend.ItemSample {
+		return backend.ItemSample{Value: xmlda.NewArrayValue(xmlda.NewStringArray(v)), Quality: xmlda.NewGoodQuality()}
+	}
+	if !sampleChanged(strs("a"), strs("b"), deadband) {
+		t.Error("a changed string array was suppressed by a deadband that cannot apply to it")
+	}
+	if sampleChanged(strs("a"), strs("a"), deadband) {
+		t.Error("an unchanged string array was reported as changed")
 	}
 }

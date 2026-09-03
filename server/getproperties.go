@@ -13,19 +13,36 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 	var env soap.Envelope[xmlda.GetPropertiesRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("GetProperties", "parse")
-		writeFault(w, requestDecodeFault("GetProperties", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("GetProperties", err))
 		return
 	}
 	req := env.Body.Content
 
 	if h.backend.Properties == nil {
 		h.metrics.IncRequestError("GetProperties", "not_supported")
-		writeFault(w, fault(xmlda.ErrNotSupported, "GetProperties is not supported by this server"))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrNotSupported, "GetProperties is not supported by this server"))
+		return
+	}
+	// PropertyNames is bounded like every other client-supplied list —
+	// Browse already did this for the same field. Both lists multiply:
+	// the response carries one ItemProperty per item AND per name, and
+	// the whole document is assembled in memory before a byte goes out,
+	// so two individually-legal lists can still ask for a response
+	// neither limit describes. A 215 KB request produced 739 MB.
+	if !h.checkItemCount(len(req.PropertyNames)) {
+		h.metrics.IncRequestError("GetProperties", "limit_exceeded")
+		writeFault(w, soapVersion(doc), limitExceededFault("too many property names in one GetProperties request"))
+		return
+	}
+	if n, m := len(req.ItemIDs), len(req.PropertyNames); h.cfg.MaxItemsPerRequest > 0 && m > 0 &&
+		n > h.cfg.MaxItemsPerRequest/m {
+		h.metrics.IncRequestError("GetProperties", "limit_exceeded")
+		writeFault(w, soapVersion(doc), limitExceededFault("too many item/property combinations in one GetProperties request"))
 		return
 	}
 	if !h.checkItemCount(len(req.ItemIDs)) {
 		h.metrics.IncRequestError("GetProperties", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many items in one GetProperties request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many items in one GetProperties request"))
 		return
 	}
 
@@ -74,12 +91,12 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 		}
 	}
 
-	results, err := observeBackend(h.metrics, h.clk, "GetProperties", func() ([]backend.Result[[]backend.Property], error) {
+	results, err := observeBackend(ctx, h.metrics, h.clk, "GetProperties", h.cfg.BackendTimeout, func() ([]backend.Result[[]backend.Property], error) {
 		return h.backend.Properties.GetProperties(ctx, reqs)
 	})
 	if err != nil {
 		h.metrics.IncRequestError("GetProperties", "backend_error")
-		writeFault(w, backendErrorFault(err))
+		writeFault(w, soapVersion(doc), backendErrorFault(err))
 		return
 	}
 
@@ -128,14 +145,20 @@ func (h *Handler) handleGetProperties(ctx context.Context, w http.ResponseWriter
 	opts := xmlda.RequestOptions{
 		ClientRequestHandle: req.ClientRequestHandle,
 		LocaleID:            req.LocaleID,
-		ReturnErrorText:     req.ReturnErrorText,
+		// Resolved through the request's OWN accessor, then passed on as an
+		// explicit value: Browse and GetProperties declare
+		// ReturnErrorText with default="false" while RequestOptions
+		// declares default="true", so handing the raw pointer to a
+		// RequestOptions would silently apply the wrong default whenever
+		// the client omits the attribute.
+		ReturnErrorText: boolPtr(req.ReturnErrorTextOrDefault()),
 	}
 	resp := xmlda.GetPropertiesResponse{
 		Result:        h.replyBase(oc, req.ClientRequestHandle, req.LocaleID),
 		PropertyLists: lists,
-		Errors:        xmlda.DedupeErrors(codes, h.errorTextFunc(opts, oc)),
+		Errors:        buildErrors(codes, h.errorTextFunc(opts, oc)),
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }
 
 // standardPropertyIDs are the standard property IDs this server can

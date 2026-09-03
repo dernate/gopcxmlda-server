@@ -208,7 +208,10 @@ func TestHandleBrowse_ReportsPropertyErrors(t *testing.T) {
 	}}}}
 	h := newTestHandler(t, backend.Backend{Status: st, Reader: r, Browser: br}, Config{}, clock.Real{})
 
-	out := decodeResponse[xmlda.BrowseResponse](t, postSOAP(t, h, browseRequestBody()))
+	// ReturnErrorText="true" explicitly: the Browse element's own schema
+	// default is false, and with no text there are no OPCError entries to
+	// assert on (§3.1.9, "For each OPCError there will be a Text element").
+	out := decodeResponse[xmlda.BrowseResponse](t, postSOAP(t, h, browseBody(`ReturnErrorText="true"`)))
 	got := map[xmlda.ErrorCode]string{}
 	for _, e := range out.Errors {
 		got[e.ID] = e.Text
@@ -240,15 +243,32 @@ func TestHandleBrowse_ReturnErrorTextFalseSuppressesText(t *testing.T) {
 	}}}}
 	h := newTestHandler(t, backend.Backend{Status: st, Reader: r, Browser: br}, Config{}, clock.Real{})
 
+	// §3.1.9 states "For each OPCError there will be a Text element", so
+	// an OPCError without one is not a lesser OPCError — it is one that
+	// should not have been sent. Switching the text off therefore omits
+	// the list, and the codes reach the client where they always did: on
+	// the per-property ResultID.
 	out := decodeResponse[xmlda.BrowseResponse](t, postSOAP(t, h, browseBody(`ReturnErrorText="false"`)))
-	if len(out.Errors) != 1 {
-		t.Fatalf("got %d Errors entries, want 1", len(out.Errors))
+	if len(out.Errors) != 0 {
+		t.Errorf("got %d Errors entries with ReturnErrorText=false, want 0: %+v", len(out.Errors), out.Errors)
 	}
-	if out.Errors[0].ID != xmlda.ErrInvalidPID {
-		t.Errorf("ID = %v, want E_INVALIDPID", out.Errors[0].ID)
+	if len(out.Elements) != 1 || len(out.Elements[0].Properties) != 1 {
+		t.Fatalf("the element/property structure was lost: %+v", out.Elements)
 	}
-	if out.Errors[0].Text != "" {
-		t.Errorf("Text = %q, want empty with ReturnErrorText=false", out.Errors[0].Text)
+	if got := out.Elements[0].Properties[0].ResultID; got != xmlda.ErrInvalidPID {
+		t.Errorf("per-property ResultID = %v, want E_INVALIDPID — it must survive regardless of ReturnErrorText", got)
+	}
+
+	// With the text switched on, the list is there in full.
+	withText := decodeResponse[xmlda.BrowseResponse](t, postSOAP(t, h, browseBody(`ReturnErrorText="true"`)))
+	if len(withText.Errors) != 1 {
+		t.Fatalf("got %d Errors entries with ReturnErrorText=true, want 1", len(withText.Errors))
+	}
+	if withText.Errors[0].ID != xmlda.ErrInvalidPID {
+		t.Errorf("ID = %v, want E_INVALIDPID", withText.Errors[0].ID)
+	}
+	if withText.Errors[0].Text == "" {
+		t.Error("Text is empty although ReturnErrorText=true")
 	}
 }
 

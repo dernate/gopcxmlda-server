@@ -100,7 +100,7 @@ func xmlMarshalStart(t *testing.T, start xml.StartElement) ([]byte, error) {
 // resolveQName (used for ReqType) works.
 func decodeItemParamsFromDoc(t *testing.T, doc []byte) ItemParams {
 	t.Helper()
-	table, err := buildPrefixTable(doc)
+	table, _, _, err := buildPrefixTable(doc, DefaultMaxElementDepth)
 	if err != nil {
 		t.Fatalf("buildPrefixTable: %v", err)
 	}

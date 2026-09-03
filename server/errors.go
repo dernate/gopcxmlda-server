@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/soap"
 	"github.com/dernate/gopcxmlda-server/xmlda"
@@ -48,6 +49,17 @@ func soapClientFault(text string) *soap.Fault {
 	return &soap.Fault{Code: soap.QName{Space: soap.NS11, Local: "Client"}, Text: text}
 }
 
+// mustUnderstandFault is SOAP 1.1 §4.4's own fault code for a header
+// block the recipient was told it had to understand and does not. It is
+// not an OPC XML-DA condition — nothing about the operation failed — so
+// it carries the SOAP namespace, like soapClientFault.
+func mustUnderstandFault(err *soap.MustUnderstandError) *soap.Fault {
+	return &soap.Fault{
+		Code: soap.QName{Space: soap.NS11, Local: "MustUnderstand"},
+		Text: err.Error(),
+	}
+}
+
 // requestDecodeFault builds the fault for bucket 3 of
 // xmlda.IdentifyOperation's documented failure model: the operation was
 // recognized, but decoding its typed request body failed (e.g. an
@@ -56,6 +68,13 @@ func soapClientFault(text string) *soap.Fault {
 // appropriate here (mirrors the real-world fault text observed in
 // testdata/faults/fault_soap12_invalid_datetime.response.xml).
 func requestDecodeFault(opName string, err error) *soap.Fault {
+	// A mustUnderstand header block is not a malformed request — the
+	// document is fine, the server just cannot honor what it promises —
+	// and SOAP gives it its own fault code (§4.2.3, §4.4).
+	var mu *soap.MustUnderstandError
+	if errors.As(err, &mu) {
+		return mustUnderstandFault(mu)
+	}
 	return soapClientFault("invalid " + opName + " request: " + err.Error())
 }
 

@@ -250,16 +250,28 @@ type WatchRequest struct {
 
 // ChangeEvent is one pushed change from a ChangeNotifier. Err, if
 // non-nil, means this specific item's watch broke: the subscription
-// manager logs a warning and stops applying further updates for that
-// item (it does not fall back to polling it individually — this
-// subscription remains push-mode overall). If the backend's watch is
-// broken more broadly rather than for just one item, close the whole
-// channel instead (see ChangeNotifier.WatchItems) to trigger the
-// subscription-wide poll-mode fallback.
+// manager logs a warning and records the mapped condition
+// (ErrorCodeFor(Err)) as that item's ResultID, which the client sees on
+// its next SubscriptionPolledRefresh. It does NOT stop watching the item
+// and does not fall back to polling it individually — this subscription
+// remains push-mode overall, and any later event for the same Ref is
+// applied normally. That is what makes recovery possible: send a normal
+// event (Err nil) once the item is readable again and the client is told
+// it is healthy. An item that will never recover simply keeps reporting
+// its condition until the subscription is cancelled.
+//
+// If the backend's watch is broken more broadly rather than for just one
+// item, close the whole channel instead (see ChangeNotifier.WatchItems)
+// to trigger the subscription-wide poll-mode fallback.
 type ChangeEvent struct {
 	Ref    ItemRef
 	Sample ItemSample
 	Err    error
+	// DiagnosticInfo is optional per-item diagnostic text for this event,
+	// reported to a client that asked for RequestOptions.
+	// ReturnDiagnosticInfo — the push-mode counterpart of
+	// Result.DiagnosticInfo. Most useful alongside Err.
+	DiagnosticInfo string
 }
 
 // RateRequest is one item's requested sampling rate, for

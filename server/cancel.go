@@ -17,7 +17,7 @@ func (h *Handler) handleSubscriptionCancel(ctx context.Context, w http.ResponseW
 	var env soap.Envelope[xmlda.SubscriptionCancelRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("SubscriptionCancel", "parse")
-		writeFault(w, requestDecodeFault("SubscriptionCancel", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("SubscriptionCancel", err))
 		return
 	}
 	req := env.Body.Content
@@ -27,5 +27,5 @@ func (h *Handler) handleSubscriptionCancel(ctx context.Context, w http.ResponseW
 	// inspected, since the response has no field to report it in anyway.
 	h.subs.Cancel(subscription.Handle(req.ServerSubHandle))
 
-	writeResponse(w, xmlda.SubscriptionCancelResponse{ClientRequestHandle: req.ClientRequestHandle})
+	writeResponse(w, h.log, soapVersion(doc), xmlda.SubscriptionCancelResponse{ClientRequestHandle: req.ClientRequestHandle})
 }

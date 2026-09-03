@@ -21,7 +21,7 @@ type WriteItemList struct {
 
 // MarshalXML implements xml.Marshaler.
 func (l WriteItemList) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(l.Params)...)
+	start.Attr = mergeAttrs(start.Attr, encodeItemParamsAttrs(e, l.Params)...)
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}

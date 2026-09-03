@@ -21,10 +21,15 @@ documented in [`docs/specification/open-questions.md`](specification/open-questi
   without the fuzzing engine's exploration.
 - **No official OPC Foundation conformance test suite has been run** against this library. Nothing in this
   repository should be read as a conformance claim — see `docs/protocol-support.md` for the precise,
-  per-operation implemented/tested status instead. Since 2026-08-30 every response this server produces *is*
-  validated against the specification's own schema (transcribed into `testdata/schema/opcxmlda.xsd`) by
-  `xmllint` in CI, which is a real external check but still narrower than a conformance suite: it verifies
-  document structure, not protocol behavior over time.
+  per-operation implemented/tested status instead. Since 2026-08-30 the responses of all eight
+  operations *are* validated against the specification's own schema (transcribed into
+  `testdata/schema/opcxmlda.xsd`) by `xmllint` in CI. Read that precisely: it is **nine frozen golden
+  documents**, one per operation plus a fault — not every response the server can produce. Shapes those
+  nine do not contain (a nil value, a vendor `xsi:type`, a buffered subscription reply carrying several
+  samples for one item) are covered only by Go-side round-trip tests, and Go's `encoding/xml` is lenient
+  in exactly the places a conforming parser is not. `testdata/invalid/` is also still empty: no test
+  asserts that malformed output is *rejected* by the schema, so the validation proves the golden
+  documents pass, not that the check would catch a regression in an untested shape.
 
 ## Specification areas with a documented, deliberately conservative interpretation
 

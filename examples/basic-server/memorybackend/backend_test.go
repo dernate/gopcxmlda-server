@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dernate/gopcxmlda-server/backend"
+	"github.com/dernate/gopcxmlda-server/backend/backendtest"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
@@ -377,4 +378,28 @@ func TestWrite_OutOfRangeCounter_ClampsAndReportsOutcome(t *testing.T) {
 	if got, err := readOut[0].Value.Value.Int32(); err != nil || got != 1000 {
 		t.Fatalf("stored value = %v (err=%v), want 1000", got, err)
 	}
+}
+
+// TestConformance runs the shared backend conformance suite against this
+// example. It is here for two reasons: it keeps the example honest, and it
+// is the worked demonstration a backend author copies — the suite is only
+// worth having if the reference implementation passes it.
+func TestConformance(t *testing.T) {
+	backendtest.Run(t, func(t *testing.T) backendtest.Fixture {
+		be := New()
+		return backendtest.Fixture{
+			Backend: backend.Backend{
+				Status:     be,
+				Reader:     be,
+				Writer:     be,
+				Browser:    be,
+				Properties: be,
+			},
+			ReadableItem: backend.ItemRef{ItemName: "Demo/Temperature"},
+			UnknownItem:  backend.ItemRef{ItemName: "Demo/NoSuchItem"},
+			WritableItem: backend.ItemRef{ItemName: "Demo/Switch"},
+			WriteValue:   xmlda.NewBool(true),
+			Cleanup:      be.Close,
+		}
+	})
 }

@@ -13,7 +13,7 @@ func (h *Handler) handleGetStatus(ctx context.Context, w http.ResponseWriter, do
 	var env soap.Envelope[xmlda.GetStatusRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("GetStatus", "parse")
-		writeFault(w, requestDecodeFault("GetStatus", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("GetStatus", err))
 		return
 	}
 	req := env.Body.Content
@@ -32,15 +32,22 @@ func (h *Handler) handleGetStatus(ctx context.Context, w http.ResponseWriter, do
 	status := oc.status
 	revised := reviseLocale(req.LocaleID, status.SupportedLocaleIDs)
 	if revised != "" && req.LocaleID != "" {
-		localized, err := observeBackend(h.metrics, h.clk, "GetStatus", func() (backend.ServerStatus, error) {
+		localized, err := observeBackend(ctx, h.metrics, h.clk, "GetStatus", h.cfg.BackendTimeout, func() (backend.ServerStatus, error) {
 			return h.backend.Status.GetStatus(ctx, revised)
 		})
 		if err != nil {
 			h.metrics.IncRequestError("GetStatus", "backend_error")
-			writeFault(w, backendErrorFault(err))
+			writeFault(w, soapVersion(doc), backendErrorFault(err))
 			return
 		}
-		status = localized
+		// normalizeStatus, not a bare assignment: this second fetch is a
+		// separate backend call and can just as easily come back with an
+		// empty State — and ServerState is use="required" in the schema,
+		// so a bare assignment made every locale-carrying GetStatus reply
+		// schema-invalid while the locale-less one stayed correct. The
+		// normalization (and its once-only warning) belongs on every path
+		// that takes a ServerStatus from the backend.
+		status = h.normalizeStatus(localized)
 	}
 
 	resp := xmlda.GetStatusResponse{
@@ -62,5 +69,5 @@ func (h *Handler) handleGetStatus(ctx context.Context, w http.ResponseWriter, do
 			SupportedInterfaceVersions: []string{xmlda.InterfaceVersion10},
 		},
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }

@@ -1,3 +1,3 @@
 module github.com/dernate/gopcxmlda-server
 
-go 1.26.5
+go 1.26.7

@@ -366,6 +366,78 @@ func TestShutdown_ConcurrentCreate_NoWaitGroupRace(t *testing.T) {
 	runtime.GC()
 }
 
+// TestShutdown_ConcurrentCreate_PushMode_NoWaitGroupRace is the
+// push-mode half of the test above, and it is the half that was missing.
+// startPush starts its own background goroutines, and with newFakeReader
+// (no ChangeNotifier) the poll path is taken instead, so push.go was
+// never reached by any concurrency test at all — its two goroutines took
+// their WaitGroup slot with a bare wg.Add, outside the m.mu/rootCtx gate
+// armTimer uses, which the race detector reports and sync.WaitGroup can
+// panic on ("Add called concurrently with Wait", or "WaitGroup is reused
+// before previous Wait has returned").
+func TestShutdown_ConcurrentCreate_PushMode_NoWaitGroupRace(t *testing.T) {
+	iterations := 400
+	if testing.Short() {
+		iterations = 50
+	}
+	for i := range iterations {
+		r := newPushReader()
+		r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+		m := NewManager(backend.Backend{Reader: r}, nil, nil, nil, Config{
+			ReapInterval:        time.Hour,
+			DefaultSamplingRate: time.Millisecond,
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		start := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = m.Create(context.Background(), CreateRequest{
+				Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.Shutdown(ctx); err != nil {
+				t.Errorf("iteration %d: Shutdown: %v", i, err)
+			}
+		}()
+		close(start)
+		wg.Wait()
+	}
+	runtime.GC()
+}
+
+// TestGoTracked_DeclinesAfterShutdown pins goTracked's half of the
+// mechanism, exactly as TestArmTimer_DeclinesAfterShutdown pins
+// armTimer's: once BeginShutdown has run, no further WaitGroup slot is
+// taken and nothing is started.
+func TestGoTracked_DeclinesAfterShutdown(t *testing.T) {
+	m := NewManager(backend.Backend{Reader: newFakeReader()}, nil, nil, nil, Config{ReapInterval: time.Hour})
+	m.BeginShutdown()
+
+	ran := make(chan struct{})
+	if m.goTracked(func() { close(ran) }) {
+		t.Fatal("goTracked reported it started a goroutine after BeginShutdown")
+	}
+	select {
+	case <-ran:
+		t.Fatal("goTracked ran f after BeginShutdown")
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.Wait(ctx); err != nil {
+		t.Fatalf("Wait after a declined goTracked: %v", err)
+	}
+}
+
 // TestArmTimer_DeclinesAfterShutdown pins the mechanism directly: once
 // BeginShutdown has run, armTimer takes no further WaitGroup slot and
 // reports that it armed nothing. That is what makes the Add/Wait pairing

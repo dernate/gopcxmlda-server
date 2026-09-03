@@ -7,6 +7,7 @@ import (
 
 	"github.com/dernate/gopcxmlda-server/backend"
 	"github.com/dernate/gopcxmlda-server/clock"
+	"github.com/dernate/gopcxmlda-server/telemetry"
 	"github.com/dernate/gopcxmlda-server/xmlda"
 )
 
@@ -62,6 +63,15 @@ func (m *Manager) schedulePoll(s *subState, in time.Duration) {
 	t, armed := m.armTimer(in, func() {
 		if s.ctx.Err() != nil {
 			return
+		}
+		// How far past its due time this tick actually ran. A
+		// subscription promises the client a RevisedSamplingRate, and
+		// that promise quietly stops holding once the poll semaphore
+		// saturates or the backend slows down — the subscription keeps
+		// working, just slower than it said. Nothing else is able to
+		// notice that.
+		if lag := m.clock.Now().Sub(due); lag > 0 {
+			m.metrics.ObservePollLag(lag)
 		}
 		m.pollOnceBounded(s)
 		if s.ctx.Err() == nil {
@@ -197,7 +207,7 @@ func (m *Manager) pollOnce(s *subState) {
 		it.mu.Lock()
 		it.lastPolledAt = now
 		it.mu.Unlock()
-		if applyUpdate(it, res.Value, res.ResultID, m.cfg.MaxBufferedSamplesPerItem, m.budget) {
+		if applyUpdateMetered(it, res.Value, res.ResultID, res.DiagnosticInfo, m.cfg.MaxBufferedSamplesPerItem, m.budget, m.metrics) {
 			changed = true
 		}
 	}
@@ -227,20 +237,49 @@ func (m *Manager) pollOnce(s *subState) {
 // value instead of the item's EU range. Documented as an accepted
 // simplification (deadband/buffering are explicitly "soft negotiated
 // behaviors" per docs/architecture/subscription-model.md), not a bug.
-func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, maxBuffer int, budget *sampleBudget) bool {
+func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, diagnosticInfo string, maxBuffer int, budget *sampleBudget) bool {
+	return applyUpdateMetered(it, sample, resultID, diagnosticInfo, maxBuffer, budget, nil)
+}
+
+// applyUpdateMetered is applyUpdate with somewhere to report discarded
+// samples. metrics may be nil (tests, and the direct applyUpdate entry
+// point).
+func applyUpdateMetered(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorCode, diagnosticInfo string, maxBuffer int, budget *sampleBudget, metrics telemetry.Metrics) bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()
+
+	// The subscription was terminated while this update was in flight;
+	// its buffers have already been returned to the server-wide budget.
+	// Acquiring more here would leak them (see itemState.released).
+	if it.released {
+		return false
+	}
 
 	var changed bool
 	var u update
 	switch {
-	case !resultID.IsZero():
+	// Only a critical E_ code means "this outcome carries no usable
+	// value". An S_ code is a non-critical exception whose value IS
+	// useful (§2.6: "For non-critical exceptions the returned value IS
+	// useful, although the client may need to react to an abnormal
+	// condition") — the same rule server/itemvalue.go's hasUsableValue
+	// applies to Read/Write/Subscribe and subscription/create.go applies
+	// to a Subscribe's initial read. Treating every non-zero code as
+	// "no sample" here silenced an item reporting a persistent S_CLAMP
+	// for the whole lifetime of its subscription: the first poll reported
+	// the code, and every later one compared equal to it and so counted
+	// as unchanged.
+	case resultID.IsError():
 		changed = resultID != it.lastResultID
-		u = update{resultID: resultID}
+		u = update{resultID: resultID, diagnosticInfo: diagnosticInfo}
 	default:
 		// Recovering from a reported condition is always a change, even
 		// if the value happens to be identical to the last good one.
-		changed = !it.lastResultID.IsZero() || !it.haveLast ||
+		// A changed result code is a change in its own right — recovering
+		// from an E_ condition, but also moving between S_ codes or in and
+		// out of one, which the client must be told about even when the
+		// value itself compares equal.
+		changed = resultID != it.lastResultID || !it.haveLast ||
 			sampleChanged(it.last, sample, it.deadband)
 		if changed {
 			// it.last is the last value REPORTED to the client, not the
@@ -257,9 +296,10 @@ func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorC
 			it.last = sample
 		}
 		it.haveLast = true
-		u = update{sample: sample, haveSample: true}
+		u = update{sample: sample, haveSample: true, resultID: resultID, diagnosticInfo: diagnosticInfo}
 	}
 	it.lastResultID = resultID
+	it.lastDiagnosticInfo = diagnosticInfo
 	if !changed {
 		return false
 	}
@@ -274,6 +314,9 @@ func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorC
 			it.buffer = it.buffer[over:]
 			budget.release(int64(over))
 			it.overflowed = true
+			if metrics != nil {
+				metrics.IncDroppedSamples(over)
+			}
 		}
 	default:
 		// The server-wide buffered-sample budget is exhausted
@@ -289,10 +332,65 @@ func applyUpdate(it *itemState, sample backend.ItemSample, resultID xmlda.ErrorC
 		case n == 0:
 			budget.add(1)
 		}
+		if metrics != nil && len(it.buffer) > 0 {
+			metrics.IncDroppedSamples(len(it.buffer))
+		}
 		it.buffer = []update{u}
 		it.overflowed = true
 	}
 	return true
+}
+
+// arrayExceedsDeadband applies the deadband element-wise to two numeric
+// arrays of the same shape, reporting whether any element crossed it. The
+// second return value is false when this comparison does not apply — the
+// values are not both numeric arrays, or their lengths differ, in which
+// case a changed shape is a change in its own right and the caller's
+// ordinary comparison decides.
+func arrayExceedsDeadband(prev, next xmlda.Value, deadbandPct float64) (changed, applicable bool) {
+	pa, err := prev.Array()
+	if err != nil {
+		return false, false
+	}
+	na, err := next.Array()
+	if err != nil {
+		return false, false
+	}
+	if pa.ElemType() != na.ElemType() || pa.Len() != na.Len() {
+		return false, false
+	}
+	pv, pok := pa.NumericFloat64s()
+	nv, nok := na.NumericFloat64s()
+	if !pok || !nok {
+		return false, false
+	}
+	for i := range pv {
+		if scalarExceedsDeadband(pv[i], nv[i], deadbandPct) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// scalarExceedsDeadband is the single-value deadband rule, shared by the
+// scalar and the element-wise array comparison so the two can never
+// disagree.
+func scalarExceedsDeadband(pf, nf, deadbandPct float64) bool {
+	pNaN, nNaN := math.IsNaN(pf), math.IsNaN(nf)
+	if pNaN || nNaN {
+		return pNaN != nNaN
+	}
+	if pf == nf {
+		return false
+	}
+	if pf != 0 {
+		delta := (nf - pf) / pf * 100
+		if delta < 0 {
+			delta = -delta
+		}
+		return delta >= deadbandPct
+	}
+	return true // previous was exactly zero: any change is significant
 }
 
 // sampleChanged reports whether next differs meaningfully from prev: any
@@ -306,6 +404,14 @@ func sampleChanged(prev, next backend.ItemSample, deadbandPct float64) bool {
 		return true
 	}
 	if deadbandPct > 0 {
+		// §3.5.1: "The deadband will also apply to array types. The entire
+		// array is returned if any array element exceeds the deadband
+		// threshold." Falling through to a plain equality comparison for
+		// arrays meant a deadbanded client got every single element change
+		// — the exact flood it had asked the server to suppress.
+		if changed, ok := arrayExceedsDeadband(prev.Value, next.Value, deadbandPct); ok {
+			return changed
+		}
 		pf, pok := prev.Value.NumericAsFloat64()
 		nf, nok := next.Value.NumericAsFloat64()
 		if pok && nok {

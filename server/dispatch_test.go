@@ -82,9 +82,25 @@ func (alwaysFailsMarshal) MarshalXML(e *xml.Encoder, start xml.StartElement) err
 // at the point the encode is attempted.
 func TestWriteResponse_EncodeFailure_FallsBackToFault(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeResponse(rec, alwaysFailsMarshal{})
+	logged := &recordingLogger{}
+	if writeResponse(rec, logged, soap.Version11, alwaysFailsMarshal{}) {
+		t.Fatal("writeResponse reported success for a payload that cannot be marshaled")
+	}
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("got status %d, want 500", rec.Code)
+	}
+	// The failure must be traceable. Reported as a bare E_FAIL with no log
+	// line, an operator has no way to learn which response failed or why —
+	// and the cause is almost always a backend value this library cannot
+	// represent, which nothing else surfaces.
+	var sawError bool
+	for _, line := range logged.Lines() {
+		if strings.HasPrefix(line, "ERROR ") && strings.Contains(line, "encoding the response failed") {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Errorf("an encode failure produced no Error-level log line; got %v", logged.Lines())
 	}
 	var env soap.Envelope[struct{}]
 	if err := xml.Unmarshal(rec.Body.Bytes(), &env); err != nil {

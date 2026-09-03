@@ -109,10 +109,9 @@ func (f *Fake) Sleep(d time.Duration) {
 // deadline is now due.
 func (f *Fake) Advance(d time.Duration) {
 	f.mu.Lock()
-	f.now = f.now.Add(d)
-	due := f.dueLocked()
+	target := f.now.Add(d)
 	f.mu.Unlock()
-	fire(due)
+	f.advanceTo(target)
 }
 
 // Set moves the fake clock to t and fires every waiter whose deadline is
@@ -123,10 +122,51 @@ func (f *Fake) Set(t time.Time) {
 		f.mu.Unlock()
 		panic("clocktest: Set must not move time backward")
 	}
-	f.now = t
-	due := f.dueLocked()
 	f.mu.Unlock()
-	fire(due)
+	f.advanceTo(t)
+}
+
+// advanceTo moves the clock forward to target one deadline at a time.
+//
+// Jumping straight to target and firing everything that had come due
+// collapsed a multi-period jump into a SINGLE tick for a
+// self-rescheduling AfterFunc chain — the shape subscription.Manager's
+// poll scheduling uses — because the callback rearms relative to the
+// clock's new time. A test advancing 10 s over a 1 s sampling rate
+// therefore exercised one poll and looked as though it had exercised ten,
+// and the callback saw Now() at the end of the jump rather than at its
+// own due time, so every timestamp it recorded was wrong by up to the
+// whole jump.
+//
+// Stepping means a rearmed timer whose new deadline is still inside the
+// jump fires too, in the right order and each seeing its own due time.
+func (f *Fake) advanceTo(target time.Time) {
+	for {
+		f.mu.Lock()
+		next, ok := f.nextDeadlineLocked()
+		if !ok || next.After(target) {
+			f.now = target
+			f.mu.Unlock()
+			return
+		}
+		f.now = next
+		due := f.dueLocked()
+		f.mu.Unlock()
+		fire(due)
+	}
+}
+
+// nextDeadlineLocked returns the earliest pending deadline. f.mu must be
+// held.
+func (f *Fake) nextDeadlineLocked() (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, t := range f.waiters {
+		if !found || t.deadline.Before(earliest) {
+			earliest, found = t.deadline, true
+		}
+	}
+	return earliest, found
 }
 
 // dueLocked removes and returns every active waiter whose deadline is

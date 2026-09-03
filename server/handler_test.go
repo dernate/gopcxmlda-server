@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -175,57 +178,72 @@ func (b *blockingStatus) GetStatus(ctx context.Context, locale string) (backend.
 	return b.testStatus.GetStatus(ctx, locale)
 }
 
-// --- acquiring an uncontended mutex must not cost a goroutine ---
+// --- the status cache must not leak goroutines against a stuck backend ---
 
-// TestLockContext_UncontendedFastPath pins the fast path. statusFor calls this on
-// the cached path unconditionally — so a cache HIT came through here too,
-// and every single request paid for a goroutine, a channel allocation and
-// a select just to discover the lock was free.
-func TestLockContext_UncontendedFastPath(t *testing.T) {
-	var mu sync.Mutex
-	before := runtimeNumGoroutine()
-	for range 100 {
-		if err := lockContext(context.Background(), &mu); err != nil {
-			t.Fatalf("lockContext: %v", err)
-		}
-		mu.Unlock()
-	}
-	if after := runtimeNumGoroutine(); after > before+2 {
-		t.Errorf("goroutines went from %d to %d over 100 uncontended acquisitions", before, after)
-	}
+// hangingStatus blocks in GetStatus until released, ignoring ctx — the
+// behavior of a driver that reaches a field device over a blocking
+// library call, which is the common case rather than the exotic one.
+type hangingStatus struct{ release chan struct{} }
+
+func (h hangingStatus) GetStatus(context.Context, string) (backend.ServerStatus, error) {
+	<-h.release
+	return backend.ServerStatus{
+		State: xmlda.ServerStateRunning, StartTime: time.Unix(0, 0).UTC(),
+		SupportedLocaleIDs: []string{"en-US"},
+	}, nil
 }
 
-// TestLockContext_ContendedStillCancellable pins that the fast path did
-// not cost the cancellability the slow path exists for: a caller whose
-// context is already done must not block behind a held mutex.
-func TestLockContext_ContendedStillCancellable(t *testing.T) {
-	var mu sync.Mutex
-	mu.Lock()
-	defer mu.Unlock()
+// TestStatusCache_HangingBackendLeaksNoGoroutines pins the cost of a
+// waiter that gives up. statusFor holds the cache lock across the backend
+// call deliberately — that is what collapses a burst into one fetch — so
+// every other request in that burst waits on it. Waiting on a sync.Mutex
+// with a context meant parking a goroutine per waiter, and against a
+// backend that never returns those goroutines never returned either: the
+// request itself timed out and released its MaxConcurrentRequests slot,
+// so nothing bounded the growth and it scaled with the request RATE.
+func TestStatusCache_HangingBackendLeaksNoGoroutines(t *testing.T) {
+	be := hangingStatus{release: make(chan struct{})}
+	h := newTestHandler(t, backend.Backend{Status: be, Reader: newTestReader()},
+		Config{RequestTimeout: 50 * time.Millisecond}, clock.Real{})
+	t.Cleanup(func() { close(be.release) })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := lockContext(ctx, &mu); err == nil {
-		t.Fatal("lockContext acquired a held mutex with a cancelled context")
-	}
-
-	// And a live context is released when the holder lets go.
-	done := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		err := lockContext(ctx, &mu)
-		if err == nil {
-			mu.Unlock()
+	// Deliberately not waited on: the request that wins the cache lock is
+	// inside the stuck backend call and never returns, which is the whole
+	// premise. Every OTHER request must give up on its RequestTimeout and
+	// leave nothing behind.
+	body := readRequestBody([]string{"A"})
+	fire := func(n int) {
+		for range n {
+			go func() {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)))
+			}()
 		}
-		done <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	mu.Unlock()
-	if err := <-done; err != nil {
-		t.Errorf("a waiter never acquired the released mutex: %v", err)
+		time.Sleep(250 * time.Millisecond) // long enough for each to hit RequestTimeout
 	}
-	mu.Lock() // restore for the deferred Unlock
+
+	fire(20) // warm-up: one of these takes the lock and keeps it
+	runtime.GC()
+	before := runtimeNumGoroutine()
+	fire(40)
+	runtime.GC()
+	mid := runtimeNumGoroutine()
+	fire(40)
+	runtime.GC()
+	after := runtimeNumGoroutine()
+	t.Logf("goroutines: before=%d after 40=%d after 80=%d", before, mid, after)
+
+	// A couple of goroutines of slack for the runtime; what must not
+	// happen is growth proportional to the number of requests.
+	// Exactly one goroutine may be parked in the stuck backend call,
+	// however many requests arrive: the status lock is released by the
+	// FETCH, so no second fetch starts while the first has not answered.
+	// Growth proportional to the request count is the defect.
+	if after-before > 5 {
+		t.Errorf("80 requests against a stuck backend left %d extra goroutines (%d after 40, %d after 80); "+
+			"the leak scales with the request rate and MaxConcurrentRequests does not bound it",
+			after-before, mid, after)
+	}
 }
 
 // --- the pre-dispatch status fetch is memoized ---

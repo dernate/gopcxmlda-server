@@ -15,7 +15,7 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	var env soap.Envelope[xmlda.SubscriptionPolledRefreshRequest]
 	if err := doc.Decode(&env); err != nil {
 		h.metrics.IncRequestError("SubscriptionPolledRefresh", "parse")
-		writeFault(w, requestDecodeFault("SubscriptionPolledRefresh", err))
+		writeFault(w, soapVersion(doc), requestDecodeFault("SubscriptionPolledRefresh", err))
 		return
 	}
 	req := env.Body.Content
@@ -23,13 +23,13 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	now := h.clk.Now()
 	if deadlinePassed(req.Options, now) {
 		h.metrics.IncRequestError("SubscriptionPolledRefresh", "deadline_exceeded")
-		writeFault(w, fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
+		writeFault(w, soapVersion(doc), fault(xmlda.ErrTimedOut, xmlda.StandardErrorText(xmlda.ErrTimedOut)))
 		return
 	}
 	holdTime, code, bad := h.resolveHoldTime(req.HoldTime, now)
 	if bad {
 		h.metrics.IncRequestError("SubscriptionPolledRefresh", "invalid_hold_time")
-		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
+		writeFault(w, soapVersion(doc), fault(code, xmlda.StandardErrorText(code)))
 		return
 	}
 
@@ -38,7 +38,7 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 	// call's duration, so an unbounded list is an amplification vector.
 	if !h.checkItemCount(len(req.ServerSubHandles)) {
 		h.metrics.IncRequestError("SubscriptionPolledRefresh", "limit_exceeded")
-		writeFault(w, limitExceededFault("too many subscription handles in one SubscriptionPolledRefresh request"))
+		writeFault(w, soapVersion(doc), limitExceededFault("too many subscription handles in one SubscriptionPolledRefresh request"))
 		return
 	}
 
@@ -78,7 +78,7 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 			code = xmlda.ErrServerState
 		}
 		h.metrics.IncSubscriptionError(code.Local)
-		writeFault(w, fault(code, xmlda.StandardErrorText(code)))
+		writeFault(w, soapVersion(doc), fault(code, xmlda.StandardErrorText(code)))
 		return
 	}
 
@@ -99,7 +99,8 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 			// turning one failing item into a whole-operation E_FAIL for
 			// the entire subscription.
 			sample, haveSample, resultID := applyReqType(it.Sample, it.HaveSample, it.ResultID, it.ReqType)
-			items[i] = buildItemValue(it.Ref, it.ClientItemHandle, sample, haveSample, resultID, "", req.Options)
+			items[i] = buildItemValue(it.Ref, it.ClientItemHandle, sample, haveSample, resultID,
+				it.DiagnosticInfo, req.Options)
 			codes = append(codes, resultID)
 		}
 		rItemLists = append(rItemLists, xmlda.SubscriptionPolledRefreshReplyItemList{
@@ -113,9 +114,9 @@ func (h *Handler) handlePolledRefresh(ctx context.Context, w http.ResponseWriter
 		Result:                  h.replyBase(oc, req.Options.ClientRequestHandle, req.Options.LocaleID),
 		InvalidServerSubHandles: invalidHandles,
 		RItemList:               rItemLists,
-		Errors:                  xmlda.DedupeErrors(codes, h.errorTextFunc(req.Options, oc)),
+		Errors:                  buildErrors(codes, h.errorTextFunc(req.Options, oc)),
 	}
-	writeResponse(w, resp)
+	writeResponse(w, h.log, soapVersion(doc), resp)
 }
 
 // resolveHoldTime validates a requested HoldTime and returns the hold
