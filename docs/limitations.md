@@ -19,7 +19,14 @@ documented in [`docs/specification/open-questions.md`](specification/open-questi
 - **Unbounded `go test -fuzz` has not been run** in this sandbox (subprocess spawning for fuzz workers is
   restricted here). The fuzz tests' seed corpora do run via plain `go test`, exercising the same code paths
   without the fuzzing engine's exploration.
-- **No official OPC Foundation conformance test suite has been run** against this library. Nothing in this
+- **No official OPC Foundation conformance test suite has been run** against this library, and no
+  commercial client (Matrikon, Softing, KEPServerEX, Siemens) has been pointed at it. What *has* run is a
+  client neither written for nor aware of this repository: `test/dockerintegration/foreignclient` builds a
+  proxy with Python's zeep from `testdata/schema/opcxmlda.wsdl` — transcribed from the specification's own
+  appendix — and drives all eight operations against the server in a container, with zeep validating every
+  response against the schema strictly. That closes the gap between "our client agrees with our server" and
+  "an independent SOAP stack can talk to it"; it does not close the gap to a conformance suite, which tests
+  protocol behavior over time rather than message shapes. Nothing in this
   repository should be read as a conformance claim — see `docs/protocol-support.md` for the precise,
   per-operation implemented/tested status instead. Since 2026-08-30 the responses of all eight
   operations *are* validated against the specification's own schema (transcribed into

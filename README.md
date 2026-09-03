@@ -121,6 +121,14 @@ See [`docs/interoperability.md`](docs/interoperability.md) for what this surface
 this server (an `xsi:type` attribute-ordering issue, safe to fix since XML attribute order carries no
 semantic meaning) and two client-side-only quirks that aren't fixable from this server's side.
 
+[`test/dockerintegration/foreignclient/`](test/dockerintegration/foreignclient/) answers the question
+neither of those can: both drive the server with the same author's client, which proves the two agree with
+each other. The foreign-client test builds a proxy with **Python's zeep** from
+[`testdata/schema/opcxmlda.wsdl`](testdata/schema/opcxmlda.wsdl) — transcribed from the specification's own
+appendix — runs it in its own container against the server in another, and has it exercise all eight
+operations. zeep validates every response against the schema strictly, which is exactly where Go's
+`encoding/xml` is lenient. It runs as part of the `dockerintegration` suite.
+
 [`test/dockerintegration/`](test/dockerintegration/) goes one step further: it builds the server into a real
 Docker image from a four-level nested address space and drives the same client against a running container,
 which is the only place the **shipped `server.Config{}` defaults** are exercised end to end. It also carries

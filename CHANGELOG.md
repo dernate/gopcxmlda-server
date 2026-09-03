@@ -187,6 +187,33 @@ library. All of them are pre-`v1`.
   described accurately: the engine reports the condition and keeps applying
   later events for that item, rather than silencing it.
 
+### Testing
+
+- **An independent client now drives the server.** Both integration suites
+  used github.com/dernate/gopcxmlda, which is independently maintained but
+  shares an author with the server: what they prove is that the two agree
+  with each other. `test/dockerintegration/foreignclient` builds a proxy
+  with Python's zeep from `testdata/schema/opcxmlda.wsdl` — the
+  specification's own WSDL, transcribed alongside the XSD that was already
+  there — runs it in its own container against the server in another, and
+  exercises all eight operations plus a fault path across 31 checks. zeep
+  validates every response against the schema strictly, which is precisely
+  where Go's `encoding/xml` is lenient.
+
+  Writing it surfaced one thing worth knowing before building any
+  WSDL-generated client: `ItemValue`'s `<Value>` is declared with no type,
+  so the element's `xsi:type` IS the type, and a client passing a bare
+  language-level number sends no type at all and gets `E_BADTYPE` —
+  correctly. The value has to be typed explicitly.
+
+- Coverage raised from 81.1% to 84.6% per package (87.0% counted across
+  packages), concentrated on code that had none rather than on the number:
+  the backend error-mapping contract that both the server and the
+  subscription engine depend on (0% → 100%), the SOAP 1.2 fault shape and
+  version mapping, the new health endpoint, the buffered-sample budget's
+  exhaustion path, `clock.Real`, and the `Server` convenience wrapper's
+  Start/Shutdown round trip.
+
 ### Documentation
 
 - `docs/getting-started.md`'s graceful-shutdown example called

@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OPC XML-DA 1.0 WSDL, transcribed from the <definitions> block in
+  docs/OPCDataAccessXMLSpecification.pdf (Appendix B, pp. 95-99) — the
+  messages, portType and binding that accompany the schema already
+  transcribed in opcxmlda.xsd.
+
+  It exists so an INDEPENDENT SOAP toolchain can generate a client from
+  the specification and drive this server with it. Both integration
+  suites otherwise use the same reference client by the same author,
+  which proves self-consistency rather than interoperability; a stack
+  that has never seen this repository, building its proxy from the
+  specification alone, is the check neither of them can make.
+  test/dockerintegration/foreignclient does exactly that with Python's
+  zeep.
+
+  Nothing in the library reads this file at runtime — the server does not
+  serve a WSDL (docs/protocol-support.md), and this changes nothing about
+  that.
+
+  Two deliberate departures from a verbatim transcription, both required
+  to make the document usable standalone:
+
+  1. The types section imports opcxmlda.xsd rather than repeating the
+     schema inline, so there is exactly one copy of it to keep correct.
+     The XSD's own three departures are documented at the top of that
+     file.
+  2. The published WSDL has no <service> element — an endpoint address is
+     deployment-specific, so the specification leaves it out. One is added
+     here with a placeholder address that a client rewrites; zeep, like
+     every other WSDL consumer, needs a port to bind an operation to.
+-->
+<wsdl:definitions
+    name="OpcXmlDa"
+    targetNamespace="http://opcfoundation.org/webservices/XMLDA/1.0/"
+    xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
+    xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+    xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    xmlns:s0="http://opcfoundation.org/webservices/XMLDA/1.0/">
+
+  <wsdl:types>
+    <xs:schema targetNamespace="http://opcfoundation.org/webservices/XMLDA/1.0/wsdl-import-shim">
+      <xs:import namespace="http://opcfoundation.org/webservices/XMLDA/1.0/"
+                 schemaLocation="opcxmlda.xsd"/>
+    </xs:schema>
+  </wsdl:types>
+
+  <wsdl:message name="GetStatusSoapIn">
+    <wsdl:part name="parameters" element="s0:GetStatus"/>
+  </wsdl:message>
+  <wsdl:message name="GetStatusSoapOut">
+    <wsdl:part name="parameters" element="s0:GetStatusResponse"/>
+  </wsdl:message>
+  <wsdl:message name="ReadSoapIn">
+    <wsdl:part name="parameters" element="s0:Read"/>
+  </wsdl:message>
+  <wsdl:message name="ReadSoapOut">
+    <wsdl:part name="parameters" element="s0:ReadResponse"/>
+  </wsdl:message>
+  <wsdl:message name="WriteSoapIn">
+    <wsdl:part name="parameters" element="s0:Write"/>
+  </wsdl:message>
+  <wsdl:message name="WriteSoapOut">
+    <wsdl:part name="parameters" element="s0:WriteResponse"/>
+  </wsdl:message>
+  <wsdl:message name="SubscribeSoapIn">
+    <wsdl:part name="parameters" element="s0:Subscribe"/>
+  </wsdl:message>
+  <wsdl:message name="SubscribeSoapOut">
+    <wsdl:part name="parameters" element="s0:SubscribeResponse"/>
+  </wsdl:message>
+  <wsdl:message name="SubscriptionPolledRefreshSoapIn">
+    <wsdl:part name="parameters" element="s0:SubscriptionPolledRefresh"/>
+  </wsdl:message>
+  <wsdl:message name="SubscriptionPolledRefreshSoapOut">
+    <wsdl:part name="parameters" element="s0:SubscriptionPolledRefreshResponse"/>
+  </wsdl:message>
+  <wsdl:message name="SubscriptionCancelSoapIn">
+    <wsdl:part name="parameters" element="s0:SubscriptionCancel"/>
+  </wsdl:message>
+  <wsdl:message name="SubscriptionCancelSoapOut">
+    <wsdl:part name="parameters" element="s0:SubscriptionCancelResponse"/>
+  </wsdl:message>
+  <wsdl:message name="BrowseSoapIn">
+    <wsdl:part name="parameters" element="s0:Browse"/>
+  </wsdl:message>
+  <wsdl:message name="BrowseSoapOut">
+    <wsdl:part name="parameters" element="s0:BrowseResponse"/>
+  </wsdl:message>
+  <wsdl:message name="GetPropertiesSoapIn">
+    <wsdl:part name="parameters" element="s0:GetProperties"/>
+  </wsdl:message>
+  <wsdl:message name="GetPropertiesSoapOut">
+    <wsdl:part name="parameters" element="s0:GetPropertiesResponse"/>
+  </wsdl:message>
+
+  <wsdl:portType name="Service">
+    <wsdl:operation name="GetStatus">
+      <wsdl:input message="s0:GetStatusSoapIn"/>
+      <wsdl:output message="s0:GetStatusSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="Read">
+      <wsdl:input message="s0:ReadSoapIn"/>
+      <wsdl:output message="s0:ReadSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="Write">
+      <wsdl:input message="s0:WriteSoapIn"/>
+      <wsdl:output message="s0:WriteSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="Subscribe">
+      <wsdl:input message="s0:SubscribeSoapIn"/>
+      <wsdl:output message="s0:SubscribeSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="SubscriptionPolledRefresh">
+      <wsdl:input message="s0:SubscriptionPolledRefreshSoapIn"/>
+      <wsdl:output message="s0:SubscriptionPolledRefreshSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="SubscriptionCancel">
+      <wsdl:input message="s0:SubscriptionCancelSoapIn"/>
+      <wsdl:output message="s0:SubscriptionCancelSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="Browse">
+      <wsdl:input message="s0:BrowseSoapIn"/>
+      <wsdl:output message="s0:BrowseSoapOut"/>
+    </wsdl:operation>
+    <wsdl:operation name="GetProperties">
+      <wsdl:input message="s0:GetPropertiesSoapIn"/>
+      <wsdl:output message="s0:GetPropertiesSoapOut"/>
+    </wsdl:operation>
+  </wsdl:portType>
+
+  <wsdl:binding name="Service" type="s0:Service">
+    <soap:binding transport="http://schemas.xmlsoap.org/soap/http" style="document"/>
+    <wsdl:operation name="GetStatus">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/GetStatus" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Read">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/Read" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Write">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/Write" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Subscribe">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/Subscribe" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="SubscriptionPolledRefresh">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/SubscriptionPolledRefresh" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="SubscriptionCancel">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/SubscriptionCancel" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Browse">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/Browse" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetProperties">
+      <soap:operation soapAction="http://opcfoundation.org/webservices/XMLDA/1.0/GetProperties" style="document"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+
+  <!-- Not in the published WSDL: an endpoint address is deployment
+       specific. The placeholder is rewritten by whatever consumes this. -->
+  <wsdl:service name="Service">
+    <wsdl:port name="Service" binding="s0:Service">
+      <soap:address location="http://localhost:8080/"/>
+    </wsdl:port>
+  </wsdl:service>
+</wsdl:definitions>

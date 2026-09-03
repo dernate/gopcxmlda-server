@@ -500,3 +500,42 @@ func TestSchedulePoll_AfterShutdownIsNoOp(t *testing.T) {
 		t.Errorf("Wait: %v", err)
 	}
 }
+
+// TestTrackedTimer_ChannelPassesThrough pins the one method on the
+// WaitGroup-tracked timer that exists only to satisfy clock.Timer: an
+// AfterFunc timer's channel never fires, and C must hand back the
+// underlying one rather than a nil a caller would block on forever.
+func TestTrackedTimer_ChannelPassesThrough(t *testing.T) {
+	m := NewManager(backend.Backend{Reader: newFakeReader()}, nil, nil, nil, Config{ReapInterval: time.Hour})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = m.Shutdown(ctx)
+	})
+
+	timer, ok := m.armTimer(time.Hour, func() {})
+	if !ok {
+		t.Fatal("armTimer declined on a live Manager")
+	}
+	// time.AfterFunc's Timer has a nil channel — the callback IS the
+	// delivery — so passing it through faithfully means C() is nil here.
+	// That is the contract clock.Timer states, and a select on a nil
+	// channel simply never fires, which is the correct behavior for a
+	// timer that never delivers. What must not happen is C() inventing a
+	// channel that looks live.
+	select {
+	case <-timer.C():
+		t.Error("an AfterFunc timer's channel fired, which clock.Timer says it never does")
+	default:
+	}
+	// A NewTimer-backed one does deliver, so the pass-through is real
+	// rather than a hardcoded nil.
+	real := clock.Real{}.NewTimer(5 * time.Millisecond)
+	defer real.Stop()
+	if real.C() == nil {
+		t.Error("clock.Timer from NewTimer has no channel")
+	}
+	if !timer.Stop() {
+		t.Error("Stop did not prevent a callback an hour out")
+	}
+}

@@ -187,3 +187,138 @@ func TestTrackedTimer_ResetPanics(t *testing.T) {
 	}()
 	timer.Reset(time.Second)
 }
+
+// TestSampleBudget_ExhaustedWithAnEmptyBuffer covers the one branch of
+// the budget accounting nothing reached: an item whose buffer is empty
+// when the server-wide budget is already full. The other two branches
+// (a buffer with entries to give back, and one holding exactly the entry
+// being replaced) were exercised; this one has to charge for the single
+// Latest Changed Value it keeps, and getting it wrong leaks or
+// double-frees a slot on every such update.
+func TestSampleBudget_ExhaustedWithAnEmptyBuffer(t *testing.T) {
+	budget := &sampleBudget{max: 1}
+	// Exhaust it, so every acquire below fails.
+	if !budget.acquire() {
+		t.Fatal("setup: the first slot was refused")
+	}
+	if budget.acquire() {
+		t.Fatal("setup: the budget handed out a second slot from a budget of 1")
+	}
+
+	it := &itemState{enableBuffering: true}
+	before := budget.count()
+
+	// Buffer empty, budget full: the item keeps its Latest Changed Value
+	// regardless (REQ-SUBSCRIPTION-007) and the budget is charged for it.
+	if !applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(1), Quality: xmlda.NewGoodQuality()},
+		xmlda.ErrorCode{}, "", 100, budget) {
+		t.Fatal("the first update was suppressed")
+	}
+	if len(it.buffer) != 1 {
+		t.Fatalf("buffer holds %d entries, want the single retained value", len(it.buffer))
+	}
+	if !it.overflowed {
+		t.Error("the loss was not flagged, so the next reply will not carry DataBufferOverflow")
+	}
+	if got := budget.count(); got != before+1 {
+		t.Errorf("budget count = %d, want %d — the retained value must be charged exactly once",
+			got, before+1)
+	}
+
+	// A second update in the same state replaces that one value and must
+	// not charge again.
+	charged := budget.count()
+	applyUpdate(it, backend.ItemSample{Value: xmlda.NewInt32(2), Quality: xmlda.NewGoodQuality()},
+		xmlda.ErrorCode{}, "", 100, budget)
+	if len(it.buffer) != 1 {
+		t.Errorf("buffer holds %d entries after a second update, want 1", len(it.buffer))
+	}
+	if got := budget.count(); got != charged {
+		t.Errorf("budget count moved from %d to %d while the buffer stayed at one entry", charged, got)
+	}
+
+	// And releasing that item returns exactly what it held.
+	it.mu.Lock()
+	budget.release(int64(len(it.buffer)))
+	it.mu.Unlock()
+	if got := budget.count(); got != charged-1 {
+		t.Errorf("after releasing one entry the count is %d, want %d", got, charged-1)
+	}
+}
+
+// TestSampleBudget_UnlimitedIsFree pins the disabled case: a nil or
+// non-positive budget must neither refuse nor count, since <= 0 means
+// unlimited everywhere else in Config.
+func TestSampleBudget_UnlimitedIsFree(t *testing.T) {
+	for name, b := range map[string]*sampleBudget{
+		"nil":      nil,
+		"zero":     {max: 0},
+		"negative": {max: -1},
+	} {
+		if !b.acquire() {
+			t.Errorf("%s budget refused a slot", name)
+		}
+		b.add(5)
+		b.release(5)
+		if got := b.count(); got != 0 {
+			t.Errorf("%s budget counted %d, want 0", name, got)
+		}
+	}
+}
+
+// TestConfigWithDefaults pins the numbers server.Config resolves through
+// this package, so the two cannot drift into stating different defaults.
+func TestConfigWithDefaults(t *testing.T) {
+	got := Config{}.WithDefaults()
+	for _, f := range []struct {
+		name string
+		zero bool
+	}{
+		{"MaxConcurrentPolls", got.MaxConcurrentPolls == 0},
+		{"ReapInterval", got.ReapInterval == 0},
+		{"ReapGraceMultiplier", got.ReapGraceMultiplier == 0},
+		{"DefaultSubscriptionPingRate", got.DefaultSubscriptionPingRate == 0},
+		{"DefaultSamplingRate", got.DefaultSamplingRate == 0},
+		{"MaxBufferedSamplesPerItem", got.MaxBufferedSamplesPerItem == 0},
+		{"PollTimeout", got.PollTimeout == 0},
+	} {
+		if f.zero {
+			t.Errorf("Config{}.WithDefaults() left %s at zero", f.name)
+		}
+	}
+	// A caller's own value survives, and a deliberate "unlimited" is not
+	// clobbered back into a default.
+	custom := Config{MaxConcurrentPolls: 3, MaxTotalSubscribedItems: -1}.WithDefaults()
+	if custom.MaxConcurrentPolls != 3 {
+		t.Errorf("MaxConcurrentPolls = %d, want the caller's 3", custom.MaxConcurrentPolls)
+	}
+	if custom.MaxTotalSubscribedItems != -1 {
+		t.Errorf("MaxTotalSubscribedItems = %d, want the caller's -1", custom.MaxTotalSubscribedItems)
+	}
+}
+
+// TestManagerCount tracks the number a health endpoint reports.
+func TestManagerCount(t *testing.T) {
+	fake := clocktest.New(testEpoch)
+	r := newFakeReader()
+	r.Set(backend.ItemRef{ItemName: "A"}, xmlda.NewInt32(1))
+	m := newTestManager(r, fake, Config{ReapInterval: time.Hour})
+	defer shutdownManager(t, m)
+
+	if got := m.Count(); got != 0 {
+		t.Fatalf("a fresh Manager reports %d subscriptions", got)
+	}
+	res, err := m.Create(context.Background(), CreateRequest{
+		Items: []CreateItemRequest{{Ref: backend.ItemRef{ItemName: "A"}}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := m.Count(); got != 1 {
+		t.Errorf("Count = %d after one Create, want 1", got)
+	}
+	m.Cancel(res.Handle)
+	if got := m.Count(); got != 0 {
+		t.Errorf("Count = %d after Cancel, want 0", got)
+	}
+}

@@ -95,10 +95,14 @@ jobs:
         with:
           go-version-file: test/dockerintegration/go.mod
 
-      # Covers both the per-operation test and the sustained-load soak
-      # test; the latter runs for DOCKERINTEGRATION_SOAK (default 30s)
-      # and is what `go test -short` would skip.
-      - name: Test against real gopcxmlda client (Dockerized server)
+      # Covers the per-operation test, the sustained-load soak test (which
+      # runs for DOCKERINTEGRATION_SOAK, default 30s, and is what
+      # `go test -short` would skip) and the foreign-client test — a
+      # Python/zeep proxy generated from the specification's own WSDL,
+      # which is the only check here not made with a client by this
+      # server's own author. It builds its image on the fly and needs
+      # network access for pip.
+      - name: Test against real gopcxmlda client and an independent SOAP stack (Dockerized)
         working-directory: test/dockerintegration
         run: go test ./...
 

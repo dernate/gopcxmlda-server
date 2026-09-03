@@ -190,8 +190,6 @@ type backendPanic struct {
 	stack []byte
 }
 
-func (p backendPanic) String() string { return fmt.Sprint(p.value) }
-
 // callBounded runs call and stops waiting for it once ctx is done or
 // timeout elapses, whichever comes first. A timeout of zero or less waits
 // indefinitely (the previous, purely cooperative behavior).
