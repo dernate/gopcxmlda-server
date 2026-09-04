@@ -306,6 +306,47 @@ library. All of them are pre-`v1`.
   language-level number sends no type at all and gets `E_BADTYPE` —
   correctly. The value has to be typed explicitly.
 
+- **The plant-backend fixture now enforces one canonical data type per
+  item**, coercing a write to it or refusing it with `E_BADTYPE`. Storing
+  the written value verbatim had two quiet consequences: an item's data
+  type changed under it — an `int` written to the double `Speed` item made
+  it report `xsi:type="xsd:int"` from then on, contradicting its own
+  `dataType` property — and range checking stopped working, because the
+  clamp could only read a value that was already a double, so a write in
+  another numeric type bypassed the limit entirely. Every clamp assertion
+  in the suite happened to send a double, so nothing noticed.
+  `rawrequest_test.go` now covers all three directions (coerced, clamped,
+  refused).
+
+  It paid for itself immediately by rejecting an incoherent existing
+  test: `TestDockerServer_AllOperations/WriteThenReadBack` wrote an
+  `ArrayOfInt` into the scalar `Speed` item — because the reference
+  client's *scalar* writes hit a known client-side `xsi:type` mismatch,
+  the test used an array to get an observable write — and passed only
+  because the fixture stored it, turning a double item into an array item
+  for everything that ran afterwards. The fixture now has a writable
+  `ArrayOfInt` item (`Tank1/Setpoints`, deliberately one the simulator
+  does not tick, so a write is actually observable on read-back) and the
+  test targets that instead. Writable-array coverage is new; there was
+  none.
+
+  The soak test's write/read-back worker had the same shape and moved to
+  the same item. Worth noting what it had been measuring: it reported
+  hundreds of successful round trips per window while writing an array
+  into a scalar item, so the "value read back matches the value written"
+  invariant held on a value the item should never have accepted.
+
+- **Test-only fixes from the first CI run of this series**, which had
+  never reached CI before being pushed: an `errorlint` violation (a bare
+  type assertion on an error in `soap/version_test.go`, now `errors.As`,
+  which is the exact class of defect that linter was enabled for) and a
+  dead embedded field in `backend/backendtest/backendtest_test.go`. The
+  three root-module CI jobs also pass `cache: false` to `setup-go`: the
+  library depends on nothing outside the standard library, so there is no
+  `go.sum` to key a cache on, and the default logged "Restore cache
+  failed: Dependencies file is not found" — which reads like a broken
+  workflow rather than the property it is.
+
 - Coverage raised from 81.1% to 84.6% per package (87.0% counted across
   packages), concentrated on code that had none rather than on the number:
   the backend error-mapping contract that both the server and the

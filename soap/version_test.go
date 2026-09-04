@@ -2,6 +2,7 @@ package soap
 
 import (
 	"encoding/xml"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -192,7 +193,11 @@ func TestEnvelope_MustUnderstandRejection(t *testing.T) {
 	if err == nil {
 		t.Fatal("a mustUnderstand header block was accepted")
 	}
-	if !asMustUnderstand(err, &mu) {
+	// errors.As, not a type assertion: checkMustUnderstand's error
+	// travels back up through Envelope.UnmarshalXML, which is free to
+	// wrap it, and a bare assertion would start failing silently the
+	// day it does.
+	if !errors.As(err, &mu) {
 		t.Fatalf("got %T (%v), want *MustUnderstandError", err, err)
 	}
 	if len(mu.Blocks) != 1 || !strings.Contains(mu.Blocks[0], "Auth") {
@@ -208,12 +213,4 @@ func TestEnvelope_MustUnderstandRejection(t *testing.T) {
 	if err := decode(``); err != nil {
 		t.Errorf("an envelope with no header at all was rejected: %v", err)
 	}
-}
-
-func asMustUnderstand(err error, target **MustUnderstandError) bool {
-	e, ok := err.(*MustUnderstandError)
-	if ok {
-		*target = e
-	}
-	return ok
 }

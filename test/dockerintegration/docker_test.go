@@ -235,15 +235,24 @@ func TestDockerServer_AllOperations(t *testing.T) {
 		// namespace mismatch), so this uses an array to actually observe
 		// a genuine value change end to end rather than an opaque-blob
 		// write.
+		//
+		// The target is the ArrayOfInt item, not the scalar Speed. It
+		// used to be Speed, and passed only because the fixture stored
+		// whatever arrived — so this test was writing an array into an
+		// item whose own dataType property says xsd:double, and turning
+		// it into an array item for every test that ran afterwards. A
+		// backend with one canonical type per item answers that with
+		// E_BADTYPE, which is what a real server would do.
+		const arrayItem = "Plant/BuildingB/Tank1/Setpoints"
 		crh, cih := newHandles(t, 1)
-		items := []gopcxmlda.TItem{{ItemName: "Plant/BuildingA/Line1/Motor1/Speed", Value: gopcxmlda.TValue{Value: []int32{1500}}}}
+		items := []gopcxmlda.TItem{{ItemName: arrayItem, Value: gopcxmlda.TValue{Value: []int32{1500}}}}
 		_, err := client.Write(ctx, items, &crh, &cih, "", clientOptions())
 		if err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 
 		crhRead, cihRead := newHandles(t, 1)
-		readItems := []gopcxmlda.TItem{{ItemName: "Plant/BuildingA/Line1/Motor1/Speed"}}
+		readItems := []gopcxmlda.TItem{{ItemName: arrayItem}}
 		got, err := client.Read(ctx, readItems, &crhRead, &cihRead, "", clientOptions())
 		if err != nil {
 			t.Fatalf("Read: %v", err)
@@ -251,7 +260,7 @@ func TestDockerServer_AllOperations(t *testing.T) {
 		if len(got.Response.ItemList.Items) != 1 || got.Response.ItemList.Items[0].Error != "" {
 			t.Fatalf("got %+v, want a single successful item after the write", got.Response.ItemList.Items)
 		}
-		if readBack := got.Response.ItemList.Items[0]; readBack.ItemName != "Plant/BuildingA/Line1/Motor1/Speed" || readBack.Timestamp.IsZero() {
+		if readBack := got.Response.ItemList.Items[0]; readBack.ItemName != arrayItem || readBack.Timestamp.IsZero() {
 			t.Errorf("got ItemName %q / Timestamp %s, want both echoed per clientOptions", readBack.ItemName, readBack.Timestamp)
 		}
 	})

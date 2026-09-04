@@ -17,6 +17,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # The library itself depends on nothing outside the standard
+          # library, so there is no go.sum for setup-go to key a cache
+          # on. Left at the default it logs "Restore cache failed:
+          # Dependencies file is not found", which reads like a
+          # misconfigured workflow rather than the property it actually
+          # is. The two test/ modules below do have dependencies and do
+          # cache.
+          cache: false
 
       - name: Build
         run: go build ./...
@@ -47,6 +55,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # The library itself depends on nothing outside the standard
+          # library, so there is no go.sum for setup-go to key a cache
+          # on. Left at the default it logs "Restore cache failed:
+          # Dependencies file is not found", which reads like a
+          # misconfigured workflow rather than the property it actually
+          # is. The two test/ modules below do have dependencies and do
+          # cache.
+          cache: false
 
       - name: Install xmllint
         run: sudo apt-get update && sudo apt-get install -y libxml2-utils
@@ -133,6 +149,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # The library itself depends on nothing outside the standard
+          # library, so there is no go.sum for setup-go to key a cache
+          # on. Left at the default it logs "Restore cache failed:
+          # Dependencies file is not found", which reads like a
+          # misconfigured workflow rather than the property it actually
+          # is. The two test/ modules below do have dependencies and do
+          # cache.
+          cache: false
 
       - name: Lint (root module)
         uses: golangci/golangci-lint-action@v8

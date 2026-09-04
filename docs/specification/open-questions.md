@@ -121,12 +121,21 @@ as legitimate XSD types in their own right, each with a direct `xsi:type` name.
 directly and symmetrically — self-contained, with no coordination needed with the containing `ItemValue`
 element. This is simpler than the `dateTime`+`ValueTypeQualifier` indirection and remains spec-legal (the
 mapping table lists these as valid types; the qualifier is presented as an interop accommodation, not a
-requirement). **Consequence, tracked for WP-4/5**: for maximum tolerance of peers that *do* send the
-`dateTime`+`ValueTypeQualifier` form (as the spec's own text suggests some implementations will), the
-`ItemValue`-bearing decode logic built in WP-4/WP-5 must additionally recognize a `ValueTypeQualifier`
-attribute with local name `time`/`date`/`duration` alongside a `dateTime`/`string`-typed `Value` and
-reinterpret accordingly — this is a decode-side tolerance addition, not a change to `Value`'s own encoding,
-which always uses the direct, symmetric form. See `docs/development/tasks.md` WP-4 for the tracked follow-up.
+requirement).
+
+**Consequence — implemented, not outstanding.** For tolerance of peers that *do* send the
+`dateTime`+`ValueTypeQualifier` form (as the spec's own text suggests some implementations will),
+`applyValueTypeQualifier` (`xmlda/itemvalue.go`) recognizes a `ValueTypeQualifier` whose local name is
+`time`/`date`/`duration` alongside a `dateTime`/`string`-typed `Value` and reinterprets accordingly.
+`TestItemValue_ValueTypeQualifierTolerance` pins it. This is decode-side only: `Value`'s own encoding
+always uses the direct, symmetric form.
+
+A **second**, separate tolerance was added later, for a different problem — see
+`docs/interoperability.md`. `valueTypeFromQualifier` lets the qualifier supply the type when the `<Value>`
+declares none at all, which is what makes NothinRandom/pyopcxmlda's writes decode (it spells the attribute
+`xsi:Type`, a different and meaningless attribute in a case-sensitive language). The two do not overlap:
+this one only fires when there is no `xsi:type` to reinterpret, and the reinterpretation above still runs
+afterwards.
 
 ## OQ-13: SOAP Fault QName resolution scope is element-local, not whole-document
 

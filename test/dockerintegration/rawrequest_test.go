@@ -201,6 +201,90 @@ func TestDockerServer_TolerantInput(t *testing.T) {
 		rawDecode[xmlda.WriteResponse](t, data)
 	})
 
+	// The fixture's items each have one canonical data type, and a write
+	// is coerced to it or refused. Storing whatever arrived used to make
+	// two things go quietly wrong: an item's data type changed under it
+	// (an int written to a double item made that item report
+	// xsi:type="xsd:int" from then on, contradicting its own dataType
+	// property), and range checking stopped working, because the clamp
+	// could only read a value that was already a double. So a write in
+	// the "wrong" numeric type bypassed the limit entirely — and every
+	// clamp assertion in this suite happened to send a double, so
+	// nothing noticed.
+	t.Run("a write in another numeric type is coerced, not stored verbatim", func(t *testing.T) {
+		const speed = "Plant/BuildingA/Line1/Motor1/Speed"
+
+		write := func(t *testing.T, xsiType, literal string) xmlda.ItemValue {
+			t.Helper()
+			body := rawEnvelopeOpen + `<Write xmlns="` + xmlda.Namespace + `">` +
+				`<ItemList><Items ItemName="` + speed + `">` +
+				// Both prefixes declared here: rawEnvelopeOpen binds only
+				// SOAP-ENV, and an unbound xsi prefix makes xsi:type a
+				// different, meaningless attribute — the value would
+				// then carry no type at all.
+				`<Value xmlns:xsd="` + xmlda.XSDNamespace + `" xmlns:xsi="` + xmlda.XSINamespace +
+				`" xsi:type="` + xsiType + `">` +
+				literal + `</Value></Items></ItemList></Write>` + rawEnvelopeClose
+			status, data := rawPost(t, url, body)
+			if status != http.StatusOK {
+				t.Fatalf("got status %d, want 200: %s", status, data)
+			}
+			out := rawDecode[xmlda.WriteResponse](t, data)
+			if len(out.RItemList.Items) != 1 {
+				t.Fatalf("got %d items, want 1: %s", len(out.RItemList.Items), data)
+			}
+			return out.RItemList.Items[0]
+		}
+
+		readBack := func(t *testing.T) xmlda.ItemValue {
+			t.Helper()
+			body := rawEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `">` +
+				`<ItemList><Items ItemName="` + speed + `"/></ItemList></Read>` + rawEnvelopeClose
+			status, data := rawPost(t, url, body)
+			if status != http.StatusOK {
+				t.Fatalf("got status %d, want 200: %s", status, data)
+			}
+			out := rawDecode[xmlda.ReadResponse](t, data)
+			if len(out.RItemList.Items) != 1 {
+				t.Fatalf("got %d items, want 1: %s", len(out.RItemList.Items), data)
+			}
+			return out.RItemList.Items[0]
+		}
+
+		// An in-range int: accepted, and the item is still a double.
+		if got := write(t, "xsd:int", "1234"); !got.ResultID.IsZero() {
+			t.Fatalf("in-range int write: ResultID = %v, want empty", got.ResultID)
+		}
+		back := readBack(t)
+		if back.Value == nil {
+			t.Fatal("in-range int write: no value read back")
+		}
+		if got := back.Value.TypeName(); got != (xmlda.QName{Space: xmlda.XSDNamespace, Local: "double"}) {
+			t.Errorf("the item's type is now %v; a write must not change it", got)
+		}
+		if f, err := back.Value.Float64(); err != nil || f != 1234 {
+			t.Errorf("read back (%v, %v), want (1234, nil)", f, err)
+		}
+
+		// An out-of-range int: this is the case that used to slip past
+		// the limit. Speed is clamped to [0, 3000].
+		if got := write(t, "xsd:int", "99999"); got.ResultID != xmlda.SuccessClamp {
+			t.Errorf("out-of-range int write: ResultID = %v, want S_CLAMP", got.ResultID)
+		}
+		if f, err := readBack(t).Value.Float64(); err != nil || f != 3000 {
+			t.Errorf("after the clamp, read back (%v, %v), want (3000, nil)", f, err)
+		}
+
+		// A value that cannot be the item's type at all is that item's
+		// E_BADTYPE (§3.4), not a silently stored string.
+		if got := write(t, "xsd:string", "not-a-number"); got.ResultID != xmlda.ErrBadType {
+			t.Errorf("string write to a double item: ResultID = %v, want E_BADTYPE", got.ResultID)
+		}
+		if f, err := readBack(t).Value.Float64(); err != nil || f != 3000 {
+			t.Errorf("the refused write changed the value to (%v, %v), want it left at 3000", f, err)
+		}
+	})
+
 	t.Run("failed item reports bad quality", func(t *testing.T) {
 		body := rawEnvelopeOpen + `<Read xmlns="` + xmlda.Namespace + `">` +
 			`<Options ReturnItemName="true"/><ItemList>` +

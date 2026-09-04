@@ -15,6 +15,7 @@ package plantbackend
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -25,12 +26,17 @@ import (
 )
 
 type item struct {
-	mu          sync.Mutex
-	value       xmlda.Value
-	quality     xmlda.OPCQuality
-	ts          time.Time
-	writable    bool
-	description string
+	mu    sync.Mutex
+	value xmlda.Value
+	// canonicalType is the item's data type, fixed at construction and
+	// never changed by a write. A real OPC item has exactly one — it is
+	// what standard property 1 (dataType) reports — and a write of some
+	// other type is coerced to it or refused, never stored verbatim.
+	canonicalType xmlda.QName
+	quality       xmlda.OPCQuality
+	ts            time.Time
+	writable      bool
+	description   string
 	// hasRange/rangeMin/rangeMax demonstrate backend.WriteOutcome.Clamped
 	// (REQ-WRITE-005), mirroring memorybackend's Demo/Counter.
 	hasRange           bool
@@ -103,6 +109,16 @@ func New() *Backend {
 		xmlda.NewArrayValue(xmlda.NewFloat64Array([]float64{0, 0, 0})), false,
 		"Simulated read-only array of three tank sensor readings (ArrayOfDouble).")
 
+	// A WRITABLE array item, and deliberately one the simulator does not
+	// touch: writing an array and reading it back is only observable if
+	// nothing overwrites it a tick later. Its element type is int
+	// because that is what the reference client sends for a []int32, and
+	// an item accepts its own type — the point of the round trip is the
+	// array wire path, not a coercion.
+	b.addItem("Plant/BuildingB/Tank1/Setpoints",
+		xmlda.NewArrayValue(xmlda.NewInt32Array([]int32{0, 0, 0})), true,
+		"Writable array of three sensor setpoints (ArrayOfInt).")
+
 	b.wg.Go(func() { b.simulate(ctx) })
 	return b
 }
@@ -115,7 +131,8 @@ func (b *Backend) Close() {
 
 func (b *Backend) addItem(name string, v xmlda.Value, writable bool, description string) {
 	b.items[backend.ItemRef{ItemName: name}] = &item{
-		value: v, quality: xmlda.NewGoodQuality(), ts: time.Now(),
+		value: v, canonicalType: v.TypeName(),
+		quality: xmlda.NewGoodQuality(), ts: time.Now(),
 		writable: writable, description: description,
 	}
 }
@@ -205,15 +222,37 @@ func (b *Backend) Write(ctx context.Context, items []backend.WriteRequestItem) (
 			out[i] = backend.Result[backend.WriteOutcome]{ResultID: xmlda.ErrReadOnly}
 			continue
 		}
-		newValue := it.Value
+		// Coerced to the item's own type before anything else. Storing
+		// the written value verbatim let a write CHANGE an item's data
+		// type — an int written to Speed made a double item report
+		// xsi:type="xsd:int" from then on, contradicting the dataType
+		// property — and it silently disabled range checking, because
+		// the clamp below could only read a double. A real OPC item has
+		// one canonical type; a value that will not fit it is that
+		// item's E_BADTYPE (§3.4).
+		newValue, ok := coerceToCanonical(it.Value, itm.canonicalType)
+		if !ok {
+			out[i] = backend.Result[backend.WriteOutcome]{ResultID: xmlda.ErrBadType}
+			continue
+		}
 		clamped := false
 		if itm.hasRange {
-			if f, err := newValue.Float64(); err == nil {
+			// NumericAsFloat64, not Float64: the range applies to the
+			// magnitude whatever numeric type carried it here.
+			if f, numeric := newValue.NumericAsFloat64(); numeric {
 				switch {
 				case f < itm.rangeMin:
 					newValue, clamped = xmlda.NewFloat64(itm.rangeMin), true
 				case f > itm.rangeMax:
 					newValue, clamped = xmlda.NewFloat64(itm.rangeMax), true
+				}
+				if clamped {
+					// The clamp produced a double; put it back into the
+					// item's own type so clamping cannot change the type
+					// either.
+					if back, ok := coerceToCanonical(newValue, itm.canonicalType); ok {
+						newValue = back
+					}
 				}
 			}
 		}
@@ -305,6 +344,49 @@ func (b *Backend) Browse(ctx context.Context, req backend.BrowseRequest) (backen
 		ContinuationPoint: next,
 		MoreElements:      next != "",
 	}, nil
+}
+
+// coerceToCanonical converts v to the type want names, reporting false
+// if it cannot.
+//
+// It covers the types this fixture's items actually declare. A real
+// backend would reach for whatever its data source offers; the point
+// here is that SOME canonical type is enforced, because a fixture whose
+// items change type on write cannot catch a server that mishandles
+// types.
+func coerceToCanonical(v xmlda.Value, want xmlda.QName) (xmlda.Value, bool) {
+	if !v.IsValid() {
+		return xmlda.Value{}, false
+	}
+	if v.TypeName() == want {
+		return v, true
+	}
+	switch want {
+	case xmlda.QName{Space: xmlda.XSDNamespace, Local: "double"}:
+		if f, ok := v.NumericAsFloat64(); ok {
+			return xmlda.NewFloat64(f), true
+		}
+	case xmlda.QName{Space: xmlda.XSDNamespace, Local: "int"}:
+		f, ok := v.NumericAsFloat64()
+		if !ok {
+			return xmlda.Value{}, false
+		}
+		// A fractional or out-of-range value is not an int; saying so is
+		// E_BADTYPE rather than silently truncating.
+		if f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxInt32 {
+			return xmlda.Value{}, false
+		}
+		return xmlda.NewInt32(int32(f)), true
+	case xmlda.QName{Space: xmlda.XSDNamespace, Local: "boolean"}:
+		if b, err := v.Bool(); err == nil {
+			return xmlda.NewBool(b), true
+		}
+	case xmlda.QName{Space: xmlda.XSDNamespace, Local: "string"}:
+		if s, err := v.String(); err == nil {
+			return xmlda.NewString(s), true
+		}
+	}
+	return xmlda.Value{}, false
 }
 
 // propertiesFor answers with the standard properties this fixture can

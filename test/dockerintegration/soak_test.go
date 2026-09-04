@@ -274,12 +274,21 @@ func TestDockerServer_SteadyState(t *testing.T) {
 	})
 
 	// Worker 2 — continuous write/read-back round trips. Nothing else
-	// writes Motor1/Speed (the simulator only nudges the Temperature and
-	// Level items), so the value read back must match the value just
-	// written, every time, for the whole window.
+	// writes Tank1/Setpoints (the simulator only nudges the Temperature,
+	// Level and Sensors items), so the value read back must match the
+	// value just written, every time, for the whole window.
+	//
+	// The item is the ArrayOfInt one, and the payload is an array, for
+	// the reason WriteThenReadBack documents: the reference client's
+	// scalar Write payloads carry an xsi:type this server cannot resolve,
+	// so a scalar round trip here would be measuring that client bug
+	// rather than the server. This used to write the same array into the
+	// scalar Motor1/Speed, which worked only while the fixture stored
+	// whatever arrived; now that each item has one canonical type, that
+	// is the E_BADTYPE it always should have been.
 	wg.Go(func() {
 		c := soakClient(client)
-		const item = "Plant/BuildingA/Line1/Motor1/Speed"
+		const item = "Plant/BuildingB/Tank1/Setpoints"
 		want := int32(0)
 		for time.Now().Before(deadline) {
 			want = (want + 137) % 3000

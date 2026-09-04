@@ -64,7 +64,9 @@ func (w wholeOpErrorReader) Read(ctx context.Context, items []backend.ReadReques
 
 var errUnknown = &backend.BackendError{Fault: backend.FaultNotSupported}
 
-type valuelessReader struct{ goodReader }
+// No embedded goodReader: backend.Reader is a single-method interface
+// and this type overrides that method, so the embedding was dead weight.
+type valuelessReader struct{}
 
 func (valuelessReader) Read(_ context.Context, items []backend.ReadRequestItem) ([]backend.Result[backend.ItemSample], error) {
 	// The Value is never constructed — the single most damaging backend
