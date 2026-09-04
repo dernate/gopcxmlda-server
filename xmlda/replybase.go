@@ -3,6 +3,7 @@ package xmlda
 import (
 	"encoding/xml"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -45,10 +46,38 @@ func formatWireTime(t time.Time) string {
 //
 // It is unexported and used only inside the shadow structs the request
 // types decode into, so the public API keeps plain *time.Time fields.
-type wireTime struct{ t time.Time }
+type wireTime struct {
+	t time.Time
+	// absent records an attribute that was present but empty, which
+	// timePtr reports as no value at all. It cannot be inferred from t
+	// being the zero time: encoding/xml allocates the pointer field
+	// before calling UnmarshalXMLAttr, so an empty attribute that
+	// returned no error would otherwise decode to January of year 1 —
+	// a RequestDeadline that has already passed, which is worse than
+	// the fault it replaced.
+	absent bool
+}
 
 // UnmarshalXMLAttr implements xml.UnmarshalerAttr.
 func (w *wireTime) UnmarshalXMLAttr(attr xml.Attr) error {
+	// An empty optional dateTime attribute is treated as absent rather
+	// than as a malformed value. It is not schema-valid — xs:dateTime
+	// has no empty lexical form, so a validating peer would never send
+	// one — but clients that assemble requests from string templates
+	// emit every attribute they know and leave the unset ones empty,
+	// and every request-side dateTime attribute in this protocol is
+	// optional (RequestOptions.RequestDeadline,
+	// SubscriptionPolledRefresh.HoldTime, ItemValue.Timestamp), so
+	// "unset" is the only reading an empty one can have. Faulting
+	// instead cost the whole request: NothinRandom/pyopcxmlda sends
+	// RequestDeadline="" on every Subscribe and HoldTime="" on every
+	// SubscriptionPolledRefresh, so subscriptions were unreachable for
+	// it entirely. This widens what decodes without changing any
+	// conforming request, which cannot contain an empty one.
+	if strings.TrimSpace(attr.Value) == "" {
+		w.absent = true
+		return nil
+	}
 	t, err := parseXSDDateTime(attr.Value)
 	if err != nil {
 		return err
@@ -58,9 +87,9 @@ func (w *wireTime) UnmarshalXMLAttr(attr xml.Attr) error {
 }
 
 // timePtr returns w's time as a fresh *time.Time, or nil if w is nil
-// (the attribute was absent).
+// (the attribute was absent) or carried an empty value.
 func (w *wireTime) timePtr() *time.Time {
-	if w == nil {
+	if w == nil || w.absent {
 		return nil
 	}
 	t := w.t

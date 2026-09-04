@@ -115,6 +115,52 @@ and covered by a regression test afterwards.
 - HTTP `405` carries an `Allow` header (RFC 9110 §15.5.6); a request whose
   `Content-Type` names something other than XML/SOAP is refused with `415`.
 
+- **A successful `Write` no longer reports `Quality="bad"`.** With
+  `ReturnValuesOnReply` at its default of false — the ordinary `Write` —
+  every returned item carried the explicit Bad quality that belongs on a
+  `Read` item which should have produced a value and could not,
+  contradicting the empty `ResultID` beside it. A failed item still
+  states Bad quality (§2.6 p.22). Found by driving the server with
+  NothinRandom/pyopcxmlda, which reads the first typed child of `<Items>`
+  as the item's data type and so reported every successful write as type
+  `opc:OPCQuality`.
+
+- **An empty optional `dateTime` attribute is treated as absent instead
+  of faulting the whole request.** `RequestDeadline=""`, `HoldTime=""` and
+  `Timestamp=""` are not schema-valid — `xs:dateTime` has no empty lexical
+  form — but clients that assemble requests from string templates emit
+  every attribute they know and leave the unset ones empty. Every
+  request-side `dateTime` attribute in this protocol is optional, so
+  "unset" is the only reading an empty one can have. pyopcxmlda sends
+  `RequestDeadline=""` on every `Subscribe` and `HoldTime=""` on every
+  `SubscriptionPolledRefresh`, so subscriptions were unreachable for it
+  entirely.
+
+- **A qualified fault code's namespace prefix is now bound on the
+  envelope as well as locally.** A fault code is a QName in element
+  content, and the binding was made only on the element carrying it, as
+  the specification's own example does (§2.6 p.21). A parser built on a
+  namespace-normalizing DOM resolves content QNames against the scope it
+  *entered* the element with, so that binding is invisible to it:
+  mlabs-haskell/opc-xml-da-client, which resolves every `xsi:type` this
+  server sends, answered faults with `Namespace not found: q0` and could
+  not read fault codes at all — and §2.5.1's error-handling flow turns on
+  telling `E_NOSUBSCRIPTION` from `E_BUSY` from `E_TIMEDOUT`. The local
+  binding is kept: this package's own fault decoder resolves
+  element-locally by design (OQ-13). Both name the same URI.
+
+- **`ValueTypeQualifier` may now stand in as a `<Value>`'s type when the
+  value declares none.** A deliberate tolerance rather than a reading of
+  the specification, which sides with the previous `E_BADTYPE` (§2.7.1
+  presents the qualifier as an accompaniment to an already-typed value;
+  §3.4 makes `Value` required). It only ever turns a rejected item into an
+  accepted one, cannot change how a conforming request decodes — an
+  explicit `xsi:type` still wins — and is restricted to qualifiers naming
+  an XSD scalar type this library can decode. What it buys: pyopcxmlda
+  spells the attribute `xsi:Type`, a different and meaningless attribute
+  in a case-sensitive language, so `ValueTypeQualifier` is the only type
+  its `Write` states and every write it issued came back `E_BADTYPE`.
+
 ### Fixed — resource limits
 
 - **Element nesting is bounded** (`Config.MaxElementDepth`, default 64)
@@ -160,7 +206,41 @@ and covered by a regression test afterwards.
   `soap.HeaderBlock`.
 - `backend.ChangeEvent.DiagnosticInfo`.
 
+- **`xmlda.KindQuality`, `xmlda.NewQualityValue` and `Value.Quality`.**
+  `Value` modelled the XSD simple types and their arrays, which left one
+  gap: §3.1.10 p.40 declares standard item property 3 (`quality`) with
+  the data type `OPCQuality`, the one complex type this protocol puts in
+  a `<Value>` position. A backend could therefore serve every standard
+  property except that one, and an `OPCQuality` arriving from a peer
+  decoded as `KindUnknown` — round-trippable opaque bytes, not something
+  a client could inspect. Both directions now work; the real captured
+  fixture in `testdata/responses/getproperties_116.response.xml` contains
+  exactly this property and its assertion in `xmlda/getproperties_test.go`
+  changed from "opaque unknown" to a decoded good/none/0 quality.
+
+  `Kind` gained a variant, so a `switch` over it that used to be
+  exhaustive no longer is, and an `OPCQuality` that used to arrive as
+  `KindUnknown` now arrives as `KindQuality` — see *Changed — breaking*.
+
+- `xmlda.AccessRightsUnknown` / `AccessRightsReadable` /
+  `AccessRightsWritable` / `AccessRightsReadWritable` and
+  `xmlda.EUTypeNoEnum` / `EUTypeAnalog` / `EUTypeEnumerated`, the legal
+  values of standard properties 5 and 7. §3.1.10 p.40 does not merely
+  suggest these spellings — "one of the following valid values must be
+  used" — so leaving them as free strings invited backends to answer
+  `read-write` or `RW`, which a conforming client cannot interpret.
+
+- `soap.FaultCodePrefix`, the prefix a qualified fault code is written
+  with, named once rather than spelled `"q0"` in four places.
+
 ### Changed — breaking
+
+- **`xmlda.Kind` gained `KindQuality`, and an `OPCQuality`-typed
+  `<Value>` no longer decodes as `KindUnknown`.** Code switching
+  exhaustively over `Kind`, or relying on a quality property value being
+  opaque bytes reachable through `Value.Raw`, has to handle the new
+  variant. `Value.Quality` is how that value is read now. See *Added*
+  for why the gap was worth closing.
 
 These are source-incompatible for anyone already building against the
 library. All of them are pre-`v1`.
@@ -189,16 +269,36 @@ library. All of them are pre-`v1`.
 
 ### Testing
 
-- **An independent client now drives the server.** Both integration suites
+- **Independent clients now drive the server.** Both integration suites
   used github.com/dernate/gopcxmlda, which is independently maintained but
   shares an author with the server: what they prove is that the two agree
-  with each other. `test/dockerintegration/foreignclient` builds a proxy
-  with Python's zeep from `testdata/schema/opcxmlda.wsdl` — the
-  specification's own WSDL, transcribed alongside the XSD that was already
-  there — runs it in its own container against the server in another, and
-  exercises all eight operations plus a fault path across 31 checks. zeep
-  validates every response against the schema strictly, which is precisely
-  where Go's `encoding/xml` is lenient.
+  with each other. `test/dockerintegration/clients/` runs three containers
+  against the server on a shared Docker network, each printing one
+  assertion per line so a failure names what failed:
+
+  - `pyopcxmlda` — a **real OPC XML-DA client** (Python, MIT) that
+    hand-builds every request and parses every response with ElementTree.
+    44 checks.
+  - `haskell` — a **real OPC XML-DA client**
+    (mlabs-haskell/opc-xml-da-client, MIT) whose request construction and
+    response parser are hand-written from the specification. Its parser is
+    strict, it decodes into a typed sum type (so an `ArrayOfDouble` either
+    arrives as a vector of doubles or not at all), and it parses SOAP
+    faults in both shapes. 56 checks.
+  - `zeep` — a **generic SOAP/XSD stack, not an OPC client**, building its
+    proxy from `testdata/schema/opcxmlda.wsdl` — the specification's own
+    WSDL, transcribed alongside the XSD that was already there — and
+    validating every response against the schema strictly, which is
+    precisely where Go's `encoding/xml` is lenient. Counted separately
+    from the two above: that WSDL was transcribed in this repository, so
+    it is no independent opinion on OPC semantics.
+
+  The two real clients found the three protocol defects listed under
+  *Fixed — protocol conformance* above and prompted the
+  `ValueTypeQualifier` tolerance. Notably, both send a **SOAP 1.1 envelope
+  with `Content-Type: application/soap+xml`**, independently of each
+  other — a combination neither binding prescribes, and one a server
+  keying its reply version off the Content-Type would answer wrongly.
 
   Writing it surfaced one thing worth knowing before building any
   WSDL-generated client: `ItemValue`'s `<Value>` is declared with no type,

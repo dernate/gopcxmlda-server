@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -228,7 +229,9 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 		}
 	}
 
-	if raw, ok := attrValue(start.Attr, xml.Name{Local: "Timestamp"}); ok {
+	if raw, ok := attrValue(start.Attr, xml.Name{Local: "Timestamp"}); ok && strings.TrimSpace(raw) != "" {
+		// An empty Timestamp is "no timestamp", for the same reason an
+		// empty RequestDeadline is (see wireTime, replybase.go).
 		// parseXSDDateTime, not a time.Time struct field: xsd:dateTime's
 		// timezone offset is optional and time.Time.UnmarshalText's is
 		// not, so a conforming Write carrying
@@ -272,8 +275,12 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 				// specification's own "blank string" answer, not an absence.
 				iv.DiagnosticInfo = &text
 			case "Value":
+				vt := t
+				if hasQualifier {
+					vt.Attr = valueTypeFromQualifier(d, start.Attr, qualifierRaw, vt.Attr)
+				}
 				var v Value
-				if err := v.UnmarshalXML(d, t); err != nil {
+				if err := v.UnmarshalXML(d, vt); err != nil {
 					// E_BADTYPE: a <Value> whose content does not match
 					// its declared xsi:type, or that declares none at
 					// all, is exactly the specification's bad-type
@@ -304,6 +311,48 @@ func (iv *ItemValue) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 	}
 	iv.DecodeErr = decodeErr
 	return nil
+}
+
+// valueTypeFromQualifier supplies a missing xsi:type on a <Value> from the
+// enclosing ItemValue's ValueTypeQualifier, returning attrs unchanged when
+// it has nothing to add.
+//
+// This is a deliberate tolerance, not a reading of the specification.
+// §2.7.1 presents ValueTypeQualifier as an accompaniment to an
+// already-typed value (a dateTime carrying "this is really an xsd:time"),
+// and §3.4 makes Value required on a Write, so an item whose <Value>
+// declares no type at all is that item's E_BADTYPE by the letter of the
+// spec — which is what this package did, and still does whenever the
+// qualifier cannot stand in.
+//
+// What justifies bending: it only ever turns a rejected item into an
+// accepted one, and it cannot change how a conforming request decodes.
+// A <Value> that carries its own xsi:type keeps it, and
+// applyValueTypeQualifier's narrowing pass still runs afterwards, so
+// dateTime+ValueTypeQualifier="xsd:time" is unaffected. Against that, it
+// is what makes a real published client interoperate at all:
+// NothinRandom/pyopcxmlda writes the attribute as xsi:Type, which in a
+// case-sensitive language is a different and meaningless attribute,
+// leaving ValueTypeQualifier as the only type the request states.
+//
+// It is restricted to qualifiers naming an XSD scalar type this package
+// can decode. A vendor QName, or one naming an array type, stays the
+// decode error it was rather than becoming a silently untyped value.
+func valueTypeFromQualifier(d *xml.Decoder, ivAttrs []xml.Attr, qualifierRaw string, attrs []xml.Attr) []xml.Attr {
+	if _, typed := attrValue(attrs, xml.Name{Space: XSINamespace, Local: "type"}); typed {
+		return attrs
+	}
+	qn, err := resolveQNameIn(d, ivAttrs, qualifierRaw)
+	if err != nil {
+		return attrs
+	}
+	if _, ok := scalarTypesByQName[qn]; !ok {
+		return attrs
+	}
+	return append(slices.Clone(attrs), xml.Attr{
+		Name:  xml.Name{Space: XSINamespace, Local: "type"},
+		Value: qualifierRaw,
+	})
 }
 
 // applyValueTypeQualifier reinterprets v's semantic scalar type per a

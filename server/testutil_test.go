@@ -258,6 +258,13 @@ func subscriptionCancelRequestBody(handle string) string {
 	return soapEnvelopeOpen + `<SubscriptionCancel xmlns="` + xmlda.Namespace + `" ServerSubHandle="` + handle + `"/>` + soapEnvelopeClose
 }
 
+// subscriptionCancelRequestBodyWithHandle is the same request carrying a
+// ClientRequestHandle, which §3.7.2 p.68 requires the response to echo.
+func subscriptionCancelRequestBodyWithHandle(handle, clientRequestHandle string) string {
+	return soapEnvelopeOpen + `<SubscriptionCancel xmlns="` + xmlda.Namespace +
+		`" ServerSubHandle="` + handle + `" ClientRequestHandle="` + clientRequestHandle + `"/>` + soapEnvelopeClose
+}
+
 func decodeFault(t *testing.T, resp *http.Response) *soap.Fault {
 	t.Helper()
 	data, err := io.ReadAll(resp.Body)

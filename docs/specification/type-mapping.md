@@ -27,6 +27,13 @@ REQ-TYPE-001..007.
 | `duration` | VT_BSTR | `string` (lexical ISO-8601 duration, e.g. `"P1D"`) | decoded directly from `xsi:type="xsd:duration"` (see OQ-12) | `xsi:type="xsd:duration"` | n/a | this library does not validate ISO-8601 duration lexical form beyond accepting any string, since the spec transmits it as opaque `VT_BSTR` | same |
 | `QName` | (no Variant equivalent) | `QName{Space, Local}` | resolved via `resolveQName` against the document's prefix table | rendered with the appropriate declared prefix (or default namespace) | n/a | unresolvable prefix ⇒ decode error | same |
 | `anyType` | VT_VARIANT | `Value` (recursive) | only meaningful as an array element type (`ArrayOfAnyType`) | each element carries its own `xsi:type` | n/a | n/a | n/a |
+| `opc:OPCQuality` | (no Variant equivalent) | `OPCQuality`, via `Value.Kind() == KindQuality` | decoded from the element's `QualityField`/`LimitField`/`VendorField` attributes | `xsi:type="opc:OPCQuality"` plus those attributes, written by `OPCQuality.MarshalXML` — `Value.MarshalXML` delegates rather than adding a second `xsi:type` | n/a | an out-of-range `VendorField` ⇒ decode error | pointer/`*Value` is `nil` |
+
+The `OPCQuality` row is the one complex type in this table. It is not a general escape hatch for complex
+values: it exists because §3.1.10 p.40 declares standard item property 3 (`quality`) with that data type, so
+a `<Value>` holding one is something the specification itself requires. Construct it with
+`xmlda.NewQualityValue` and read it with `Value.Quality`. Every other complex type in a `<Value>` position
+is a vendor extension and stays `KindUnknown`, preserved byte for byte (ADR-003).
 
 **Missing vs. null distinction (REQ-TYPE-007, cross-cutting)**: an `ItemValue.Value` field is a `*Value`
 pointer. `nil` means "no `<Value>` element present at all" (e.g. Bad quality with no last-known value, or a
@@ -71,6 +78,8 @@ identifying which index and what was expected (never silently drops or substitut
 
 Any `xsi:type` not in the tables above (including a vendor type in a non-standard, non-XSD namespace)
 decodes to `Value{Kind: KindUnknown}`, capturing the exact `xsi:type` QName and the verbatim inner XML bytes.
+`opc:OPCQuality` used to land here too; since it is a type the specification itself requires in a `<Value>`
+position (standard property 3), it now decodes as `KindQuality` instead — see the row in the table above.
 This value round-trips unchanged on re-encode and is never treated as a decode error — see ADR-003.
 `Value.Raw()` is the only accessor that succeeds for such a value; every typed accessor returns a
 `*TypeError` naming the actual (unknown) type.

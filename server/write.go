@@ -170,7 +170,22 @@ func (h *Handler) handleWrite(ctx context.Context, w http.ResponseWriter, doc *x
 		if resultID.IsZero() && res.Value.Clamped {
 			resultID = xmlda.SuccessClamp
 		}
-		items[i] = buildItemValue(refs[i], it.ClientItemHandle, sample, haveSample, resultID, res.DiagnosticInfo, req.Options)
+		iv := buildItemValue(refs[i], it.ClientItemHandle, sample, haveSample, resultID, res.DiagnosticInfo, req.Options)
+		if !haveSample && !resultID.IsError() {
+			// A Write the client did not ask values back from carries no
+			// value, so it has no quality to state either. The explicit
+			// Bad quality buildItemValue supplies for a sample-less item
+			// is about data that is missing (Read's case); here the data
+			// was never requested, and ReturnValuesOnReply defaults to
+			// false, so this is the ordinary Write. Reporting bad quality
+			// on a write that succeeded contradicts the empty ResultID on
+			// the same element, and it is not harmless: an independent
+			// client (NothinRandom/pyopcxmlda) reads the first typed
+			// child of <Items> as the item's data type and reported every
+			// successful write as type opc:OPCQuality.
+			iv.Quality = nil
+		}
+		items[i] = iv
 		codes = append(codes, resultID)
 	}
 

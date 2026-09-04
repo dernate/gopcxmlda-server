@@ -97,14 +97,21 @@ jobs:
 
       # Covers the per-operation test, the sustained-load soak test (which
       # runs for DOCKERINTEGRATION_SOAK, default 30s, and is what
-      # `go test -short` would skip) and the foreign-client test — a
-      # Python/zeep proxy generated from the specification's own WSDL,
-      # which is the only check here not made with a client by this
-      # server's own author. It builds its image on the fly and needs
-      # network access for pip.
-      - name: Test against real gopcxmlda client and an independent SOAP stack (Dockerized)
+      # `go test -short` would skip) and the independent-client tests —
+      # two real OPC XML-DA implementations plus a generic SOAP stack,
+      # the only checks here not made with a client by this server's own
+      # author. Each builds its image on the fly and needs network access
+      # (pip, Stackage, Hackage).
+      #
+      # The timeout is generous because of one of them: the Haskell
+      # client's image compiles a GHC snapshot. Measured locally, the
+      # three-client test takes ~11 minutes on a cold layer cache and ~1
+      # minute warm — and a CI runner is always cold, so budget for the
+      # former.
+      - name: Test against real gopcxmlda client and independent clients (Dockerized)
         working-directory: test/dockerintegration
-        run: go test ./...
+        timeout-minutes: 75
+        run: go test -timeout 70m ./...
 
   # go vet in build-and-test catches a narrow, high-confidence set. This
   # job adds the checks that vet does not make: errcheck (an unhandled

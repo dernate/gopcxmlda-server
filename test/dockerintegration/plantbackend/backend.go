@@ -307,15 +307,57 @@ func (b *Backend) Browse(ctx context.Context, req backend.BrowseRequest) (backen
 	}, nil
 }
 
+// propertiesFor answers with the standard properties this fixture can
+// legitimately know about an item. §3.9 requires a server to return "all
+// properties which are available", so the set is the server's to choose
+// — but a fixture that offers only dataType and description does not
+// exercise the property surface a real client reaches for. An
+// independent client (NothinRandom/pyopcxmlda) models a property reply
+// as dataType/value/timestamp/accessRights/scanRate/quality/euType, and
+// every one of those is already sitting in the item struct.
 func propertiesFor(itm *item, includeValue bool) []backend.Property {
 	itm.mu.Lock()
 	value := itm.value
 	description := itm.description
+	quality := itm.quality
+	ts := itm.ts
+	writable := itm.writable
+	hasRange := itm.hasRange
+	rangeMin, rangeMax := itm.rangeMin, itm.rangeMax
 	itm.mu.Unlock()
+
+	access := xmlda.AccessRightsReadable
+	if writable {
+		access = xmlda.AccessRightsReadWritable
+	}
+	euType := xmlda.EUTypeNoEnum
+	if hasRange {
+		// An item with an engineering range is the specification's
+		// "analog" case, and highEU/lowEU are the properties that carry
+		// the range (IDs 102/103).
+		euType = xmlda.EUTypeAnalog
+	}
 
 	props := []backend.Property{
 		{ID: xmlda.PropDataType, Value: xmlda.NewQNameValue(value.TypeName())},
+		// §3.1.10 p.40 gives this property the data type OPCQuality —
+		// the one complex type the specification puts in a <Value>
+		// position, which xmlda.NewQualityValue exists to express.
+		{ID: xmlda.PropQuality, Value: xmlda.NewQualityValue(quality)},
+		{ID: xmlda.PropTimestamp, Value: xmlda.NewDateTime(ts)},
+		{ID: xmlda.PropAccessRights, Value: xmlda.NewString(access)},
+		// The fastest rate the source could be sampled at, in
+		// milliseconds (§3.1.10 p.40) — the fixture's simulator ticks
+		// every 100ms.
+		{ID: xmlda.PropScanRate, Value: xmlda.NewFloat32(100)},
+		{ID: xmlda.PropEUType, Value: xmlda.NewString(euType)},
 		{ID: xmlda.PropDescription, Value: xmlda.NewString(description)},
+	}
+	if hasRange {
+		props = append(props,
+			backend.Property{ID: xmlda.PropHighEU, Value: xmlda.NewFloat64(rangeMax)},
+			backend.Property{ID: xmlda.PropLowEU, Value: xmlda.NewFloat64(rangeMin)},
+		)
 	}
 	if includeValue {
 		props = append(props, backend.Property{ID: xmlda.PropValue, Value: value})

@@ -1,0 +1,23 @@
+cabal-version: 2.4
+name: driver
+version: 0.1.0
+synopsis: Drives an OPC XML-DA server through an independent Haskell client
+build-type: Simple
+
+executable driver
+  main-is: Main.hs
+  hs-source-dirs: app
+  default-language: Haskell2010
+  default-extensions: OverloadedStrings, DuplicateRecordFields, NamedFieldPuns, LambdaCase, ScopedTypeVariables, TypeApplications
+  ghc-options: -threaded
+  build-depends:
+      base >=4.14 && <5
+    , bytestring
+    , containers
+    , http-client
+    , opc-xml-da-client
+    , scientific
+    , text
+    , time
+    , unordered-containers
+    , vector

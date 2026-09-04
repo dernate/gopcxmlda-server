@@ -139,6 +139,34 @@ func (e Envelope[T]) MarshalXML(enc *xml.Encoder, start xml.StartElement) error 
 		start.Attr = append(start.Attr,
 			xml.Attr{Name: xml.Name{Local: "xmlns:" + prefix}, Value: e.ExtraNamespaces[prefix]})
 	}
+	// A fault code is a QName in element CONTENT, and its prefix is bound
+	// in TWO scopes: here on the envelope, and again on the element
+	// carrying it (see Fault.MarshalXML). Both bindings name the same
+	// URI, so the QName is the same either way and no parser can see a
+	// conflict — the redundancy buys compatibility with two kinds of
+	// reader that each miss one of the scopes.
+	//
+	// Locally, because that is the specification's own example (§2.6
+	// p.21) and because this package's own fault decoder resolves
+	// prefixes element-locally by design: soap must not depend on
+	// xmlda's whole-document prefix scan (open-questions.md OQ-13), so
+	// dropping the local binding would leave this library unable to read
+	// the faults it writes.
+	//
+	// On the envelope, because a QName in content is the fragile case
+	// for the other kind of parser: one built on a namespace-normalizing
+	// DOM resolves prefixes from the scope it entered an element with,
+	// and a declaration made ON that element is not yet in that scope.
+	// Not hypothetical — mlabs-haskell/opc-xml-da-client resolves every
+	// xsi:type this server sends, because those prefixes are declared up
+	// here, yet answered a locally-declared fault code with "Namespace
+	// not found: q0" and so could not read fault codes at all. For an OPC
+	// client that is not cosmetic: §2.5.1's error-handling flow turns on
+	// telling E_NOSUBSCRIPTION from E_BUSY from E_TIMEDOUT.
+	if e.Body.Fault != nil && e.Body.Fault.Code.Space != "" {
+		start.Attr = append(start.Attr,
+			xml.Attr{Name: xml.Name{Local: "xmlns:" + FaultCodePrefix}, Value: e.Body.Fault.Code.Space})
+	}
 	if err := enc.EncodeToken(start); err != nil {
 		return err
 	}

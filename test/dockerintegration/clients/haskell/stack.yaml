@@ -1,0 +1,14 @@
+# Pinned exactly as mlabs-haskell/opc-xml-da-client pins itself, plus the
+# client at a fixed commit. Nothing here floats: a green run today has to
+# stay reproducible, and a client that silently changed its wire format
+# would defeat the purpose of testing against it.
+resolver: nightly-2022-02-07
+
+packages:
+  - .
+
+extra-deps:
+  - caerbannog-1.0.0.0
+  - xml-parser-0.1.1
+  - github: mlabs-haskell/opc-xml-da-client
+    commit: 2f92644ba52f87e9866a8a13076f442fd60db974

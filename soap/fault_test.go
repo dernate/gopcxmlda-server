@@ -278,3 +278,77 @@ func TestFault_StructuredDetail_SOAP12(t *testing.T) {
 		t.Fatalf("got Detail %q, want it to contain the structured child element's content", f.Detail)
 	}
 }
+
+// TestFault_CodeNamespaceDeclaredInBothScopes pins a deliberate
+// redundancy: the prefix binding for a qualified fault code is written
+// both on the envelope and on the element carrying the code.
+//
+// Two kinds of reader each miss one of those scopes. This package's own
+// fault decoder resolves prefixes element-locally, because soap must not
+// depend on xmlda's whole-document prefix scan (open-questions.md
+// OQ-13) — drop the local binding and the library can no longer read
+// the faults it writes. A parser built on a namespace-normalizing DOM
+// has the opposite blind spot: it resolves content QNames against the
+// scope it entered the element with, so a binding declared ON that
+// element is invisible. mlabs-haskell/opc-xml-da-client is the second
+// kind, and reported "Namespace not found: q0" until the envelope
+// carried the binding too.
+//
+// Both bindings name the same URI, so the QName is identical either way
+// and no conforming parser can see a conflict.
+func TestFault_CodeNamespaceDeclaredInBothScopes(t *testing.T) {
+	const ns = "http://opcfoundation.org/webservices/XMLDA/1.0/"
+
+	for _, tc := range []struct {
+		name    string
+		version Version
+		// element is the tag the code QName sits in for this version.
+		element string
+	}{
+		{"soap 1.1", Version11, "faultcode"},
+		{"soap 1.2", Version12, "SOAP-ENV:Value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &Fault{Code: QName{Space: ns, Local: "E_NOSUBSCRIPTION"}, Text: "gone"}
+			env := Envelope[struct{}]{Version: tc.version, Body: Body[struct{}]{Fault: f}}
+			out, err := xml.Marshal(env)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			got := string(out)
+
+			decl := `xmlns:` + FaultCodePrefix + `="` + ns + `"`
+			if n := strings.Count(got, decl); n != 2 {
+				t.Errorf("found %d declarations of %s, want 2 (envelope and code element):\n%s", n, decl, got)
+			}
+			// One of them has to be on the envelope, before the Body.
+			envEnd := strings.Index(got, "<SOAP-ENV:Body")
+			if envEnd < 0 {
+				t.Fatalf("no Body in output:\n%s", got)
+			}
+			if !strings.Contains(got[:envEnd], decl) {
+				t.Errorf("envelope element does not declare %s:\n%s", decl, got[:envEnd])
+			}
+			// And one on the element carrying the code itself.
+			if !strings.Contains(got, "<"+tc.element+" "+decl+">") {
+				t.Errorf("<%s> does not declare %s locally:\n%s", tc.element, decl, got)
+			}
+			if !strings.Contains(got, ">"+FaultCodePrefix+":E_NOSUBSCRIPTION<") {
+				t.Errorf("code is not written with the %q prefix:\n%s", FaultCodePrefix, got)
+			}
+
+			// The round trip is the point of keeping the local binding:
+			// this package must still resolve its own fault codes.
+			var back Envelope[struct{}]
+			if err := xml.Unmarshal(out, &back); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if back.Body.Fault == nil {
+				t.Fatal("decoded envelope carries no Fault")
+			}
+			if got := back.Body.Fault.Code; got.Space != ns || got.Local != "E_NOSUBSCRIPTION" {
+				t.Errorf("decoded Code = %v, want {%s E_NOSUBSCRIPTION}", got, ns)
+			}
+		})
+	}
+}

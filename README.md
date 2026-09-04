@@ -121,13 +121,28 @@ See [`docs/interoperability.md`](docs/interoperability.md) for what this surface
 this server (an `xsi:type` attribute-ordering issue, safe to fix since XML attribute order carries no
 semantic meaning) and two client-side-only quirks that aren't fixable from this server's side.
 
-[`test/dockerintegration/foreignclient/`](test/dockerintegration/foreignclient/) answers the question
-neither of those can: both drive the server with the same author's client, which proves the two agree with
-each other. The foreign-client test builds a proxy with **Python's zeep** from
-[`testdata/schema/opcxmlda.wsdl`](testdata/schema/opcxmlda.wsdl) — transcribed from the specification's own
-appendix — runs it in its own container against the server in another, and has it exercise all eight
-operations. zeep validates every response against the schema strictly, which is exactly where Go's
-`encoding/xml` is lenient. It runs as part of the `dockerintegration` suite.
+[`test/dockerintegration/clients/`](test/dockerintegration/clients/) answers the question neither of those
+can: both drive the server with the same author's client, which proves the two agree with each other. Three
+independent clients, each in its own container on a shared Docker network with the server, exercise all
+eight operations and print one assertion per line so a failure names what failed:
+
+| Client | What it is | What it proves |
+|---|---|---|
+| [`pyopcxmlda`](test/dockerintegration/clients/pyopcxmlda/) | A **real OPC XML-DA client** (Python, MIT) | Knows item lists, subscriptions and qualities. Hand-builds every request; a second opinion on protocol *semantics*, not just schema shape. |
+| [`haskell`](test/dockerintegration/clients/haskell/) | A **real OPC XML-DA client** ([mlabs-haskell](https://github.com/mlabs-haskell/opc-xml-da-client), MIT) | Request construction *and* response parser hand-written from the specification, and the parser is **strict**: content the specification does not allow is a hard decode error. Decodes into a typed sum type (an `ArrayOfDouble` arrives as a vector of doubles or not at all) and parses SOAP faults in both the 1.1 and 1.2 shapes. |
+| [`zeep`](test/dockerintegration/clients/zeep/) | A **generic SOAP/XSD stack** — *not* an OPC client | Builds its proxy from [`testdata/schema/opcxmlda.wsdl`](testdata/schema/opcxmlda.wsdl) and validates every response against the schema strictly, which is exactly where Go's `encoding/xml` is lenient. It is *not* an independent opinion on OPC semantics: that WSDL was transcribed in this repository, so an error in the transcription would be invisible to it. |
+
+The two real clients found three defects in this server — all since fixed — and prompted one deliberate
+tolerance; [`docs/interoperability.md`](docs/interoperability.md) lists each with the reasoning.
+
+They run as part of the `dockerintegration` suite. The Haskell image compiles a GHC snapshot, so the whole
+independent-client test takes ~11 minutes on a cold layer cache and ~1 minute once that layer is built —
+it depends only on its `stack.yaml` and `driver.cabal`, so editing a driver does not rebuild it. To skip it
+while iterating, name the clients you want:
+
+```sh
+DOCKERINTEGRATION_CLIENTS=pyopcxmlda,zeep go test -run TestForeignClients ./...
+```
 
 [`test/dockerintegration/`](test/dockerintegration/) goes one step further: it builds the server into a real
 Docker image from a four-level nested address space and drives the same client against a running container,

@@ -104,3 +104,80 @@ func TestRequestOptions_RequestDeadlineWithoutOffset(t *testing.T) {
 		t.Errorf("RequestDeadline was not re-emitted in the canonical wire form: %s", out)
 	}
 }
+
+// TestEmptyDateTimeAttributesAreAbsent pins the tolerance that made
+// NothinRandom/pyopcxmlda's subscriptions reachable at all.
+//
+// xs:dateTime has no empty lexical form, so none of these attributes is
+// schema-valid — but a client that assembles requests from string
+// templates emits every attribute it knows and leaves the unset ones
+// empty, and pyopcxmlda does exactly that on every Subscribe
+// (RequestDeadline="") and every SubscriptionPolledRefresh (HoldTime="").
+// Every request-side dateTime attribute in this protocol is optional, so
+// "unset" is the only reading an empty one can have; faulting instead
+// cost the client the whole operation.
+//
+// The absence has to be a real absence, not the zero time: a HoldTime of
+// January year 1 is a hold that has already expired, and a
+// RequestDeadline of January year 1 is a request that is already too
+// late — both worse than the fault they replaced.
+func TestEmptyDateTimeAttributesAreAbsent(t *testing.T) {
+	t.Run("RequestOptions.RequestDeadline", func(t *testing.T) {
+		doc := `<Read xmlns="` + Namespace + `"><Options RequestDeadline="" LocaleID="en-US"/><ItemList/></Read>`
+		var req ReadRequest
+		if err := Decode([]byte(doc), &req); err != nil {
+			t.Fatalf("an empty RequestDeadline faulted the whole request: %v", err)
+		}
+		if req.Options.RequestDeadline != nil {
+			t.Errorf("RequestDeadline = %v, want nil", *req.Options.RequestDeadline)
+		}
+		// The rest of the element must still decode.
+		if req.Options.LocaleID != "en-US" {
+			t.Errorf("LocaleID = %q, want en-US", req.Options.LocaleID)
+		}
+	})
+
+	t.Run("SubscriptionPolledRefresh.HoldTime", func(t *testing.T) {
+		doc := `<SubscriptionPolledRefresh xmlns="` + Namespace + `" HoldTime="" WaitTime="2000">` +
+			`<ServerSubHandles>h1</ServerSubHandles></SubscriptionPolledRefresh>`
+		var req SubscriptionPolledRefreshRequest
+		if err := Decode([]byte(doc), &req); err != nil {
+			t.Fatalf("an empty HoldTime faulted the whole request: %v", err)
+		}
+		if req.HoldTime != nil {
+			t.Errorf("HoldTime = %v, want nil", *req.HoldTime)
+		}
+		if req.WaitTime != 2000 {
+			t.Errorf("WaitTime = %d, want 2000", req.WaitTime)
+		}
+	})
+
+	t.Run("ItemValue.Timestamp", func(t *testing.T) {
+		doc := `<Items xmlns="` + Namespace + `" xmlns:xsi="` + XSINamespace + `" xmlns:xsd="` + XSDNamespace +
+			`" ItemName="Tag" Timestamp=""><Value xsi:type="xsd:int">7</Value></Items>`
+		var iv ItemValue
+		if err := Decode([]byte(doc), &iv); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if iv.DecodeErr != nil {
+			t.Fatalf("DecodeErr = %v, want nil: an empty Timestamp must not cost the item", iv.DecodeErr)
+		}
+		if iv.Timestamp != nil {
+			t.Errorf("Timestamp = %v, want nil", *iv.Timestamp)
+		}
+		if iv.Value == nil {
+			t.Error("Value was dropped along with the timestamp")
+		}
+	})
+
+	t.Run("a non-empty malformed value still fails", func(t *testing.T) {
+		// The tolerance is for emptiness only. Actual garbage in a
+		// dateTime attribute must keep failing, or a typo becomes a
+		// silently ignored deadline.
+		doc := `<Read xmlns="` + Namespace + `"><Options RequestDeadline="not-a-date"/><ItemList/></Read>`
+		var req ReadRequest
+		if err := Decode([]byte(doc), &req); err == nil {
+			t.Errorf("RequestDeadline=%q decoded cleanly as %v, want an error", "not-a-date", req.Options.RequestDeadline)
+		}
+	})
+}

@@ -58,6 +58,12 @@ const (
 	// or future type). Its exact wire bytes are preserved for round-trip;
 	// see ADR-003.
 	KindUnknown
+	// KindQuality is an OPCQuality-typed value. It is the one complex
+	// type the specification puts in a <Value> position: standard item
+	// property 3, "Item Quality", has the data type OPCQuality
+	// (§3.1.10 p.40). Without it a backend could serve every standard
+	// property except that one. See Value.Quality and NewQualityValue.
+	KindQuality
 )
 
 // String returns a human-readable name for k, used in error messages.
@@ -69,6 +75,8 @@ func (k Kind) String() string {
 		return "array"
 	case KindUnknown:
 		return "unknown"
+	case KindQuality:
+		return "quality"
 	default:
 		return "invalid"
 	}
@@ -207,6 +215,8 @@ func (e *TypeError) Error() string {
 	switch e.Kind {
 	case KindUnknown:
 		return fmt.Sprintf("xmlda: Value.%s: value has unrecognized type %s", e.Op, e.TypeName)
+	case KindQuality:
+		return fmt.Sprintf("xmlda: Value.%s: value is a quality (%s), not the requested type", e.Op, e.TypeName)
 	case KindArray:
 		return fmt.Sprintf("xmlda: Value.%s: value is an array of %s, not the requested scalar type", e.Op, e.Actual)
 	default:
@@ -285,6 +295,22 @@ func (v Value) Equal(other Value) bool {
 		return v.array.equal(other.array)
 	case KindUnknown:
 		return v.typeName == other.typeName && bytes.Equal(v.raw.InnerXML, other.raw.InnerXML)
+	case KindQuality:
+		// Compared through the accessors, not field by field: OPCQuality
+		// holds its enum fields as pointers so an absent attribute is
+		// distinguishable from a present one, and == on those compares
+		// addresses. The accessors resolve absent to the schema default,
+		// which is what makes an explicit QualityField="good" and an
+		// omitted one compare equal — as they must, since they mean the
+		// same quality.
+		a, aok := v.scalar.(OPCQuality)
+		b, bok := other.scalar.(OPCQuality)
+		if !aok || !bok {
+			return false
+		}
+		return a.QualityField() == b.QualityField() &&
+			a.LimitField() == b.LimitField() &&
+			a.VendorField() == b.VendorField()
 	default: // KindScalar
 		return scalarEqual(v.typ, v.scalar, other.scalar)
 	}
@@ -386,7 +412,48 @@ func decodeNilKind(typeName QName) (Kind, ScalarType) {
 	if st, ok := scalarTypesByQName[typeName]; ok {
 		return KindScalar, st
 	}
+	if typeName == qualityTypeName {
+		return KindQuality, ""
+	}
 	return KindUnknown, ""
+}
+
+// qualityTypeName is the xsi:type an OPCQuality-typed Value declares.
+var qualityTypeName = QName{Space: Namespace, Local: "OPCQuality"}
+
+// NewQualityValue wraps q as a Value.
+//
+// OPCQuality is the one complex type the specification puts in a <Value>
+// position: standard item property 3, "Item Quality", is declared with
+// the data type OPCQuality (§3.1.10 p.40), so a backend serving the
+// standard property set needs a way to express one. Every other <Value>
+// this protocol carries is an XSD simple type or an ArrayOf<X> of them.
+//
+//	props = append(props, backend.Property{
+//		ID:    xmlda.PropQuality,
+//		Value: xmlda.NewQualityValue(sample.Quality),
+//	})
+//
+// Note that this is a property VALUE, unrelated to ItemValue.Quality —
+// that field is an OPCQuality directly, not a Value wrapping one.
+func NewQualityValue(q OPCQuality) Value {
+	return Value{kind: KindQuality, typeName: qualityTypeName, scalar: q}
+}
+
+// Quality returns v's OPCQuality, or a *TypeError if v does not hold one.
+func (v Value) Quality() (OPCQuality, error) {
+	if v.isNil || v.kind != KindQuality {
+		return OPCQuality{}, &TypeError{
+			Op: "Quality", Kind: v.kind, Actual: v.typ, TypeName: v.typeName, Nil: v.isNil,
+		}
+	}
+	q, ok := v.scalar.(OPCQuality)
+	if !ok {
+		return OPCQuality{}, &TypeError{
+			Op: "Quality", Kind: v.kind, Actual: v.typ, TypeName: v.typeName,
+		}
+	}
+	return q, nil
 }
 
 // NewArrayValue wraps a as a Value, the way the NewX constructors below
@@ -1599,6 +1666,19 @@ func (v Value) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	if v.typeName.IsZero() {
 		return fmt.Errorf("xmlda: cannot marshal a Value with no declared type")
 	}
+	if v.kind == KindQuality && !v.isNil {
+		// Delegated with start's attributes untouched, because
+		// OPCQuality.MarshalXML writes the xsi:type itself. Adding it
+		// here first would emit the attribute twice — a duplicate
+		// attribute is not well-formed XML, and encoding/xml will not
+		// stop it. A nilled quality falls through to the branch below,
+		// which is the same shape every other nilled value takes.
+		q, ok := v.scalar.(OPCQuality)
+		if !ok {
+			return fmt.Errorf("xmlda: Value declares %s but holds %T", v.typeName, v.scalar)
+		}
+		return q.MarshalXML(e, start)
+	}
 	base := append([]xml.Attr{}, start.Attr...)
 	start.Attr = mergeAttrs(base, typeAttrs(e, base, v.typeName)...)
 	if v.isNil {
@@ -1935,6 +2015,18 @@ func (v *Value) decodeElement(d *xml.Decoder, start xml.StartElement, depth int)
 	}
 	if et, ok := arrayElemTypesByQName[tn]; ok {
 		return v.decodeArray(d, et, tn, depth)
+	}
+	if tn == qualityTypeName {
+		// Recognized rather than left to decodeUnknown: a quality that
+		// round-trips as opaque bytes cannot be inspected by a client,
+		// and this is a type the specification defines, not a vendor
+		// extension.
+		var q OPCQuality
+		if err := q.UnmarshalXML(d, start); err != nil {
+			return true, err
+		}
+		v.kind, v.typeName, v.scalar = KindQuality, tn, q
+		return true, nil
 	}
 	return v.decodeUnknown(d, start, tn)
 }

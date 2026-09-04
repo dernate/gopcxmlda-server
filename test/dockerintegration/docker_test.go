@@ -297,12 +297,45 @@ func TestDockerServer_AllOperations(t *testing.T) {
 		if len(got.Response.PropertyList) != 1 {
 			t.Fatalf("got %d property lists, want 1", len(got.Response.PropertyList))
 		}
-		names := map[string]bool{}
+		// TValue wraps the value: .Value is the content, .Type the
+		// xsi:type's local name.
+		values := map[string]string{}
+		types := map[string]string{}
 		for _, p := range got.Response.PropertyList[0].Properties {
-			names[p.Name] = true
+			values[p.Name] = fmt.Sprintf("%v", p.Value.Value)
+			types[p.Name] = p.Value.Type
 		}
-		if !names["opc:dataType"] || !names["opc:description"] {
-			t.Fatalf("got properties %+v, want at least opc:dataType and opc:description", got.Response.PropertyList[0].Properties)
+		// The standard property surface a real client reaches for
+		// (§3.1.10 pp.39-40, IDs 1/4/5/6/7 plus description).
+		for _, want := range []string{
+			"opc:dataType", "opc:quality", "opc:timestamp", "opc:accessRights",
+			"opc:scanRate", "opc:euType", "opc:description",
+		} {
+			if _, ok := values[want]; !ok {
+				t.Errorf("property %s missing; got %+v", want, got.Response.PropertyList[0].Properties)
+			}
+		}
+		// accessRights is not a free string: §3.1.10 p.40 says "one of
+		// the following valid values must be used", and Tank1/Level is
+		// read-only.
+		if got := values["opc:accessRights"]; got != "readable" {
+			t.Errorf("accessRights = %q, want %q", got, "readable")
+		}
+		// An item with an engineering range is the specification's
+		// analog case, and Level has none in this fixture.
+		if got := values["opc:euType"]; got != "noEnum" && got != "analog" {
+			t.Errorf("euType = %q, want one of noEnum/analog", got)
+		}
+		// Property 3's declared data type is OPCQuality (§3.1.10 p.40) —
+		// the one complex type this protocol puts in a <Value> position,
+		// and the reason xmlda.KindQuality exists. Asserting the type
+		// rather than the content: an OPCQuality carries its state in
+		// attributes, so it has no text for the client to report.
+		if got := types["opc:quality"]; got != "OPCQuality" {
+			t.Errorf("quality property type = %q, want OPCQuality", got)
+		}
+		if got := types["opc:dataType"]; got != "QName" {
+			t.Errorf("dataType property type = %q, want QName", got)
 		}
 	})
 

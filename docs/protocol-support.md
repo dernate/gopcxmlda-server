@@ -52,7 +52,7 @@ to `E_BADTYPE` rather than attempting a best-effort conversion.
 
 - OPC XML-DA's optional WSDL/discovery surface: the server does not generate or serve a WSDL document.
   The specification's own WSDL *is* transcribed, at `testdata/schema/opcxmlda.wsdl`, and an independent
-  SOAP stack does build a working client from it (`test/dockerintegration/foreignclient`) — but that file
+  SOAP stack does build a working client from it (`test/dockerintegration/clients/zeep`) — but that file
   is a test fixture, not something the server offers at a URL. A client that wants a proxy generated must
   be handed the file.
 - Any transport other than HTTP(S) POST with a SOAP-enveloped body.

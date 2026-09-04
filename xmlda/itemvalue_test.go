@@ -2,6 +2,7 @@ package xmlda
 
 import (
 	"encoding/xml"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -334,3 +335,97 @@ func TestItemValueList_CarriesTypeAndReserved(t *testing.T) {
 // pointer-ness distinguishes "the client asked and there is nothing to
 // say" (a blank string, §3.1.6) from "the client did not ask".
 func strPtrIV(s string) *string { return &s }
+
+// TestItemValue_QualifierTypesAnUntypedValue pins the interop tolerance
+// added for NothinRandom/pyopcxmlda, which spells the type attribute
+// xsi:Type. XML attribute names are case-sensitive, so that is a
+// different and meaningless attribute and the request states no type
+// except through ValueTypeQualifier. Before the tolerance every Write
+// that client issued came back E_BADTYPE.
+//
+// The subtests bound the tolerance in both directions: it must not touch
+// a value that types itself, and it must not invent a type out of a
+// qualifier this package cannot decode.
+func TestItemValue_QualifierTypesAnUntypedValue(t *testing.T) {
+	const ns = ` xmlns:xsi="` + XSINamespace + `" xmlns:xsd="` + XSDNamespace +
+		`" xmlns:opc="` + Namespace + `"`
+
+	t.Run("qualifier is the only type stated", func(t *testing.T) {
+		// Verbatim the shape pyopcxmlda puts on the wire, capital T and all.
+		doc := []byte(`<Items` + ns + ` ItemName="Tag" ValueTypeQualifier="xsd:int">` +
+			`<Value xsi:Type="xsd:int">1234</Value></Items>`)
+		var got ItemValue
+		if err := Decode(doc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.DecodeErr != nil {
+			t.Fatalf("DecodeErr = %v, want nil", got.DecodeErr)
+		}
+		if got.Value == nil {
+			t.Fatal("Value is nil")
+		}
+		if got.Value.Type() != TypeInt {
+			t.Fatalf("Type() = %s, want int", got.Value.Type())
+		}
+		n, err := got.Value.Int32()
+		if err != nil {
+			t.Fatalf("Int32: %v", err)
+		}
+		if n != 1234 {
+			t.Fatalf("Int32() = %d, want 1234", n)
+		}
+	})
+
+	t.Run("an explicit xsi:type still wins", func(t *testing.T) {
+		// The qualifier names a different type than xsi:type does. The
+		// tolerance must stay out of the way entirely: a conforming
+		// request has to decode exactly as it did before.
+		doc := []byte(`<Items` + ns + ` ItemName="Tag" ValueTypeQualifier="xsd:int">` +
+			`<Value xsi:type="xsd:string">1234</Value></Items>`)
+		var got ItemValue
+		if err := Decode(doc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.Value == nil {
+			t.Fatal("Value is nil")
+		}
+		if got.Value.Type() != TypeString {
+			t.Fatalf("Type() = %s, want string (xsi:type must win over the qualifier)", got.Value.Type())
+		}
+	})
+
+	t.Run("a qualifier this package cannot decode stays E_BADTYPE", func(t *testing.T) {
+		for _, qualifier := range []string{
+			"opc:Vendorish",       // not an XSD type at all
+			"xsd:int",             // sanity anchor, handled above
+			"opc:ArrayOfInt",      // an array type, not a scalar
+			"xsd:nosuchtypeatall", // XSD namespace, unknown local name
+		} {
+			doc := []byte(`<Items` + ns + ` ItemName="Tag" ValueTypeQualifier="` + qualifier + `">` +
+				`<Value>1234</Value></Items>`)
+			var got ItemValue
+			if err := Decode(doc, &got); err != nil {
+				t.Fatalf("Decode(%s): %v", qualifier, err)
+			}
+			wantOK := qualifier == "xsd:int"
+			if wantOK {
+				if got.DecodeErr != nil {
+					t.Errorf("qualifier %s: DecodeErr = %v, want nil", qualifier, got.DecodeErr)
+				}
+				continue
+			}
+			if got.DecodeErr == nil {
+				t.Errorf("qualifier %s: decoded cleanly, want a bad-type item error", qualifier)
+				continue
+			}
+			var ide *ItemDecodeError
+			if !errors.As(got.DecodeErr, &ide) {
+				t.Errorf("qualifier %s: DecodeErr = %T, want *ItemDecodeError", qualifier, got.DecodeErr)
+				continue
+			}
+			if ide.Code != ErrBadType {
+				t.Errorf("qualifier %s: Code = %v, want E_BADTYPE", qualifier, ide.Code)
+			}
+		}
+	})
+}

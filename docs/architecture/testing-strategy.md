@@ -100,10 +100,19 @@ After every milestone: `go fmt ./...`, `go vet ./...`, `go test ./...`; `go test
 per milestone from the point the `subscription` package exists onward. Goroutine-leak checks (e.g. via
 `go.uber.org/goleak` in `subscription`'s test suite) run after every `Manager.Shutdown` in a lifecycle test.
 
-`test/clientintegration` (see `README.md`) is **not** part of `go test ./...` (separate `go.mod`, by design)
-and is not run automatically by anything — it must be run manually (`cd test/clientintegration && go test
-./...`) before a release and after any change to `xmlda`/`soap` wire encoding, since it is the only check
-against a real, independently-maintained client rather than this repository's own fixtures.
+`test/clientintegration` and `test/dockerintegration` (see `README.md`) are **not** part of `go test ./...`
+— each has its own `go.mod`, by design, so testcontainers-go's Docker dependency stays out of the lighter
+suites. Both have their own CI job, and both should also be run locally after any change to `xmlda`/`soap`
+wire encoding, since between them they carry every check made against a client other than this repository's
+own fixtures:
+
+- `test/clientintegration` and most of `test/dockerintegration` drive the server with
+  `github.com/dernate/gopcxmlda`. It is independently maintained, but it shares an author with the server,
+  so what these establish is that the two agree with each other.
+- `test/dockerintegration/clients/` is the part that does not have that weakness: two real OPC XML-DA
+  implementations that have never seen this repository (`pyopcxmlda`, and mlabs-haskell's client with its
+  strict hand-written parser), plus a generic SOAP/XSD stack generated from the specification's WSDL. See
+  `docs/interoperability.md` for the defects this surfaced.
 
 ## Byte-exact vs. semantic-equivalence testing
 

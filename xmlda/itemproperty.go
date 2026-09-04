@@ -31,6 +31,30 @@ const (
 	PropTimeZone         PropertyID = 108
 )
 
+// AccessRights values for the standard accessRights property (ID 5).
+//
+// §3.1.10 p.40 does not merely suggest these spellings: "string – one of
+// the following valid values must be used". A backend that answers
+// "read-write" or "RW" is emitting a property a conforming client cannot
+// interpret, so the four legal values are named here rather than left to
+// each backend to spell for itself.
+const (
+	AccessRightsUnknown      = "unknown"
+	AccessRightsReadable     = "readable"
+	AccessRightsWritable     = "writable"
+	AccessRightsReadWritable = "readWritable"
+)
+
+// EUType values for the standard euType property (ID 7), constrained the
+// same way as AccessRights (§3.1.10 p.40). "enumerated" is what makes
+// euInfo (ID 8) meaningful: it declares that the item's numeric values
+// index the array of strings euInfo carries.
+const (
+	EUTypeNoEnum     = "noEnum"
+	EUTypeAnalog     = "analog"
+	EUTypeEnumerated = "enumerated"
+)
+
 var standardPropertyLocalNames = map[PropertyID]string{
 	PropDataType:         "dataType",
 	PropValue:            "value",

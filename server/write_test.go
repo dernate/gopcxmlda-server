@@ -284,3 +284,66 @@ func TestHandleWrite_OffsetlessItemTimestamp(t *testing.T) {
 		t.Errorf("ResultID = %v, want none", got)
 	}
 }
+
+// TestHandleWrite_SuccessfulAckStatesNoQuality pins the distinction
+// between "no value available" and "no value requested".
+//
+// ReturnValuesOnReply defaults to false, so the ordinary Write returns
+// items that carry no value at all. buildItemValue's explicit Bad quality
+// exists for the Read case — an item that should have produced a value
+// and could not, where a missing <Quality> would be read back as "good"
+// via the schema default (§2.6 p.22). Applying it here told every
+// successful write that its data was bad, contradicting the empty
+// ResultID on the same element.
+//
+// Found by driving the server with NothinRandom/pyopcxmlda, which reads
+// the first typed child of <Items> as the item's data type and so
+// reported every successful write as type opc:OPCQuality.
+func TestHandleWrite_SuccessfulAckStatesNoQuality(t *testing.T) {
+	be, _, reader := newWritableBackend()
+	reader.Set(backend.ItemRef{ItemName: "Item1"}, xmlda.NewInt32(0))
+	h := newTestHandler(t, be, Config{}, clock.Real{})
+
+	t.Run("success without values requested carries no Quality", func(t *testing.T) {
+		got := decodeResponse[xmlda.WriteResponse](t, postSOAP(t, h, writeRequestBody("Item1", "int", "42", false)))
+		item := got.RItemList.Items[0]
+		if !item.ResultID.IsZero() {
+			t.Fatalf("ResultID = %v, want empty", item.ResultID)
+		}
+		if item.Quality != nil {
+			t.Errorf("Quality = %+v, want nil: the write succeeded and returned no value, "+
+				"so there is no quality to state", *item.Quality)
+		}
+	})
+
+	t.Run("a failed item still states Bad quality", func(t *testing.T) {
+		// The §2.6 argument is untouched where it applies: this item has
+		// a ResultID, and a client applying the schema default to a
+		// missing <Quality> would read it as good.
+		got := decodeResponse[xmlda.WriteResponse](t, postSOAP(t, h, writeRequestBody("Unknown", "int", "1", false)))
+		item := got.RItemList.Items[0]
+		if item.ResultID != xmlda.ErrUnknownItemName {
+			t.Fatalf("ResultID = %v, want E_UNKNOWNITEMNAME", item.ResultID)
+		}
+		if item.Quality == nil {
+			t.Fatal("Quality = nil, want an explicit Bad quality on a failed item")
+		}
+		if got := item.Quality.QualityField(); got != xmlda.QualityBad {
+			t.Errorf("QualityField() = %v, want bad", got)
+		}
+	})
+
+	t.Run("values requested carries the real quality", func(t *testing.T) {
+		got := decodeResponse[xmlda.WriteResponse](t, postSOAP(t, h, writeRequestBody("Item1", "int", "44", true)))
+		item := got.RItemList.Items[0]
+		if item.Value == nil {
+			t.Fatal("Value = nil, want the written value echoed back")
+		}
+		if item.Quality == nil {
+			t.Fatal("Quality = nil, want the quality of the value being reported")
+		}
+		if got := item.Quality.QualityField(); got != xmlda.QualityGood {
+			t.Errorf("QualityField() = %v, want good", got)
+		}
+	})
+}

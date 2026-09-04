@@ -19,14 +19,24 @@ documented in [`docs/specification/open-questions.md`](specification/open-questi
 - **Unbounded `go test -fuzz` has not been run** in this sandbox (subprocess spawning for fuzz workers is
   restricted here). The fuzz tests' seed corpora do run via plain `go test`, exercising the same code paths
   without the fuzzing engine's exploration.
+- **A backend cannot express a *vendor-defined* complex property value.** `xmlda.Value` models the XSD
+  simple types, their `ArrayOf<X>` forms, and `OPCQuality` — which between them cover every `<Value>` the
+  specification itself defines, standard property 3 (`quality`, §3.1.10 p.40) included, via
+  `xmlda.NewQualityValue`. A vendor property whose value is some *other* complex type still has no
+  constructor: `KindUnknown` preserves one that arrived from a peer, byte for byte, but its `RawValue` is
+  only ever populated by the decoder, so a backend cannot originate one. No known client needs this; it is
+  recorded because the asymmetry is real.
 - **No official OPC Foundation conformance test suite has been run** against this library, and no
   commercial client (Matrikon, Softing, KEPServerEX, Siemens) has been pointed at it. What *has* run is a
-  client neither written for nor aware of this repository: `test/dockerintegration/foreignclient` builds a
-  proxy with Python's zeep from `testdata/schema/opcxmlda.wsdl` — transcribed from the specification's own
-  appendix — and drives all eight operations against the server in a container, with zeep validating every
-  response against the schema strictly. That closes the gap between "our client agrees with our server" and
-  "an independent SOAP stack can talk to it"; it does not close the gap to a conformance suite, which tests
-  protocol behavior over time rather than message shapes. Nothing in this
+  clients neither written for nor aware of this repository: `test/dockerintegration/clients/` runs two real
+  OPC XML-DA implementations (`pyopcxmlda`, Python; `mlabs-haskell/opc-xml-da-client`, Haskell — the latter
+  with a strict, hand-written parser) plus a generic SOAP/XSD stack (zeep, driven from
+  `testdata/schema/opcxmlda.wsdl`), each in its own container, across all eight operations. Between them
+  they found three defects in this server, all since fixed (`docs/interoperability.md`). That closes the gap
+  between "our client agrees with our server" and "independent implementations can talk to it"; it does not
+  close the gap to a conformance suite, which tests protocol behavior over time rather than message shapes.
+  Note also what the third of them is not: zeep's WSDL was transcribed in this repository, so it validates
+  schema conformance, not the transcription. Nothing in this
   repository should be read as a conformance claim — see `docs/protocol-support.md` for the precise,
   per-operation implemented/tested status instead. Since 2026-08-30 the responses of all eight
   operations *are* validated against the specification's own schema (transcribed into

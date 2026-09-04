@@ -72,6 +72,12 @@ func wellFormedFragment(s string) bool {
 	}
 }
 
+// FaultCodePrefix is the namespace prefix a qualified fault code is
+// written with. The specification's examples use "q0" (§2.6 p.21) and
+// peers have been seen matching on it literally, so it is fixed rather
+// than generated.
+const FaultCodePrefix = "q0"
+
 // MarshalXML implements xml.Marshaler, always emitting the spec-conformant
 // SOAP 1.1 shape: a QName-qualified faultcode (via a locally-declared
 // "q0" prefix) when Code has a namespace, faultstring, and an (empty, if
@@ -88,8 +94,11 @@ func (f Fault) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 	fcStart := xml.StartElement{Name: xml.Name{Local: "faultcode"}}
 	fcText := f.Code.Local
 	if f.Code.Space != "" {
-		fcStart.Attr = append(fcStart.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:q0"}, Value: f.Code.Space})
-		fcText = "q0:" + f.Code.Local
+		// Also declared on the envelope; see Envelope.MarshalXML for
+		// why the binding is deliberately made in both scopes.
+		fcStart.Attr = append(fcStart.Attr,
+			xml.Attr{Name: xml.Name{Local: "xmlns:" + FaultCodePrefix}, Value: f.Code.Space})
+		fcText = FaultCodePrefix + ":" + f.Code.Local
 	}
 	if err := e.EncodeToken(fcStart); err != nil {
 		return err
@@ -369,8 +378,9 @@ func (f Fault) marshalXML12(e *xml.Encoder, start xml.StartElement) error {
 		// namespace, and two of them were renamed.
 		valueText = "SOAP-ENV:" + soap12CodeName(f.Code.Local)
 	case f.Code.Space != "":
-		valueStart.Attr = append(valueStart.Attr, xml.Attr{Name: xml.Name{Local: "xmlns:q0"}, Value: f.Code.Space})
-		valueText = "q0:" + f.Code.Local
+		valueStart.Attr = append(valueStart.Attr,
+			xml.Attr{Name: xml.Name{Local: "xmlns:" + FaultCodePrefix}, Value: f.Code.Space})
+		valueText = FaultCodePrefix + ":" + f.Code.Local
 	}
 	if err := e.EncodeToken(valueStart); err != nil {
 		return err

@@ -296,7 +296,20 @@ func TestHandleSubscriptionCancel_RoundTrip(t *testing.T) {
 		t.Fatalf("got status %d, want 200", resp.StatusCode)
 	}
 	got := decodeResponse[xmlda.SubscriptionCancelResponse](t, resp)
-	_ = got
+	// The response's one and only field. §3.7.2 p.68: "If supplied by
+	// the client in the request then this value is echoed back in the
+	// response" — and with no ReplyBase to fall back on, it is the sole
+	// means a client has of correlating this reply with its request.
+	// The assertion used to be discarded into `_ = got`.
+	if got.ClientRequestHandle != "" {
+		t.Errorf("ClientRequestHandle = %q, want empty (the request carried none)", got.ClientRequestHandle)
+	}
+
+	echoResp := postSOAP(t, h, subscriptionCancelRequestBodyWithHandle(handle, "CRH-echo"))
+	echoed := decodeResponse[xmlda.SubscriptionCancelResponse](t, echoResp)
+	if echoed.ClientRequestHandle != "CRH-echo" {
+		t.Errorf("ClientRequestHandle = %q, want %q", echoed.ClientRequestHandle, "CRH-echo")
+	}
 
 	// Cancelling again (already cancelled) must be a safe no-op, not an error.
 	resp2 := postSOAP(t, h, subscriptionCancelRequestBody(handle))

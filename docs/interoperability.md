@@ -143,6 +143,106 @@ A `<Value>` (or `ResultID`, or `ItemProperty.Name`) declaring an `xsi:type` this
 Vendor error codes and vendor item properties work the same way, as long as they live in their own XML
 namespace (never the OPC XML-DA namespace) and follow the `E_`/`S_` naming convention for error codes.
 
+## Driven by two independent OPC XML-DA client implementations
+
+Fixtures prove this library reads what real servers wrote. They cannot prove a real *client* can read what
+this server writes, and neither can `test/clientintegration` or the rest of `test/dockerintegration`: those
+drive the server with `github.com/dernate/gopcxmlda`, which shares an author with it, so what they
+establish is that the two agree with each other.
+
+`test/dockerintegration/clients/` closes that gap with two implementations that have never seen this
+repository, each in its own container:
+
+- **[`pyopcxmlda`](https://github.com/NothinRandom/pyopcxmlda)** (Python, MIT) — a real OPC XML-DA client:
+  it hand-builds every request from the specification and parses every response with ElementTree. 44 checks.
+- **[`opc-xml-da-client`](https://github.com/mlabs-haskell/opc-xml-da-client)** (Haskell, MIT) — a real OPC
+  XML-DA client whose request construction *and* response parser are hand-written from the specification.
+  Its parser is **strict** (content the specification does not allow at a position is a hard decode error,
+  not something quietly skipped), it decodes values into a typed sum type, and it parses SOAP faults in
+  both the 1.1 and 1.2 shapes. 56 checks.
+
+A third container runs **zeep**, which is deliberately *not* counted among these: it is a generic SOAP/XSD
+stack driven from `testdata/schema/opcxmlda.wsdl`, and that WSDL was transcribed from the specification's
+appendix *in this repository*. It is a strong check that responses satisfy the schema — strictly, where
+Go's `encoding/xml` is lenient — and no check at all on OPC semantics or on the transcription itself.
+
+Both real clients send a **SOAP 1.1 envelope with `Content-Type: application/soap+xml`**, independently of
+each other. That combination is not what either SOAP binding prescribes, and a server keying its reply
+version off the Content-Type would answer both with a 1.2 envelope they do not expect. This server keys off
+the envelope namespace and accepts either media type, which is what lets both through.
+
+### What they found
+
+Three defects in this server, each now fixed and pinned by a regression test:
+
+1. **A successful `Write` reported `Quality="bad"`.** `ReturnValuesOnReply` defaults to false, so the
+   ordinary `Write` returns items carrying no value — and the explicit Bad quality that belongs on a
+   `Read` item that *should* have produced a value was being applied to them too, contradicting the empty
+   `ResultID` on the same element. Not cosmetic: pyopcxmlda reads the first typed child of `<Items>` as the
+   item's data type and reported every successful write as type `opc:OPCQuality`. Fixed in `server/write.go`
+   (`TestHandleWrite_SuccessfulAckStatesNoQuality`); a *failed* item still states Bad quality, which is what
+   §2.6 p.22 asks for.
+2. **An empty optional `dateTime` attribute faulted the whole request.** `xs:dateTime` has no empty lexical
+   form, so `RequestDeadline=""` is not schema-valid — but clients that assemble requests from string
+   templates emit every attribute they know and leave the unset ones empty, and pyopcxmlda does exactly
+   that on every `Subscribe` and every `SubscriptionPolledRefresh`. Subscriptions were therefore
+   unreachable for it. Every request-side `dateTime` attribute in this protocol is optional
+   (`RequestOptions.RequestDeadline`, `SubscriptionPolledRefresh.HoldTime`, `ItemValue.Timestamp`), so
+   "unset" is the only reading an empty one can have. Fixed in `xmlda/replybase.go` (`wireTime`) and
+   `xmlda/itemvalue.go`. The `absent` flag matters: `encoding/xml` allocates the pointer field before
+   calling `UnmarshalXMLAttr`, so simply not erroring would have decoded to January of year 1 — a
+   `RequestDeadline` that has already passed, worse than the fault it replaced.
+3. **Fault codes were unreadable to a namespace-normalizing parser.** A fault code is a QName in element
+   *content*, and its prefix was bound only on the element carrying it — as the specification's own example
+   does (§2.6 p.21). A parser built on a namespace-normalizing DOM resolves content QNames against the
+   scope it *entered* the element with, so a binding made on that element is invisible: the Haskell client,
+   which resolves every `xsi:type` this server sends, answered a fault with `Namespace not found: q0` and
+   could not read fault codes at all. For an OPC client that is not cosmetic — §2.5.1's whole
+   error-handling flow turns on telling `E_NOSUBSCRIPTION` from `E_BUSY` from `E_TIMEDOUT`. The binding is
+   now made in **both** scopes: on the envelope for that kind of parser, and locally because this package's
+   own fault decoder resolves element-locally by design (OQ-13) and would otherwise be unable to read the
+   faults it writes. Both name the same URI, so the QName is identical either way
+   (`TestFault_CodeNamespaceDeclaredInBothScopes`).
+
+And one deliberate tolerance, where the specification sides with this server but interoperating cost
+nothing:
+
+4. **`ValueTypeQualifier` may stand in as a `<Value>`'s type.** pyopcxmlda writes the type attribute as
+   `xsi:Type`, which in a case-sensitive language is a different and meaningless attribute, leaving
+   `ValueTypeQualifier` as the only type its `Write` states. §2.7.1 presents that attribute as an
+   accompaniment to an already-typed value (a `dateTime` carrying "this is really an `xsd:time`") and §3.4
+   makes `Value` required, so `E_BADTYPE` was the correct answer — and still is whenever the qualifier
+   cannot stand in. What justifies bending: it only ever turns a rejected item into an accepted one, it
+   cannot change how a conforming request decodes (an explicit `xsi:type` still wins, and the qualifier's
+   narrowing pass still runs afterwards), and it is restricted to qualifiers naming an XSD scalar type this
+   library can decode — a vendor QName or an array type stays the error it was
+   (`TestItemValue_QualifierTypesAnUntypedValue`).
+
+### What is the clients' own, not this server's
+
+Recorded so the next reader does not mistake them for open defects:
+
+- **pyopcxmlda treats two schema-defaulted attributes as mandatory** and crashes outright on either.
+  `clients/pyopcxmlda/relax-optional-attributes.py` relaxes exactly those two expressions in its image,
+  leaving all of its parsing logic intact, and fails the build loudly if either expression is no longer
+  there. The two:
+  - an `xsi:type` on every `BrowseElement`. Nothing in OPC XML-DA asks for it: `BrowseResponse` declares
+    its `Elements` children as `BrowseElement` (Appendix B), a type that is not polymorphic, so there is
+    nothing for `xsi:type` to disambiguate. Every other attribute that parser demands — `Name`,
+    `ItemPath`, `ItemName`, `IsItem`, `HasChildren` — this server does send.
+  - a `QualityField` on the `quality` property's value. `OPCQuality.QualityField` carries a schema default
+    of `good` and §3.1.5 is explicit that good quality may omit it, which is what keeps a reply with one
+    `<Quality>` per item from repeating `QualityField="good"` on every one.
+- **pyopcxmlda's `SubscriptionPolledRefresh` parser has no fault branch,** so `E_NOSUBSCRIPTION` on a dead
+  handle reaches it as an empty list. The server does send that fault; `rawrequest_test.go` and the Haskell
+  client both assert it.
+- **The Haskell client reads `SubscriptionCancelResponse`'s `ClientRequestHandle` as a child element,**
+  where §3.7.2 p.68 and the schema both declare an attribute, so it always reports it absent. The server
+  echoes it correctly (`TestHandleSubscriptionCancel_RoundTrip`, and the `subscriptioncancel` golden
+  response).
+- **Neither Python client decodes an `ArrayOf<X>` value.** The Haskell client does, and asserts an
+  `ArrayOfDouble` arrives as three doubles.
+
 ## Real fixtures this library was validated against
 
 `testdata/requests/subscribe_679.request.xml` and `testdata/responses/subscribe_680.response.xml` are a

@@ -197,8 +197,25 @@ func TestGetPropertiesResponse_RealFixture(t *testing.T) {
 	if s, err := list.Properties[2].Value.String(); err != nil || s != "noEnum" {
 		t.Fatalf("euType: got %q, err=%v, want noEnum", s, err)
 	}
-	if !list.Properties[3].Value.IsUnknown() || list.Properties[3].Value.TypeName() != (QName{Space: Namespace, Local: "OPCQuality"}) {
-		t.Fatalf("quality: got Kind=%v TypeName=%+v, want KindUnknown/OPCQuality", list.Properties[3].Value.Kind(), list.Properties[3].Value.TypeName())
+	// The quality property used to come back as KindUnknown — decoded as
+	// opaque, round-trippable bytes, because OPCQuality was the one type
+	// the specification puts in a <Value> position that Value could not
+	// model. This capture is what a real server sends for it
+	// (QualityField="good" LimitField="none" VendorField="0"), and it now
+	// decodes into an inspectable OPCQuality.
+	quality := list.Properties[3].Value
+	if quality.Kind() != KindQuality {
+		t.Fatalf("quality: got Kind=%v, want quality", quality.Kind())
+	}
+	if quality.TypeName() != (QName{Space: Namespace, Local: "OPCQuality"}) {
+		t.Fatalf("quality: got TypeName=%+v, want opc:OPCQuality", quality.TypeName())
+	}
+	q, err := quality.Quality()
+	if err != nil {
+		t.Fatalf("quality: Quality(): %v", err)
+	}
+	if q.QualityField() != QualityGood || q.LimitField() != LimitNone || q.VendorField() != 0 {
+		t.Fatalf("quality: got %v/%v/%d, want good/none/0", q.QualityField(), q.LimitField(), q.VendorField())
 	}
 	if f, err := list.Properties[4].Value.Float32(); err != nil || f != 2310 {
 		t.Fatalf("scanRate: got %v, err=%v, want 2310", f, err)
