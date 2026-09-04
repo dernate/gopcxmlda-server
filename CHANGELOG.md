@@ -336,6 +336,18 @@ library. All of them are pre-`v1`.
   into a scalar item, so the "value read back matches the value written"
   invariant held on a value the item should never have accepted.
 
+- **CI actions moved off the deprecated node20 runtime**:
+  `actions/checkout` v4 → v5, `actions/setup-go` v5 → v6,
+  `golangci/golangci-lint-action` v8 → v9. Each is the lowest major that
+  runs on node24, deliberately rather than the newest available: newer
+  majors carry changes this workflow does not need (checkout v6 moves
+  credential persistence to a separate file and v7 blocks fork-PR
+  checkout for `pull_request_target`/`workflow_run`, triggers this
+  workflow does not use; setup-go v7 migrates to ESM), and none of it is
+  worth adopting untested on a pipeline that gates every push. Each
+  action's `action.yml` was checked at the pinned tag first: the inputs
+  used here still exist and all three now declare `runs.using: node24`.
+
 - **Test-only fixes from the first CI run of this series**, which had
   never reached CI before being pushed: an `errorlint` violation (a bare
   type assertion on an error in `soap/version_test.go`, now `errors.As`,
